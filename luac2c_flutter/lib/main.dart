@@ -7,43 +7,132 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/cupertino.dart';
 // 以下三个仅存在于 material：日志可选中文本、悬浮提示、分隔线
 import 'package:flutter/material.dart' show SelectableText, Tooltip, Divider;
 import 'package:flutter/services.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await ThemeCtl.I.load();
   runApp(const Luac2cApp());
 }
 
-// ---------------------------------------------------------------- 主题
-const Color kCardBg = CupertinoColors.tertiarySystemGroupedBackground;
-const Color kLogBg = Color(0xFF1C1C1E);
-const Color kLogFg = Color(0xFFE5E5EA);
+// ---------------------------------------------------------------- 主题控制
+/// 明暗主题状态（持久化到 exe 同目录的 client_prefs.txt）
+class ThemeCtl extends ChangeNotifier {
+  ThemeCtl._();
+  static final ThemeCtl I = ThemeCtl._();
 
-class Luac2cApp extends StatelessWidget {
-  const Luac2cApp({super.key});
+  bool dark = false;
 
-  @override
-  Widget build(BuildContext context) {
-    return const CupertinoApp(
-      title: 'luac2c 客户端',
-      debugShowCheckedModeBanner: false,
-      theme: CupertinoThemeData(
-        brightness: Brightness.light,
-        scaffoldBackgroundColor: Color(0xFFF2F2F7),
+  Future<void> load() async {
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      final f = File('$exeDir\\client_prefs.txt');
+      if (f.existsSync()) {
+        dark = (await f.readAsString()).trim() == 'dark=1';
+      }
+    } catch (_) {/* 读取失败用默认值 */}
+  }
+
+  Future<void> set(bool d) async {
+    if (dark == d) return;
+    dark = d;
+    notifyListeners();
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      await File('$exeDir\\client_prefs.txt')
+          .writeAsString(d ? 'dark=1' : 'dark=0');
+    } catch (_) {/* 写失败不影响运行 */}
+  }
+
+  void toggle() => set(!dark);
+}
+
+// ---------------------------------------------------------------- Liquid Glass 调色板
+class Glass {
+  static bool get dark => ThemeCtl.I.dark;
+
+  // 页面底色（模糊与折射感知的底）
+  static Color get pageTop => dark ? const Color(0xFF101018) : const Color(0xFFEEF1F8);
+  static Color get pageBottom => dark ? const Color(0xFF050508) : const Color(0xFFE2E6F0);
+
+  // 背景色斑（液态玻璃的"折射源"）
+  static Color get blob1 => dark
+      ? CupertinoColors.systemIndigo.withValues(alpha: 0.35)
+      : CupertinoColors.systemBlue.withValues(alpha: 0.30);
+  static Color get blob2 => dark
+      ? CupertinoColors.systemPurple.withValues(alpha: 0.28)
+      : CupertinoColors.systemPurple.withValues(alpha: 0.22);
+  static Color get blob3 => dark
+      ? CupertinoColors.systemTeal.withValues(alpha: 0.22)
+      : CupertinoColors.systemPink.withValues(alpha: 0.20);
+
+  // 玻璃卡片
+  static Color get cardFill => dark
+      ? const Color(0x14FFFFFF)
+      : const Color(0x99FFFFFF);
+  static Color get cardEdge => dark
+      ? const Color(0x2EFFFFFF)
+      : const Color(0x73FFFFFF);
+  static Color get cardGloss => dark
+      ? const Color(0x1FFFFFFF)
+      : const Color(0x55FFFFFF);
+  static List<BoxShadow> get cardShadow => [
+        BoxShadow(
+            color: dark ? const Color(0x66000000) : const Color(0x1A000000),
+            blurRadius: 20,
+            offset: const Offset(0, 8)),
+      ];
+
+  static Color get title => dark
+      ? CupertinoColors.systemGrey
+      : const Color(0xFF6D6D72);
+
+  // 日志终端（两种模式都保持深色控制台，暗色下更深）
+  static Color get logBg => dark ? const Color(0xFF101014) : const Color(0xFF1C1C1E);
+  static const Color logFg = Color(0xFFE8E8ED);
+  static Color get logBorder => dark ? const Color(0xFF2C2C30) : const Color(0xFF3A3A3C);
+
+  static Color get segThumb => dark ? const Color(0xFF5A5A60) : CupertinoColors.white;
+
+  static Color get fill => dark
+      ? const Color(0x1FFFFFFF)
+      : CupertinoColors.tertiarySystemFill;
+
+  static CupertinoThemeData theme() => CupertinoThemeData(
+        brightness: dark ? Brightness.dark : Brightness.light,
+        scaffoldBackgroundColor: pageBottom,
         primaryColor: CupertinoColors.systemBlue,
-        barBackgroundColor: Color(0xFFFBFBFD),
-        textTheme: CupertinoTextThemeData(
+        barBackgroundColor: dark
+            ? const Color(0xCC16161C)
+            : const Color(0xCCFBFBFD),
+        textTheme: const CupertinoTextThemeData(
           textStyle: TextStyle(
             fontFamily: 'Microsoft YaHei UI',
             fontSize: 14,
             color: CupertinoColors.label,
           ),
         ),
+      );
+}
+
+class Luac2cApp extends StatelessWidget {
+  const Luac2cApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: ThemeCtl.I,
+      builder: (context, _) => CupertinoApp(
+        title: 'luac2c 客户端',
+        debugShowCheckedModeBanner: false,
+        theme: Glass.theme(),
+        home: const HomePage(),
       ),
-      home: HomePage(),
     );
   }
 }
@@ -169,7 +258,7 @@ List<String> _fromPathEnv(String name) {
 String trimTail(String s) => s.replaceFirst(RegExp(r'[\s]+$'), '');
 
 // ---------------------------------------------------------------- 通用组件
-/// iOS inset-grouped 卡片
+/// Liquid Glass 卡片：背景高斯模糊 + 半透明填充 + 顶部高光 + 边缘高光描边
 class IosCard extends StatelessWidget {
   final Widget child;
   final EdgeInsetsGeometry padding;
@@ -180,18 +269,33 @@ class IosCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      decoration: BoxDecoration(
-        color: kCardBg,
-        borderRadius: BorderRadius.circular(12),
-        boxShadow: const [
-          BoxShadow(
-              color: Color(0x08000000), blurRadius: 8, offset: Offset(0, 1))
-        ],
+    final r = BorderRadius.circular(14);
+    return DecoratedBox(
+      // 阴影画在最外层（BackdropFilter 会裁掉后面的阴影）
+      decoration: BoxDecoration(borderRadius: r, boxShadow: Glass.cardShadow),
+      child: ClipRRect(
+        borderRadius: r,
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+          child: Container(
+            width: double.infinity,
+            // 垂直渐变：顶部高光 -> 主体填充，模拟玻璃受光面
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [Glass.cardGloss, Glass.cardFill, Glass.cardFill],
+                stops: const [0, 0.35, 1],
+              ),
+              borderRadius: r,
+              // 内发光式边缘高光：液态玻璃的折射轮廓
+              border: Border.all(color: Glass.cardEdge, width: 0.8),
+            ),
+            padding: padding,
+            child: child,
+          ),
+        ),
       ),
-      padding: padding,
-      child: child,
     );
   }
 }
@@ -572,51 +676,126 @@ class _HomePageState extends State<HomePage> {
   // ---------------------------------------------------------------- UI
   @override
   Widget build(BuildContext context) {
-    return CupertinoPageScaffold(
-      navigationBar: CupertinoNavigationBar(
-        middle: Row(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 22,
-            height: 22,
-            decoration: BoxDecoration(
-              color: CupertinoColors.systemBlue,
-              borderRadius: BorderRadius.circular(6),
+    // 液态玻璃需要"透"出东西：渐变底 + 色斑作为折射源，卡片再 BackdropFilter 模糊它
+    return Stack(children: [
+      Positioned.fill(child: ColoredBox(color: Glass.pageBottom, child: _glassBackdrop())),
+      CupertinoPageScaffold(
+        backgroundColor: CupertinoColors.transparent,
+        navigationBar: CupertinoNavigationBar(
+          middle: Row(mainAxisSize: MainAxisSize.min, children: [
+            Container(
+              width: 22,
+              height: 22,
+              decoration: BoxDecoration(
+                color: CupertinoColors.systemBlue,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              alignment: Alignment.center,
+              child: const Icon(CupertinoIcons.chevron_left_slash_chevron_right,
+                  size: 13, color: CupertinoColors.white),
             ),
-            alignment: Alignment.center,
-            child: const Icon(CupertinoIcons.chevron_left_slash_chevron_right,
-                size: 13, color: CupertinoColors.white),
+            const SizedBox(width: 8),
+            const Text('luac2c 客户端',
+                style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600)),
+          ]),
+          trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              minimumSize: const Size(0, 30),
+              onPressed: () => ThemeCtl.I.toggle(),
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 250),
+                transitionBuilder: (c, a) =>
+                    FadeTransition(opacity: a, child: c),
+                child: Icon(
+                  key: ValueKey<bool>(ThemeCtl.I.dark),
+                  ThemeCtl.I.dark
+                      ? CupertinoIcons.sun_max_fill
+                      : CupertinoIcons.moon_fill,
+                  size: 20,
+                  color: ThemeCtl.I.dark
+                      ? CupertinoColors.systemYellow
+                      : CupertinoColors.systemIndigo,
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              minimumSize: const Size(0, 30),
+              onPressed: _showAbout,
+              child: const Icon(CupertinoIcons.info_circle, size: 21),
+            ),
+          ]),
+        ),
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _sourceCard(),
+                const SizedBox(height: 12),
+                _modeCard(),
+                const SizedBox(height: 12),
+                _toolsCard(),
+                const SizedBox(height: 12),
+                _actionsCard(),
+                const SizedBox(height: 10),
+                _statusBar(),
+                const SizedBox(height: 10),
+                Expanded(child: _logCard()),
+              ],
+            ),
           ),
-          const SizedBox(width: 8),
-          const Text('luac2c 客户端',
-              style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600)),
-        ]),
-        trailing: CupertinoButton(
-          padding: EdgeInsets.zero,
-          minimumSize: const Size(0, 30),
-          onPressed: _showAbout,
-          child: const Icon(CupertinoIcons.info_circle, size: 21),
         ),
       ),
-      child: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _sourceCard(),
-              const SizedBox(height: 12),
-              _modeCard(),
-              const SizedBox(height: 12),
-              _toolsCard(),
-              const SizedBox(height: 12),
-              _actionsCard(),
-              const SizedBox(height: 10),
-              _statusBar(),
-              const SizedBox(height: 10),
-              Expanded(child: _logCard()),
-            ],
+    ]);
+  }
+
+  /// 玻璃背后的"折射源"：对角渐变 + 三团柔和色斑
+  Widget _glassBackdrop() {
+    return IgnorePointer(
+      child: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Glass.pageTop, Glass.pageBottom],
           ),
         ),
+        child: Stack(children: [
+          Positioned(
+            top: -110,
+            left: -70,
+            child: _blob(320, Glass.blob1),
+          ),
+          Positioned(
+            top: 180,
+            right: -90,
+            child: _blob(360, Glass.blob2),
+          ),
+          Positioned(
+            bottom: -120,
+            left: 60,
+            child: _blob(300, Glass.blob3),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  /// 单个径向渐变模糊色斑
+  Widget _blob(double size, Color color) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: RadialGradient(colors: [
+          color,
+          color.withValues(alpha: 0.0),
+        ]),
       ),
     );
   }
@@ -658,7 +837,7 @@ class _HomePageState extends State<HomePage> {
                 : Container(
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: CupertinoColors.tertiarySystemFill,
+                      color: Glass.fill,
                       borderRadius: BorderRadius.circular(9),
                     ),
                     child: const Text('点击「添加文件」多选，或把多个 .lua 文件拖进窗口',
@@ -675,7 +854,7 @@ class _HomePageState extends State<HomePage> {
                 child: CupertinoButton(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   borderRadius: BorderRadius.circular(9),
-                  color: CupertinoColors.tertiarySystemFill,
+                  color: Glass.fill,
                   onPressed: _busy ? null : pickFile,
                   child: const Row(
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -707,7 +886,7 @@ class _HomePageState extends State<HomePage> {
               child: CupertinoButton(
                 padding: const EdgeInsets.symmetric(horizontal: 14),
                 borderRadius: BorderRadius.circular(9),
-                color: CupertinoColors.tertiarySystemFill,
+                color: Glass.fill,
                 onPressed: openOutDir,
                 child: const Row(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -744,7 +923,7 @@ class _HomePageState extends State<HomePage> {
   Widget _fileList() {
     return Container(
       decoration: BoxDecoration(
-        color: CupertinoColors.tertiarySystemFill,
+        color: Glass.fill,
         borderRadius: BorderRadius.circular(9),
       ),
       child: ListView.separated(
@@ -815,7 +994,7 @@ class _HomePageState extends State<HomePage> {
             Expanded(
               child: CupertinoSlidingSegmentedControl<int>(
                 groupValue: _mode,
-                thumbColor: CupertinoColors.white,
+                thumbColor: Glass.segThumb,
                 children: const {
                   0: _SegText('默认多样化'),
                   1: _SegText('指定种子'),
@@ -841,7 +1020,7 @@ class _HomePageState extends State<HomePage> {
                   style: const TextStyle(fontSize: 12.5),
                   padding: const EdgeInsets.symmetric(horizontal: 6),
                   decoration: BoxDecoration(
-                    color: CupertinoColors.tertiarySystemFill,
+                    color: Glass.fill,
                     borderRadius: BorderRadius.circular(8),
                   ),
                 ),
@@ -990,7 +1169,7 @@ class _HomePageState extends State<HomePage> {
       child: CupertinoButton(
         padding: const EdgeInsets.symmetric(horizontal: 6),
         borderRadius: BorderRadius.circular(9),
-        color: CupertinoColors.tertiarySystemFill,
+        color: Glass.fill,
         onPressed: _busy ? null : onTap,
         child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
           Icon(icon, size: 14, color: CupertinoColors.activeBlue),
@@ -1054,10 +1233,12 @@ class _HomePageState extends State<HomePage> {
 
   // ---- 日志 ----
   Widget _logCard() {
+    final logFg = Glass.logFg;
     return Container(
       decoration: BoxDecoration(
-        color: kLogBg,
+        color: Glass.logBg,
         borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Glass.logBorder, width: 0.8),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1065,37 +1246,37 @@ class _HomePageState extends State<HomePage> {
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 8, 6),
             child: Row(children: [
-              const Icon(CupertinoIcons.doc_richtext, size: 13, color: kLogFg),
+              Icon(CupertinoIcons.doc_richtext, size: 13, color: logFg),
               const SizedBox(width: 7),
-              const Text('输出日志',
+              Text('输出日志',
                   style: TextStyle(
                       fontSize: 12.5,
                       fontWeight: FontWeight.w600,
-                      color: kLogFg)),
+                      color: logFg)),
               const Spacer(),
               CupertinoButton(
                 minimumSize: const Size(0, 26),
                 padding: const EdgeInsets.symmetric(horizontal: 8),
                 onPressed: copyLog,
-                child: const Row(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(CupertinoIcons.doc_on_doc, size: 12, color: kLogFg),
-                  SizedBox(width: 4),
-                  Text('复制', style: TextStyle(fontSize: 11.5, color: kLogFg)),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(CupertinoIcons.doc_on_doc, size: 12, color: logFg),
+                  const SizedBox(width: 4),
+                  Text('复制', style: TextStyle(fontSize: 11.5, color: logFg)),
                 ]),
               ),
               CupertinoButton(
                 minimumSize: const Size(0, 26),
                 padding: const EdgeInsets.symmetric(horizontal: 8),
                 onPressed: () => setState(_logLines.clear),
-                child: const Row(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(CupertinoIcons.trash, size: 12, color: kLogFg),
-                  SizedBox(width: 4),
-                  Text('清空', style: TextStyle(fontSize: 11.5, color: kLogFg)),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(CupertinoIcons.trash, size: 12, color: logFg),
+                  const SizedBox(width: 4),
+                  Text('清空', style: TextStyle(fontSize: 11.5, color: logFg)),
                 ]),
               ),
             ]),
           ),
-          const Divider(height: 1, thickness: 1, color: Color(0xFF3A3A3C)),
+          Divider(height: 1, thickness: 1, color: Glass.logBorder),
           Expanded(
             child: CupertinoScrollbar(
               controller: _logScroll,
@@ -1104,12 +1285,12 @@ class _HomePageState extends State<HomePage> {
                 padding: const EdgeInsets.all(12),
                 child: SelectableText(
                   _logLines.isEmpty ? '（暂无输出）' : _logLines.join('\n'),
-                  style: const TextStyle(
+                  style: TextStyle(
                       fontFamily: 'Consolas',
                       fontFamilyFallback: ['Microsoft YaHei UI'],
                       fontSize: 12,
                       height: 1.45,
-                      color: kLogFg),
+                      color: logFg),
                 ),
               ),
             ),
