@@ -1,0 +1,39 @@
+# ---- 运行/测试产生的中间产物 ----
+*.luac
+*_out.c
+*_out.exe
+*_sw.c
+*_sw.exe
+*_sws.c
+*_sws.exe
+test/_test_report.txt
+test/_sweep.txt
+_hash*.txt
+_hash*.json
+
+# ---- 工具二进制（可由源码重建，不入库） ----
+*.exe
+*.obj
+*.pdb
+*.ilk
+
+# ---- 本地工作目录（不上传） ----
+.workbuddy/
+.claude/
+data/
+flutter_windows.dll
+luac2c_client.exe
+
+# ---- Flutter / Dart ----
+.dart_tool/
+.idea/
+build/
+dist/
+windows/flutter/ephemeral/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
+
+# ---- 系统杂项 ----
+Thumbs.db
+Desktop.ini
