@@ -19,6 +19,33 @@ void main() async {
   await ThemeCtl.I.load();
   await LiquidGlassWidgets.initialize(); // 预热着色器
   runApp(const Luac2cApp());
+  // 诊断：确认首帧真的完成了
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    debugPrint('FIRST_FRAME_OK');
+  });
+}
+
+/// 低对比点阵网格画笔（折射纹理源）
+class _DotGridPainter extends CustomPainter {
+  final Color color;
+  final double spacing;
+  final double dotSize;
+  const _DotGridPainter(
+      {required this.color, required this.spacing, required this.dotSize});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = color;
+    for (double x = spacing / 2; x < size.width; x += spacing) {
+      for (double y = spacing / 2; y < size.height; y += spacing) {
+        canvas.drawCircle(Offset(x, y), dotSize, paint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DotGridPainter old) =>
+      old.color != color || old.spacing != spacing;
 }
 
 // ---------------------------------------------------------------- 主题控制
@@ -112,6 +139,9 @@ class Luac2cApp extends StatelessWidget {
         theme: GlassThemeData(
           brightness: ThemeCtl.I.dark ? Brightness.dark : Brightness.light,
         ),
+        // 开启自适应质量：Windows 上会把质量上限压到 standard，
+        // 避免 GlassAppBar 内部强制 premium 多通道着色器导致白屏
+        adaptiveQuality: true,
         child: CupertinoApp(
           title: 'luac2c 客户端',
           debugShowCheckedModeBanner: false,
@@ -628,10 +658,24 @@ class _HomePageState extends State<HomePage> {
     // 玻璃材质保留给导航层与控制层（顶栏、分段控件、开关、按钮），
     // 内容区（源文件列表、工具链、日志）用不透明/半透明卡片。
     return GlassScaffold(
-      // 玻璃的"折射源"：对角渐变 + 三团柔和色斑
+      // 玻璃的"折射源"：对角渐变 + 三团柔和色斑 + 细点阵纹理（折射需要背景有细节）
       background: SizedBox.expand(child: _glassBackdrop()),
       backgroundColor: Glass.pageBottom,
       statusBarStyle: GlassStatusBarStyle.none,
+      // 页面级共享玻璃层参数：加厚玻璃、增强折射与边缘光
+      settings: LiquidGlassSettings(
+        glassColor:
+            ThemeCtl.I.dark ? const Color(0x1FFFFFFF) : const Color(0x5CFFFFFF),
+        thickness: 24, // 玻璃厚度：折射变形范围
+        blur: 12, // 磨砂强度（过大会糊且费性能）
+        refractiveIndex: 1.45, // 折射率：越大边缘变形越明显
+        lightAngle: 0.6,
+        lightIntensity: 1.3,
+        ambientStrength: 0.8,
+        ambientRim: 0.6,
+        fresnelStrength: 0.9, // 菲涅尔边缘光
+        saturation: 1.1,
+      ),
       // Windows 固定高度布局，不需要滚动边缘淡出
       extendBody: false,
       edgeFade: false,
@@ -703,8 +747,10 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// 玻璃背后的"折射源"：对角渐变 + 三团柔和色斑
+  /// 玻璃背后的"折射源"：对角渐变 + 三团柔和色斑 + 细点阵（折射可见性）
   Widget _glassBackdrop() {
+    final dot =
+        (ThemeCtl.I.dark ? const Color(0x14FFFFFF) : const Color(0x12000000));
     return IgnorePointer(
       child: Container(
         decoration: BoxDecoration(
@@ -715,6 +761,12 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         child: Stack(children: [
+          // 点阵网格：玻璃折射会把点拉弯，效果立刻可见
+          Positioned.fill(
+            child: CustomPaint(
+              painter: _DotGridPainter(color: dot, spacing: 22, dotSize: 1.6),
+            ),
+          ),
           Positioned(
             top: -110,
             left: -70,

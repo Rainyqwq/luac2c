@@ -39,13 +39,10 @@ bool FlutterWindow::OnCreate() {
   // 允许把文件拖进窗口
   DragAcceptFiles(GetHandle(), TRUE);
 
-  flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
-  });
-
-  // Flutter can complete the first frame before the "show window" callback is
-  // registered. The following call ensures a frame is pending to ensure the
-  // window is shown. It is a no-op if the first frame hasn't completed yet.
+  // 注意：不用 SetNextFrameCallback 再 Show——玻璃着色器初始化异常时首帧
+  // 永远不来，窗口会一直不显示（表现为"进程在但打不开"）。直接显示窗口，
+  // 即使渲染慢也先让用户看到窗体。
+  this->Show();
   flutter_controller_->ForceRedraw();
 
   return true;
