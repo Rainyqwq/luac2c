@@ -107,6 +107,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "6.1.0"
+  liquid_glass_widgets:
+    dependency: "direct main"
+    description:
+      name: liquid_glass_widgets
+      sha256: b00e51b4b72f4164fac39aa75b8072ea97d1955d91b703d1f354464b082f5b98
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.4.4"
   matcher:
     dependency: transitive
     description:
@@ -210,4 +218,4 @@ packages:
     version: "15.3.0"
 sdks:
   dart: ">=3.13.3 <4.0.0"
-  flutter: ">=3.18.0-18.0.pre.54"
+  flutter: ">=3.41.0"

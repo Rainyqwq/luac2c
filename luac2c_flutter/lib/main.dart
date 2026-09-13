@@ -7,16 +7,17 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/cupertino.dart';
 // 以下三个仅存在于 material：日志可选中文本、悬浮提示、分隔线
 import 'package:flutter/material.dart' show SelectableText, Tooltip, Divider;
 import 'package:flutter/services.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await ThemeCtl.I.load();
+  await LiquidGlassWidgets.initialize(); // 预热着色器
   runApp(const Luac2cApp());
 }
 
@@ -53,6 +54,7 @@ class ThemeCtl extends ChangeNotifier {
 }
 
 // ---------------------------------------------------------------- Liquid Glass 调色板
+/// 玻璃材质由 liquid_glass_widgets 提供；这里只保留页面底色、折射色斑与日志终端色
 class Glass {
   static bool get dark => ThemeCtl.I.dark;
 
@@ -71,37 +73,15 @@ class Glass {
       ? CupertinoColors.systemTeal.withValues(alpha: 0.22)
       : CupertinoColors.systemPink.withValues(alpha: 0.20);
 
-  // 玻璃卡片
-  static Color get cardFill => dark
-      ? const Color(0x14FFFFFF)
-      : const Color(0x99FFFFFF);
-  static Color get cardEdge => dark
-      ? const Color(0x2EFFFFFF)
-      : const Color(0x73FFFFFF);
-  static Color get cardGloss => dark
+  // 普通填充（非玻璃控件：输入框等）
+  static Color get fill => dark
       ? const Color(0x1FFFFFFF)
-      : const Color(0x55FFFFFF);
-  static List<BoxShadow> get cardShadow => [
-        BoxShadow(
-            color: dark ? const Color(0x66000000) : const Color(0x1A000000),
-            blurRadius: 20,
-            offset: const Offset(0, 8)),
-      ];
-
-  static Color get title => dark
-      ? CupertinoColors.systemGrey
-      : const Color(0xFF6D6D72);
+      : CupertinoColors.tertiarySystemFill;
 
   // 日志终端（两种模式都保持深色控制台，暗色下更深）
   static Color get logBg => dark ? const Color(0xFF101014) : const Color(0xFF1C1C1E);
   static const Color logFg = Color(0xFFE8E8ED);
   static Color get logBorder => dark ? const Color(0xFF2C2C30) : const Color(0xFF3A3A3C);
-
-  static Color get segThumb => dark ? const Color(0xFF5A5A60) : CupertinoColors.white;
-
-  static Color get fill => dark
-      ? const Color(0x1FFFFFFF)
-      : CupertinoColors.tertiarySystemFill;
 
   static CupertinoThemeData theme() => CupertinoThemeData(
         brightness: dark ? Brightness.dark : Brightness.light,
@@ -127,11 +107,17 @@ class Luac2cApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: ThemeCtl.I,
-      builder: (context, _) => CupertinoApp(
-        title: 'luac2c 客户端',
-        debugShowCheckedModeBanner: false,
-        theme: Glass.theme(),
-        home: const HomePage(),
+      builder: (context, _) => LiquidGlassWidgets.wrap(
+        // 把明暗主题接入库的 brightness 级联（玻璃明暗、光泽随之切换）
+        theme: GlassThemeData(
+          brightness: ThemeCtl.I.dark ? Brightness.dark : Brightness.light,
+        ),
+        child: CupertinoApp(
+          title: 'luac2c 客户端',
+          debugShowCheckedModeBanner: false,
+          theme: Glass.theme(),
+          home: const HomePage(),
+        ),
       ),
     );
   }
@@ -258,48 +244,6 @@ List<String> _fromPathEnv(String name) {
 String trimTail(String s) => s.replaceFirst(RegExp(r'[\s]+$'), '');
 
 // ---------------------------------------------------------------- 通用组件
-/// Liquid Glass 卡片：背景高斯模糊 + 半透明填充 + 顶部高光 + 边缘高光描边
-class IosCard extends StatelessWidget {
-  final Widget child;
-  final EdgeInsetsGeometry padding;
-  const IosCard(
-      {super.key,
-      required this.child,
-      this.padding = const EdgeInsets.symmetric(horizontal: 16, vertical: 14)});
-
-  @override
-  Widget build(BuildContext context) {
-    final r = BorderRadius.circular(14);
-    return DecoratedBox(
-      // 阴影画在最外层（BackdropFilter 会裁掉后面的阴影）
-      decoration: BoxDecoration(borderRadius: r, boxShadow: Glass.cardShadow),
-      child: ClipRRect(
-        borderRadius: r,
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-          child: Container(
-            width: double.infinity,
-            // 垂直渐变：顶部高光 -> 主体填充，模拟玻璃受光面
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [Glass.cardGloss, Glass.cardFill, Glass.cardFill],
-                stops: const [0, 0.35, 1],
-              ),
-              borderRadius: r,
-              // 内发光式边缘高光：液态玻璃的折射轮廓
-              border: Border.all(color: Glass.cardEdge, width: 0.8),
-            ),
-            padding: padding,
-            child: child,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 /// 卡片内小标题
 class SectionTitle extends StatelessWidget {
   final String text;
@@ -671,86 +615,92 @@ class _HomePageState extends State<HomePage> {
   Future<void> _msg(String m) async {
     log('! $m');
     setStatus(m);
+    if (mounted) {
+      GlassToast.show(context,
+          message: m, type: GlassToastType.info, position: GlassToastPosition.top);
+    }
   }
 
   // ---------------------------------------------------------------- UI
   @override
   Widget build(BuildContext context) {
-    // 液态玻璃需要"透"出东西：渐变底 + 色斑作为折射源，卡片再 BackdropFilter 模糊它
-    return Stack(children: [
-      Positioned.fill(child: ColoredBox(color: Glass.pageBottom, child: _glassBackdrop())),
-      CupertinoPageScaffold(
-        backgroundColor: CupertinoColors.transparent,
-        navigationBar: CupertinoNavigationBar(
-          middle: Row(mainAxisSize: MainAxisSize.min, children: [
-            Container(
-              width: 22,
-              height: 22,
-              decoration: BoxDecoration(
-                color: CupertinoColors.systemBlue,
-                borderRadius: BorderRadius.circular(6),
-              ),
-              alignment: Alignment.center,
-              child: const Icon(CupertinoIcons.chevron_left_slash_chevron_right,
-                  size: 13, color: CupertinoColors.white),
+    // 遵循 liquid_glass_widgets 的 iOS 26 设计哲学：
+    // 玻璃材质保留给导航层与控制层（顶栏、分段控件、开关、按钮），
+    // 内容区（源文件列表、工具链、日志）用不透明/半透明卡片。
+    return GlassScaffold(
+      // 玻璃的"折射源"：对角渐变 + 三团柔和色斑
+      background: SizedBox.expand(child: _glassBackdrop()),
+      backgroundColor: Glass.pageBottom,
+      statusBarStyle: GlassStatusBarStyle.none,
+      // Windows 固定高度布局，不需要滚动边缘淡出
+      extendBody: false,
+      edgeFade: false,
+      appBar: GlassAppBar(
+        title: Row(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 22,
+            height: 22,
+            decoration: BoxDecoration(
+              color: CupertinoColors.systemBlue,
+              borderRadius: BorderRadius.circular(6),
             ),
-            const SizedBox(width: 8),
-            const Text('luac2c 客户端',
-                style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600)),
-          ]),
-          trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-            CupertinoButton(
-              padding: EdgeInsets.zero,
-              minimumSize: const Size(0, 30),
-              onPressed: () => ThemeCtl.I.toggle(),
-              child: AnimatedSwitcher(
-                duration: const Duration(milliseconds: 250),
-                transitionBuilder: (c, a) =>
-                    FadeTransition(opacity: a, child: c),
-                child: Icon(
-                  key: ValueKey<bool>(ThemeCtl.I.dark),
-                  ThemeCtl.I.dark
-                      ? CupertinoIcons.sun_max_fill
-                      : CupertinoIcons.moon_fill,
-                  size: 20,
-                  color: ThemeCtl.I.dark
-                      ? CupertinoColors.systemYellow
-                      : CupertinoColors.systemIndigo,
-                ),
-              ),
-            ),
-            const SizedBox(width: 4),
-            CupertinoButton(
-              padding: EdgeInsets.zero,
-              minimumSize: const Size(0, 30),
-              onPressed: _showAbout,
-              child: const Icon(CupertinoIcons.info_circle, size: 21),
-            ),
-          ]),
-        ),
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 14),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _sourceCard(),
-                const SizedBox(height: 12),
-                _modeCard(),
-                const SizedBox(height: 12),
-                _toolsCard(),
-                const SizedBox(height: 12),
-                _actionsCard(),
-                const SizedBox(height: 10),
-                _statusBar(),
-                const SizedBox(height: 10),
-                Expanded(child: _logCard()),
-              ],
-            ),
+            alignment: Alignment.center,
+            child: const Icon(CupertinoIcons.chevron_left_slash_chevron_right,
+                size: 13, color: CupertinoColors.white),
           ),
+          const SizedBox(width: 8),
+          const Text('luac2c 客户端',
+              style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600)),
+        ]),
+        actions: [
+          GlassButton(
+            icon: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 250),
+              transitionBuilder: (c, a) => FadeTransition(opacity: a, child: c),
+              child: Icon(
+                key: ValueKey<bool>(ThemeCtl.I.dark),
+                ThemeCtl.I.dark
+                    ? CupertinoIcons.sun_max_fill
+                    : CupertinoIcons.moon_fill,
+                size: 19,
+                color: ThemeCtl.I.dark
+                    ? CupertinoColors.systemYellow
+                    : CupertinoColors.systemIndigo,
+              ),
+            ),
+            onTap: () => ThemeCtl.I.toggle(),
+            width: 38,
+            height: 38,
+          ),
+          const SizedBox(width: 8),
+          GlassButton(
+            icon: const Icon(CupertinoIcons.info_circle, size: 19),
+            onTap: _showAbout,
+            width: 38,
+            height: 38,
+          ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _sourceCard(),
+            const SizedBox(height: 12),
+            _modeSection(),
+            const SizedBox(height: 12),
+            _toolsCard(),
+            const SizedBox(height: 12),
+            _actionsSection(),
+            const SizedBox(height: 10),
+            _statusBar(),
+            const SizedBox(height: 10),
+            Expanded(child: _logCard()),
+          ],
         ),
       ),
-    ]);
+    );
   }
 
   /// 玻璃背后的"折射源"：对角渐变 + 三团柔和色斑
@@ -803,7 +753,7 @@ class _HomePageState extends State<HomePage> {
   // ---- 源文件（批量列表） ----
   Widget _sourceCard() {
     final hasFiles = _files.isNotEmpty;
-    return IosCard(
+    return GlassCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -981,71 +931,68 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // ---- 翻译模式与选项 ----
-  Widget _modeCard() {
-    return IosCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const SectionTitle('翻译模式',
-              icon: CupertinoIcons.slider_horizontal_3),
-          const SizedBox(height: 10),
-          Row(children: [
-            Expanded(
-              child: CupertinoSlidingSegmentedControl<int>(
-                groupValue: _mode,
-                thumbColor: Glass.segThumb,
-                children: const {
-                  0: _SegText('默认多样化'),
-                  1: _SegText('指定种子'),
-                  2: _SegText('--static'),
-                },
-                onValueChanged: (v) {
-                  if (v != null && !_busy) setState(() => _mode = v);
-                },
-              ),
+  // ---- 翻译模式与选项（玻璃控制层：控件直接浮在背景上，遵循 Apple 的玻璃分层原则） ----
+  Widget _modeSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SectionTitle('翻译模式',
+            icon: CupertinoIcons.slider_horizontal_3),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(
+            child: GlassSegmentedControl(
+              segments: const [
+                GlassSegment(label: '默认多样化'),
+                GlassSegment(label: '指定种子'),
+                GlassSegment(label: '--static'),
+              ],
+              selectedIndex: _mode,
+              onSegmentSelected: (i) {
+                if (!_busy) setState(() => _mode = i);
+              },
             ),
-            const SizedBox(width: 10),
-            Opacity(
-              opacity: _mode == 1 ? 1 : 0.45,
-              child: SizedBox(
-                width: 78,
-                height: 32,
-                child: CupertinoTextField(
-                  controller: _seed,
-                  enabled: !_busy && _mode == 1,
-                  placeholder: 'seed',
-                  textAlign: TextAlign.center,
-                  keyboardType: TextInputType.number,
-                  style: const TextStyle(fontSize: 12.5),
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                  decoration: BoxDecoration(
-                    color: Glass.fill,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
+          ),
+          const SizedBox(width: 10),
+          Opacity(
+            opacity: _mode == 1 ? 1 : 0.45,
+            child: SizedBox(
+              width: 78,
+              height: 32,
+              child: CupertinoTextField(
+                controller: _seed,
+                enabled: !_busy && _mode == 1,
+                placeholder: 'seed',
+                textAlign: TextAlign.center,
+                keyboardType: TextInputType.number,
+                style: const TextStyle(fontSize: 12.5),
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                decoration: BoxDecoration(
+                  color: Glass.fill,
+                  borderRadius: BorderRadius.circular(8),
                 ),
               ),
             ),
-          ]),
-          const SizedBox(height: 4),
-          const Divider(height: 22, thickness: 0.5),
-          _switchRow(
-            icon: CupertinoIcons.cube,
-            title: '--no-pool',
-            subtitle: '关闭常量池，字面量直接进源码，便于调试',
-            value: _nopool,
-            onChanged: (v) => _nopool = v,
           ),
-          const SizedBox(height: 4),
-          _switchRow(
-            icon: CupertinoIcons.text_alignleft,
-            title: '--annotate',
-            subtitle: '在生成的 C 代码中保留 opcode 注释',
-            value: _annot,
-            onChanged: (v) => _annot = v,
-          ),
-        ],
-      ),
+        ]),
+        const SizedBox(height: 6),
+        const Divider(height: 22, thickness: 0.5),
+        _switchRow(
+          icon: CupertinoIcons.cube,
+          title: '--no-pool',
+          subtitle: '关闭常量池，字面量直接进源码，便于调试',
+          value: _nopool,
+          onChanged: (v) => _nopool = v,
+        ),
+        const SizedBox(height: 4),
+        _switchRow(
+          icon: CupertinoIcons.text_alignleft,
+          title: '--annotate',
+          subtitle: '在生成的 C 代码中保留 opcode 注释',
+          value: _annot,
+          onChanged: (v) => _annot = v,
+        ),
+      ],
     );
   }
 
@@ -1073,17 +1020,18 @@ class _HomePageState extends State<HomePage> {
           ],
         ),
       ),
-      CupertinoSwitch(
+      GlassSwitch(
         value: value,
-        activeTrackColor: CupertinoColors.systemGreen,
-        onChanged: _busy ? null : (x) => setState(() => onChanged(x)),
+        onChanged: (x) {
+          if (!_busy) setState(() => onChanged(x));
+        },
       ),
     ]);
   }
 
   // ---- 工具链 ----
   Widget _toolsCard() {
-    return IosCard(
+    return GlassCard(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1115,74 +1063,65 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // ---- 操作按钮 ----
-  Widget _actionsCard() {
-    return IosCard(
-      padding: const EdgeInsets.all(12),
-      child: Column(children: [
-        SizedBox(
-          width: double.infinity,
-          height: 42,
-          child: CupertinoButton.filled(
-            padding: EdgeInsets.zero,
-            borderRadius: BorderRadius.circular(10),
-            onPressed: _busy ? null : () => runPipeline(full: true),
-            child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-              if (_busy)
-                const CupertinoActivityIndicator(
-                    radius: 8, color: CupertinoColors.white)
-              else
-                const Icon(CupertinoIcons.play_arrow_solid, size: 15),
-              const SizedBox(width: 8),
-              const Text('一键流水线',
-                  style:
-                      TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600)),
-              const SizedBox(width: 4),
-              Text('（翻译 → 编译 → 运行 → 比对）',
-                  style: TextStyle(
-                      fontSize: 11.5,
-                      color: CupertinoColors.white.withValues(alpha: 0.75))),
-            ]),
-          ),
-        ),
-        const SizedBox(height: 9),
-        Row(children: [
-          Expanded(
-              child: _minorButton(CupertinoIcons.doc_plaintext, '仅翻译 C',
-                  () => runPipeline(full: false))),
-          const SizedBox(width: 9),
-          Expanded(
-              child: _minorButton(CupertinoIcons.arrow_2_circlepath,
-                  '重建 luac2c', rebuildLuac2c)),
-          const SizedBox(width: 9),
-          Expanded(
-              child: _minorButton(
-                  CupertinoIcons.folder_open, '输出目录', openOutDir)),
+  // ---- 操作按钮（玻璃控制层） ----
+  Widget _actionsSection() {
+    return Column(children: [
+      GlassButton.custom(
+        onTap: () => runPipeline(full: true),
+        enabled: !_busy,
+        height: 44,
+        width: double.infinity,
+        shape: const LiquidRoundedSuperellipse(borderRadius: 14),
+        style: GlassButtonStyle.prominent,
+        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+          if (_busy)
+            const CupertinoActivityIndicator(radius: 8)
+          else
+            const Icon(CupertinoIcons.play_arrow_solid, size: 15),
+          const SizedBox(width: 8),
+          const Text('一键流水线',
+              style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600)),
+          const SizedBox(width: 4),
+          Text('（翻译 → 编译 → 运行 → 比对）',
+              style: TextStyle(
+                  fontSize: 11.5,
+                  color: CupertinoColors.white.withValues(alpha: 0.75))),
         ]),
+      ),
+      const SizedBox(height: 9),
+      Row(children: [
+        Expanded(
+            child: _minorButton(CupertinoIcons.doc_plaintext, '仅翻译 C',
+                () => runPipeline(full: false))),
+        const SizedBox(width: 9),
+        Expanded(
+            child: _minorButton(CupertinoIcons.arrow_2_circlepath,
+                '重建 luac2c', rebuildLuac2c)),
+        const SizedBox(width: 9),
+        Expanded(
+            child: _minorButton(
+                CupertinoIcons.folder_open, '输出目录', openOutDir)),
       ]),
-    );
+    ]);
   }
 
   Widget _minorButton(IconData icon, String label, VoidCallback onTap) {
-    return SizedBox(
+    return GlassButton.custom(
+      onTap: onTap,
+      enabled: !_busy,
       height: 36,
-      child: CupertinoButton(
-        padding: const EdgeInsets.symmetric(horizontal: 6),
-        borderRadius: BorderRadius.circular(9),
-        color: Glass.fill,
-        onPressed: _busy ? null : onTap,
-        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Icon(icon, size: 14, color: CupertinoColors.activeBlue),
-          const SizedBox(width: 6),
-          Flexible(
-            child: Text(label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                    fontSize: 12.5, color: CupertinoColors.activeBlue)),
-          ),
-        ]),
-      ),
+      shape: const LiquidRoundedSuperellipse(borderRadius: 11),
+      child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+        Icon(icon, size: 14, color: CupertinoColors.activeBlue),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                  fontSize: 12.5, color: CupertinoColors.activeBlue)),
+        ),
+      ]),
     );
   }
 
@@ -1331,19 +1270,6 @@ class _HomePageState extends State<HomePage> {
               onPressed: () => Navigator.of(ctx).pop()),
         ],
       ),
-    );
-  }
-}
-
-class _SegText extends StatelessWidget {
-  final String text;
-  const _SegText(this.text);
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Text(text, style: const TextStyle(fontSize: 12.5)),
     );
   }
 }

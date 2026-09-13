@@ -35,11 +35,14 @@ out.exe                          # 3. 运行，输出与 lua.exe 完全一致
   - 常量池强化：双密钥混合的常量池解码
   - 控制流扁平化：状态机分发器改写全部控制流
   - 函数切分：函数体切分为指针表调用的块函数
-- **GUI 客户端**（`luac2c_flutter/`，Cupertino/iOS 风格）：
+- **GUI 客户端**（`luac2c_flutter/`，iOS 26 Liquid Glass 设计语言）：
   - 一键流水线：翻译 → 编译 → 运行 → 与 lua.exe 逐字节比对
   - **批量模式**：多选/拖入多个 `.lua` 文件依次处理，逐文件标记通过/失败
   - 工具自动探测：exe 同目录 → 根目录 → 系统 `PATH` 环境变量，可被 `luac2c_gui.ini` 覆盖
   - 三种翻译模式 + `--no-pool` / `--annotate`，实时日志，一键重建 luac2c
+  - **Apple Liquid Glass**：基于 [liquid_glass_widgets](https://pub.dev/packages/liquid_glass_widgets)
+    的着色器玻璃（GlassScaffold / GlassCard / GlassSegmentedControl / GlassSwitch / GlassButton / GlassToast），
+    遵循 Apple 设计规范（玻璃只用于导航与控制层，内容区保持可读），支持深色模式（右上角切换并持久化）
 
 ## 构建客户端
 
