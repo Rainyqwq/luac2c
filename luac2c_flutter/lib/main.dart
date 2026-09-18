@@ -181,6 +181,20 @@ class Tools {
   bool get luaOk => File(lua).existsSync();
   bool get gccOk => File(gcc).existsSync();
   bool get allOk => luacOk && l2cOk && luaOk && gccOk;
+
+  /// 状态签名：轮询时用它判断工具链是否真的变了，避免无谓的 setState
+  String get signature {
+    String e(String p) => File(p).existsSync() ? '1' : '0';
+    return '$root|$luac${e(luac)}|$l2c${e(l2c)}|$lua${e(lua)}|$gcc${e(gcc)}';
+  }
+
+  /// 缺失的工具名列表（用于一次性提示，而不是跑到一半才报错）
+  List<String> missing({required bool full}) => <String>[
+        if (!luacOk) 'luac',
+        if (!l2cOk) 'luac2c',
+        if (full && !gccOk) 'gcc',
+        if (full && !luaOk) 'lua',
+      ];
 }
 
 Tools findTools() {
@@ -249,33 +263,127 @@ Tools findTools() {
 }
 
 // ---------------------------------------------------------------- 流程执行
+/// 子进程执行结果：退出码 + 输出 + 耗时 + 是否超时
 class StepResult {
   final int exitCode;
   final String output;
-  StepResult(this.exitCode, this.output);
+  final int ms;
+  final bool timeout;
+  StepResult(this.exitCode, this.output, {this.ms = 0, this.timeout = false});
 }
 
-Future<StepResult> runCapture(String exe, List<String> args, String? cwd) async {
+/// 子进程默认超时（防止某个环节卡死导致整条流水线永挂）
+const Duration kStepTimeout = Duration(seconds: 60);
+
+/// 单条命令最多收集的输出行数（防止日志爆炸拖垮 UI 与内存）
+const int kMaxOutputLines = 400;
+
+/// 当前存活的子进程（供"停止"时立即终止，而不是等步骤跑完）
+final List<Process> _activeProcs = <Process>[];
+
+/// 终止所有在跑的子进程
+void killActiveProcesses() {
+  for (final p in List<Process>.of(_activeProcs)) {
+    try {
+      p.kill();
+    } catch (_) {/* 已退出 */}
+  }
+  _activeProcs.clear();
+}
+
+/// 启动子进程并收集输出。
+/// 健壮性要点：
+///   1. 超时后 kill 进程，不再无限等待；
+///   2. 输出解码允许非法 UTF-8（中文 Windows 下 gcc/lua 的报错常是 GBK）；
+///   3. 输出行数截断，避免超大输出撑爆内存与日志控件；
+///   4. 记录耗时，便于定位慢步骤；
+///   5. 支持取消（[isCancelled]）。
+Future<StepResult> runCapture(String exe, List<String> args, String? cwd,
+    {Duration timeout = kStepTimeout, bool Function()? isCancelled}) async {
+  final sw = Stopwatch()..start();
+  if (isCancelled?.call() ?? false) {
+    return StepResult(-2, '已取消', ms: 0);
+  }
+  Process? p;
+  final subs = <StreamSubscription>[];
   try {
-    final p =
-        await Process.start(exe, args, workingDirectory: cwd, runInShell: false);
+    p = await Process.start(exe, args,
+        workingDirectory: cwd, runInShell: false);
+    _activeProcs.add(p);
     final out = <String>[];
-    final done = <Future>[];
-    done.add(p.stdout
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .forEach(out.add));
-    done.add(p.stderr
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .forEach(out.add));
-    await Future.wait(done);
+    var lines = 0;
+    var truncated = false;
+
+    void attach(Stream<List<int>> s) {
+      subs.add(s
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .transform(const LineSplitter())
+          .listen((l) {
+        if (lines >= kMaxOutputLines) {
+          truncated = true;
+          return;
+        }
+        lines++;
+        out.add(l);
+      }, onError: (_) {/* 解码异常不应中断流程 */}));
+    }
+
+    attach(p.stdout);
+    attach(p.stderr);
+
+    final streamsDone = Future.wait(subs.map((s) => s.asFuture()));
+    var timedOut = false;
+    try {
+      await Future.wait<Object?>([p.exitCode, streamsDone]).timeout(timeout,
+          onTimeout: () {
+        timedOut = true;
+        return <Object?>[];
+      });
+    } catch (_) {/* 子进程异常关闭等，不应中断流水线 */}
+
+    if (timedOut) {
+      p.kill(ProcessSignal.sigterm);
+      for (final s in subs) {
+        unawaited(s.cancel());
+      }
+      return StepResult(-3, '执行超时（${timeout.inSeconds}s），已终止进程',
+          ms: sw.elapsedMilliseconds, timeout: true);
+    }
+
     final code = await p.exitCode;
-    return StepResult(code, out.join('\n'));
+    if (truncated) {
+      out.add('… （输出已截断，仅保留前 $kMaxOutputLines 行）');
+    }
+    return StepResult(code, out.join('\n'), ms: sw.elapsedMilliseconds);
   } catch (e) {
-    return StepResult(-1, e.toString());
+    return StepResult(-1, e.toString(), ms: sw.elapsedMilliseconds);
+  } finally {
+    if (p != null) {
+      _activeProcs.remove(p);
+      // 进程已结束但流未收干净时，确保订阅被释放
+      for (final s in subs) {
+        unawaited(s.cancel());
+      }
+    }
   }
 }
+
+/// 单个文件的处理结果：是否通过 + 该文件产生的日志 + 耗时。
+/// 日志先攒在局部缓冲里，文件跑完再一次性入库，
+/// 这样并发处理多个文件时日志不会互相穿插。
+class FileOutcome {
+  final String path;
+  final bool ok;
+  final List<String> lines;
+  final int ms;
+  final bool cancelled;
+  FileOutcome(this.path, this.ok, this.lines,
+      {this.ms = 0, this.cancelled = false});
+}
+
+/// 换行统一为 LF，避免 CRLF 差异造成误判
+String _normalize(String s) =>
+    trimTail(s.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
 
 /// 从系统 PATH 环境变量里枚举某工具的候选路径
 List<String> _fromPathEnv(String name) {
@@ -353,6 +461,59 @@ class StatusDot extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------- 主界面
+/// 日志存储器：独立可监听容器 + 节流批量刷新。
+/// 配合 ListenableBuilder 使用，日志刷新只重建日志面板本身，
+/// 不会连带重建文件列表/工具链卡片/按钮区（批量跑几十个文件时体感差别很大）。
+class LogStore extends ChangeNotifier {
+  final List<String> lines = <String>[];
+  final List<String> _buf = <String>[];
+  Timer? _timer;
+  static const int maxLines = 4000;
+
+  void add(String s) {
+    _buf.add(s);
+    if (_buf.length >= 200) {
+      flush();
+      return;
+    }
+    _timer ??= Timer(const Duration(milliseconds: 80), flush);
+  }
+
+  void addAll(Iterable<String> it) {
+    _buf.addAll(it);
+    if (_buf.length >= 200) {
+      flush();
+      return;
+    }
+    _timer ??= Timer(const Duration(milliseconds: 80), flush);
+  }
+
+  /// 把缓冲里的行一次性合入（节流刷新点）
+  void flush() {
+    _timer = null;
+    if (_buf.isEmpty) return;
+    lines.addAll(_buf);
+    _buf.clear();
+    if (lines.length > maxLines) {
+      lines.removeRange(0, lines.length - maxLines);
+      lines.insert(0, '… （更早的日志已自动丢弃，仅保留最近 $maxLines 行）');
+    }
+    notifyListeners();
+  }
+
+  void clear() {
+    _buf.clear();
+    lines.clear();
+    notifyListeners();
+  }
+
+  /// 释放定时器（注意：不能叫 dispose，会与 ChangeNotifier.dispose 冲突）
+  void close() {
+    _timer?.cancel();
+    _timer = null;
+  }
+}
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -363,7 +524,9 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final TextEditingController _seed = TextEditingController(text: '0');
   final ScrollController _logScroll = ScrollController();
-  final List<String> _logLines = [];
+  final LogStore _log = LogStore();
+  // 日志是否自动跟随底部（用户往上翻看历史时暂停跟随）
+  bool _stickBottom = true;
   // 批量处理：待处理文件列表 + 每个文件的结果
   final List<String> _files = <String>[];
   final Map<String, bool> _results = <String, bool>{};
@@ -371,6 +534,8 @@ class _HomePageState extends State<HomePage> {
   Tools _tools = Tools();
   int _mode = 0; // 0 多样化 1 指定种子 2 --static
   bool _nopool = false, _annot = false, _busy = false;
+  // 取消标志：用户点"停止"后，流水线在下一个步骤边界退出
+  bool _cancel = false;
   String _status = '就绪';
   Timer? _toolsTimer;
   static const MethodChannel _drop = MethodChannel('luac2c/drop');
@@ -389,9 +554,17 @@ class _HomePageState extends State<HomePage> {
       }
       return null;
     });
-    _toolsTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+    // 用户往上翻时停止自动跟随底部，回到底部后恢复（纯字段赋值，不触发重建）
+    _logScroll.addListener(() {
+      if (!_logScroll.hasClients) return;
+      _stickBottom = _logScroll.position.extentAfter < 24;
+    });
+    // 工具链探测：轮询会遍历 PATH 做 existsSync，因此
+    // ① 间隔放宽到 5s；② 流水线运行期间跳过（此时工具不会变，且别抢 IO）
+    _toolsTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (_busy || !mounted) return;
       final t = findTools();
-      if (mounted && t.allOk != _tools.allOk) {
+      if (t.signature != _tools.signature) {
         setState(() => _tools = t);
       }
     });
@@ -404,6 +577,8 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _toolsTimer?.cancel();
+    _log.flush();
+    _log.close();
     _seed.dispose();
     _logScroll.dispose();
     super.dispose();
@@ -426,15 +601,11 @@ class _HomePageState extends State<HomePage> {
     if (added > 0) log('已添加 $added 个文件（当前共 ${_files.length} 个）');
   }
 
-  void log(String s) {
-    if (!mounted) return;
-    setState(() => _logLines.add(s));
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_logScroll.hasClients) {
-        _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
-      }
-    });
-  }
+  /// 写日志。高频调用走缓冲 + 80ms 节流，且只刷新日志面板自身。
+  void log(String s) => _log.add(s);
+
+  /// 立即把缓冲落盘（流水线结束/停止时调用，保证日志不丢）
+  void _flushLog() => _log.flush();
 
   void setStatus(String s) {
     if (mounted) setState(() => _status = s);
@@ -445,7 +616,9 @@ class _HomePageState extends State<HomePage> {
     final r = await runCapture(
         'powershell.exe',
         [
+          // -STA：WinForms 的 OpenFileDialog 要求单线程套间，否则可能直接抛异常
           '-NoProfile',
+          '-STA',
           '-Command',
           'Add-Type -AssemblyName System.Windows.Forms;'
               '\$f = New-Object System.Windows.Forms.OpenFileDialog;'
@@ -453,11 +626,13 @@ class _HomePageState extends State<HomePage> {
               '\$f.Filter = "Lua 源文件(*.lua;*.luac)|*.lua;*.luac|所有文件(*.*)|*.*";'
               'if (\$f.ShowDialog() -eq "OK") { \$f.FileNames | ForEach-Object { Write-Output \$_ } }'
         ],
-        null);
+        null,
+        // 对话框要等人操作，超时必须放宽，否则默认 60s 会把 powershell 杀掉
+        timeout: const Duration(minutes: 10));
     final lines = r.output
         .split('\n')
         .map((e) => e.trim())
-        .where((e) => e.isNotEmpty)
+        .where((e) => e.isNotEmpty && File(e).existsSync())
         .toList();
     if (r.exitCode == 0 && lines.isNotEmpty) _addFiles(lines);
   }
@@ -470,7 +645,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> copyLog() async {
-    await Clipboard.setData(ClipboardData(text: _logLines.join('\n')));
+    await Clipboard.setData(ClipboardData(text: _log.lines.join('\n')));
     setStatus('日志已复制到剪贴板');
   }
 
@@ -494,73 +669,165 @@ class _HomePageState extends State<HomePage> {
       await _msg('请先添加 .lua 文件（可多选，或把多个文件拖进窗口）');
       return;
     }
-    if (!_tools.l2cOk) {
-      await _msg('找不到 luac2c.exe（根目录：${_tools.root}，已尝试 PATH）');
+    // 前置校验：一次检查全部需要的工具，避免跑到一半才发现缺工具
+    final t = findTools();
+    if (t.signature != _tools.signature && mounted) setState(() => _tools = t);
+    final missing = t.missing(full: full);
+    if (missing.isNotEmpty) {
+      await _msg('缺少工具：${missing.join('、')}（根目录：${_tools.root}，已尝试系统 PATH）');
       return;
     }
+    // 剔除已失效的文件，避免列表里有被删除的路径
+    final stale = _files.where((f) => !File(f).existsSync()).toList();
+    if (stale.isNotEmpty) {
+      _files.removeWhere((f) => stale.contains(f));
+      log('! 已忽略 ${stale.length} 个不存在的文件');
+    }
+    if (_files.isEmpty) {
+      await _msg('文件列表为空或文件均已不存在');
+      return;
+    }
+
     setState(() {
       _busy = true;
+      _cancel = false;
       _results.clear();
       _totalCount = _files.length;
       _doneCount = 0;
     });
+    final sw = Stopwatch()..start();
     var pass = 0;
-    for (final f in _files) {
-      final ok = await _processOne(f, full);
-      if (ok) pass++;
-      setState(() {
-        _doneCount++;
-        _results[f] = ok;
-      });
-      setStatus('进度 $_doneCount/$_totalCount —— 已通过 $pass');
-    }
-    final failed = _totalCount - pass;
-    setState(() => _busy = false);
-    setStatus(failed == 0
-        ? '批量通过：$pass/$_totalCount'
-        : '批量完成：$pass 通过，$failed 失败');
-    log(failed == 0
-        ? '✓ 批量全部通过（$pass/$_totalCount）'
-        : '✗ 批量结束：失败 $failed 个');
-  }
-
-  /// 处理单个文件，返回是否通过
-  Future<bool> _processOne(String srcPath, bool full) async {
-    final now = DateTime.now();
-    String two(int v) => v.toString().padLeft(2, '0');
-    log('');
-    log('──── ${now.year}-${two(now.month)}-${two(now.day)} '
-        '${two(now.hour)}:${two(now.minute)}:${two(now.second)}  $srcPath');
-    final dir = srcPath.contains(r'\')
-        ? srcPath.substring(0, srcPath.lastIndexOf(r'\'))
-        : Directory.current.path;
-    final base = srcPath.split(r'\').last;
-    final dot = base.lastIndexOf('.');
-    final stem = dot > 0 ? base.substring(0, dot) : base;
-    final pLuac = '$dir\\$stem.luac';
-    final pC = '$dir\\${stem}_out.c';
-    final pExe = '$dir\\${stem}_out.exe';
-
     try {
-      log('[1/5] luac  编译字节码');
-      if (!_tools.luacOk) throw '找不到 luac.exe（[paths] luac = ${_tools.luac}）';
-      var r = await runCapture(_tools.luac, ['-o', pLuac, srcPath], dir);
-      _logOut(r);
-      if (r.exitCode != 0) throw 'luac 退出码 ${r.exitCode}';
-      log('      → $pLuac');
+      // 并发工作池：每个文件要串行跑 5 个子进程，但文件之间互不依赖，
+      // 并行处理能把 luac/gcc 的等待时间重叠起来，批量场景提速明显。
+      final queue = List<String>.from(_files);
+      var cursor = 0;
+      final workers = _workerCount < queue.length ? _workerCount : queue.length;
+      log('▶ 开始处理 ${queue.length} 个文件（并发 $workers，'
+          '${Platform.numberOfProcessors} 核）');
 
-      log('[2/5] luac2c  翻译为 C');
-      r = await runCapture(_tools.l2c, l2cArgs(pLuac, pC), dir);
-      _logOut(r);
-      if (r.exitCode != 0) throw 'luac2c 退出码 ${r.exitCode}';
-      log('      → $pC');
-      if (!full) {
-        log('✓ 仅翻译完成 → $pC');
-        return true;
+      Future<void> worker() async {
+        while (!_cancel) {
+          if (cursor >= queue.length) return;
+          // Dart 单线程事件循环：读与自增之间没有 await，并发安全
+          final f = queue[cursor++];
+          final o = await _processOne(f, full);
+          _log.addAll(o.lines); // 整段入库，避免逐行触发刷新
+          if (o.ok) pass++;
+          if (!mounted) return;
+          setState(() {
+            _doneCount++;
+            _results[f] = o.ok;
+          });
+          setStatus('进度 $_doneCount/$_totalCount —— 已通过 $pass');
+        }
       }
 
-      log('[3/5] gcc  编译链接');
-      if (!_tools.gccOk) throw '找不到 gcc.exe（[paths] gcc = ${_tools.gcc}）';
+      await Future.wait(List.generate(workers, (_) => worker()));
+      if (_cancel) log('■ 已停止，剩余任务未执行');
+    } catch (e) {
+      log('! 流水线异常：$e');
+      setStatus('流水线异常：$e');
+    } finally {
+      _flushLog();
+      if (mounted) setState(() => _busy = false);
+    }
+    sw.stop();
+    final done = _doneCount;
+    final failed = done - pass;
+    final secs = (sw.elapsedMilliseconds / 1000).toStringAsFixed(1);
+    if (_cancel) {
+      setStatus('已停止：完成 $done/$_totalCount，通过 $pass');
+      log('■ 已停止（耗时 ${secs}s）');
+    } else if (failed == 0) {
+      setStatus('批量通过：$pass/$done（${secs}s）');
+      log('✓ 批量全部通过（$pass/$done，耗时 ${secs}s）');
+    } else {
+      setStatus('批量完成：$pass 通过，$failed 失败（${secs}s）');
+      log('✗ 批量结束：失败 $failed 个，通过 $pass 个（耗时 ${secs}s）');
+    }
+  }
+
+  /// 流水线并发度：按 CPU 核数自适应，上限 6（再多只是抢 gcc 的 CPU）
+  int get _workerCount {
+    final w = Platform.numberOfProcessors ~/ 2;
+    if (w < 1) return 1;
+    if (w > 6) return 6;
+    return w;
+  }
+
+  /// 请求停止：立刻终止当前所有子进程，并在下一个步骤边界退出
+  void stopPipeline() {
+    if (!_busy) return;
+    _cancel = true;
+    killActiveProcesses(); // 立刻终止正在跑的子进程，不等它们自然结束
+    setStatus('正在停止…');
+    log('! 收到停止请求，已终止子进程');
+    _flushLog();
+  }
+
+  /// 处理单个文件。日志先进局部缓冲，返回后由调用方统一入库。
+  Future<FileOutcome> _processOne(String srcPath, bool full) async {
+    final out = <String>[];
+    void p(String s) => out.add(s);
+    void pOut(StepResult r) {
+      if (r.output.trim().isNotEmpty) {
+        p('      ${r.output.trim().replaceAll('\n', '\n      ')}');
+      }
+    }
+
+    final now = DateTime.now();
+    String two(int v) => v.toString().padLeft(2, '0');
+    p('');
+    p('──── ${now.year}-${two(now.month)}-${two(now.day)} '
+        '${two(now.hour)}:${two(now.minute)}:${two(now.second)}  $srcPath');
+    final sep = Platform.isWindows ? r'\' : '/';
+    final dir = srcPath.contains(sep)
+        ? srcPath.substring(0, srcPath.lastIndexOf(sep))
+        : Directory.current.path;
+    final base = srcPath.split(sep).last;
+    final dot = base.lastIndexOf('.');
+    final stem = dot > 0 ? base.substring(0, dot) : base;
+    final pLuac = '$dir$sep$stem.luac';
+    final pC = '$dir$sep${stem}_out.c';
+    final pExe = '$dir$sep${stem}_out.exe';
+
+    // 清理上一轮的中间产物：避免用陈旧结果"假通过"
+    for (final path in <String>[pLuac, pC, if (full) pExe]) {
+      try {
+        final f = File(path);
+        if (f.existsSync()) f.deleteSync();
+      } catch (_) {/* 删不掉不影响后续，写入会覆盖 */}
+    }
+
+    final sw = Stopwatch()..start();
+    var ok = false;
+    try {
+      p('[1/5] luac  编译字节码');
+      if (_cancel) throw '已取消';
+      var r = await runCapture(_tools.luac, ['-o', pLuac, srcPath], dir,
+          timeout: const Duration(seconds: 30), isCancelled: () => _cancel);
+      pOut(r);
+      if (r.exitCode != 0) throw 'luac 退出码 ${r.exitCode}';
+      if (!File(pLuac).existsSync()) throw 'luac 未生成 $pLuac';
+      p('      → $pLuac  (${r.ms}ms)');
+
+      p('[2/5] luac2c  翻译为 C');
+      if (_cancel) throw '已取消';
+      r = await runCapture(_tools.l2c, l2cArgs(pLuac, pC), dir,
+          timeout: const Duration(seconds: 60), isCancelled: () => _cancel);
+      pOut(r);
+      if (r.exitCode != 0) throw 'luac2c 退出码 ${r.exitCode}';
+      if (!File(pC).existsSync()) throw 'luac2c 未生成 $pC';
+      p('      → $pC  (${r.ms}ms)');
+      if (!full) {
+        p('✓ 仅翻译完成 → $pC');
+        ok = true;
+        return FileOutcome(srcPath, true, out, ms: sw.elapsedMilliseconds);
+      }
+
+      p('[3/5] gcc  编译链接');
+      if (_cancel) throw '已取消';
       r = await runCapture(
           _tools.gcc,
           [
@@ -572,45 +839,58 @@ class _HomePageState extends State<HomePage> {
             '-std=c99',
             '-w',
             '-O0',
+            // -pipe：用管道代替临时文件，减少磁盘 IO
+            if (Platform.isWindows) '-pipe',
             '-o',
             pExe,
             _tools.lib,
             '-lm'
           ],
-          dir);
-      _logOut(r);
+          dir,
+          timeout: const Duration(seconds: 180),
+          isCancelled: () => _cancel);
+      pOut(r);
       if (r.exitCode != 0) throw 'gcc 退出码 ${r.exitCode}';
-      log('      → $pExe');
+      if (!File(pExe).existsSync()) throw 'gcc 未生成 $pExe';
+      p('      → $pExe  (${r.ms}ms)');
 
-      log('[4/5] 运行生成物');
-      final gen = await runCapture(pExe, [], dir);
+      p('[4/5] 运行生成物');
+      if (_cancel) throw '已取消';
+      final gen = await runCapture(pExe, [], dir,
+          timeout: const Duration(seconds: 30), isCancelled: () => _cancel);
+      if (gen.timeout) throw '生成物运行超时，已终止';
 
-      log('[5/5] 与 lua.exe 输出比对');
-      if (!_tools.luaOk) throw '找不到 lua.exe（[paths] lua = ${_tools.lua}）';
-      final ref = await runCapture(_tools.lua, [srcPath], dir);
-      final genOut = trimTail(gen.output);
-      final refOut = trimTail(ref.output);
+      p('[5/5] 与 lua.exe 输出比对');
+      if (_cancel) throw '已取消';
+      final ref = await runCapture(_tools.lua, [srcPath], dir,
+          timeout: const Duration(seconds: 30), isCancelled: () => _cancel);
+      if (ref.timeout) throw 'lua.exe 运行超时，已终止';
+      // 规范化换行：Windows 下 CRLF/LF 差异不应判为失败
+      final genOut = _normalize(gen.output);
+      final refOut = _normalize(ref.output);
       if (genOut.isNotEmpty) {
-        log('      生成物> ${genOut.replaceAll('\n', '\n      ')}');
+        p('      生成物> ${genOut.replaceAll('\n', '\n      ')}');
       }
       if (refOut.isNotEmpty) {
-        log('      lua.exe> ${refOut.replaceAll('\n', '\n      ')}');
+        p('      lua.exe> ${refOut.replaceAll('\n', '\n      ')}');
       }
       final same = genOut == refOut && gen.exitCode == ref.exitCode;
+      ok = same;
       if (same) {
-        log('      ✓ 输出一致，退出码一致 (${gen.exitCode})');
-        log('✓ 通过：$srcPath');
-        return true;
+        p('      ✓ 输出一致，退出码一致 (${gen.exitCode})');
+        p('✓ 通过：$srcPath');
       } else {
-        log('      ✗ 不一致（exit ${gen.exitCode} vs ${ref.exitCode}）');
-        log('✗ 失败：$srcPath');
-        return false;
+        p('      ✗ 不一致（exit ${gen.exitCode} vs ${ref.exitCode}）');
+        p('✗ 失败：$srcPath');
       }
     } catch (e) {
-      log('      ✗ $e');
-      log('✗ 失败：$srcPath');
-      return false;
+      p('      ✗ $e');
+      p('✗ 失败：$srcPath');
+      ok = false;
     }
+    sw.stop();
+    p('      [${(sw.elapsedMilliseconds / 1000).toStringAsFixed(2)}s]');
+    return FileOutcome(srcPath, ok, out, ms: sw.elapsedMilliseconds);
   }
 
   Future<void> rebuildLuac2c() async {
@@ -1023,23 +1303,45 @@ class _HomePageState extends State<HomePage> {
   // ---- 操作按钮（M3：FilledButton 主操作 / OutlinedButton 次操作） ----
   Widget _actionsSection() {
     return Column(children: [
-      SizedBox(
-        width: double.infinity,
-        child: FilledButton.icon(
-          onPressed: _busy ? null : () => runPipeline(full: true),
-          icon: _busy
-              ? const SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Icon(Icons.play_arrow, size: 20),
-          label: const Padding(
-            padding: EdgeInsets.symmetric(vertical: 12),
-            child: Text('一键流水线', style: TextStyle(fontSize: 15)),
+      Row(children: [
+        Expanded(
+          child: FilledButton.icon(
+            onPressed: _busy ? null : () => runPipeline(full: true),
+            icon: _busy
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.play_arrow, size: 20),
+            label: const Padding(
+              padding: EdgeInsets.symmetric(vertical: 12),
+              child: Text('一键流水线', style: TextStyle(fontSize: 15)),
+            ),
           ),
         ),
-      ),
+        if (_busy) ...[
+          const SizedBox(width: 10),
+          FilledButton.tonalIcon(
+            onPressed: stopPipeline,
+            icon: const Icon(Icons.stop, size: 18),
+            label: const Padding(
+              padding: EdgeInsets.symmetric(vertical: 12),
+              child: Text('停止', style: TextStyle(fontSize: 14)),
+            ),
+          ),
+        ],
+      ]),
+      if (_busy) ...[
+        const SizedBox(height: 8),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+            value: _totalCount == 0 ? null : _doneCount / _totalCount,
+            minHeight: 6,
+          ),
+        ),
+      ],
       const SizedBox(height: 10),
       Row(children: [
         Expanded(
@@ -1115,15 +1417,13 @@ class _HomePageState extends State<HomePage> {
             width: 16,
             height: 16,
             child: CircularProgressIndicator(strokeWidth: 2, color: fg),
-          )
-        else if (_logLines.isNotEmpty)
-          Text('${_logLines.length} 行',
-              style: TextStyle(fontSize: 11, color: fg)),
+          ),
       ]),
     );
   }
 
   // ---- 日志（M3：surface 容器 + 等宽字体） ----
+  /// 只让日志区订阅 [LogStore]：日志刷新不再重建本页其它部分
   Widget _logCard() {
     final cs = Theme.of(context).colorScheme;
     return Card(
@@ -1142,13 +1442,20 @@ class _HomePageState extends State<HomePage> {
                       fontWeight: FontWeight.w600,
                       color: cs.onSurface)),
               const Spacer(),
+              // 行数用 ListenableBuilder 单独订阅，避免整页随日志重建
+              ListenableBuilder(
+                listenable: _log,
+                builder: (context, _) => Text('${_log.lines.length} 行',
+                    style: TextStyle(
+                        fontSize: 11.5, color: cs.onSurfaceVariant)),
+              ),
               TextButton.icon(
                 onPressed: copyLog,
                 icon: const Icon(Icons.copy_all, size: 15),
                 label: const Text('复制'),
               ),
               TextButton.icon(
-                onPressed: () => setState(_logLines.clear),
+                onPressed: _log.clear,
                 icon: const Icon(Icons.delete_outline, size: 15),
                 label: const Text('清空'),
               ),
@@ -1156,22 +1463,37 @@ class _HomePageState extends State<HomePage> {
           ),
           Divider(height: 1, color: cs.outlineVariant),
           Expanded(
-            child: Scrollbar(
-              controller: _logScroll,
-              thumbVisibility: true,
-              child: SingleChildScrollView(
-                controller: _logScroll,
-                padding: const EdgeInsets.all(12),
-                child: SelectableText(
-                  _logLines.isEmpty ? '（暂无输出）' : _logLines.join('\n'),
-                  style: TextStyle(
-                      fontFamily: 'Consolas',
-                      fontFamilyFallback: const ['Microsoft YaHei UI'],
-                      fontSize: 12,
-                      height: 1.45,
-                      color: cs.onSurface),
-                ),
-              ),
+            child: ListenableBuilder(
+              listenable: _log,
+              builder: (context, _) {
+                // 新日志到达后跟随到底部（用户上翻时由 _stickBottom 暂停）
+                if (_stickBottom) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (_logScroll.hasClients) {
+                      _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
+                    }
+                  });
+                }
+                return Scrollbar(
+                  controller: _logScroll,
+                  thumbVisibility: true,
+                  child: SingleChildScrollView(
+                    controller: _logScroll,
+                    padding: const EdgeInsets.all(12),
+                    child: RepaintBoundary(
+                      child: SelectableText(
+                        _log.lines.isEmpty ? '（暂无输出）' : _log.lines.join('\n'),
+                        style: TextStyle(
+                            fontFamily: 'Consolas',
+                            fontFamilyFallback: const ['Microsoft YaHei UI'],
+                            fontSize: 12,
+                            height: 1.45,
+                            color: cs.onSurface),
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
           ),
         ],
