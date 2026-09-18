@@ -1,5 +1,6 @@
 # ---- 运行/测试产生的中间产物 ----
 *.luac
+client_prefs.txt
 *_out.c
 *_out.exe
 *_sw.c
