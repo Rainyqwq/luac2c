@@ -35,14 +35,30 @@ out.exe                          # 3. 运行，输出与 lua.exe 完全一致
   - 常量池强化：双密钥混合的常量池解码
   - 控制流扁平化：状态机分发器改写全部控制流
   - 函数切分：函数体切分为指针表调用的块函数
-- **GUI 客户端**（`luac2c_flutter/`，iOS 26 Liquid Glass 设计语言）：
-  - 一键流水线：翻译 → 编译 → 运行 → 与 lua.exe 逐字节比对
+  - **不透明谓词 + 垃圾指令**（`--no-opaque` 关闭）：谓词取自 `lua_State` 地址的
+    恒真/恒假恒等式（编译器与 IDA 都无法折叠），恒假分支里放永不执行的 Lua 调用、
+    指向真实标签的虚假跳转（污染 IDA 重建的 CFG），以及被 `jmp` 跳过的伪 `call`
+    字节序列（破坏线性扫描反汇编）。垃圾指令汇入 `l2c_noise` 依赖链，删掉即被观测
+- **运行时守卫与签名校验**（默认开启，`--no-guard` 关闭）：
+  - **代码区签名**：对 `[l2c_sig_a, l2c_sig_b)` 这段机器码做 FNV 校验，启动时采样
+    为基准，之后每次进入生成的函数都复查 —— Frida / 调试器在运行途中安装的
+    inline hook、`int3` 断点都会改变它
+  - **常量池签名**：blob 的校验和在生成期算好烧进源码，blob 被改即失配
+  - **固化签名（两遍构建）**：先 `./prog --l2c-sig` 读出签名，再用
+    `gcc out.c -DL2C_SIG=0x<code>` 重新编译，此后对受保护区的任何字节改动都会被检出
+  - **环境取证**：调试器（`IsDebuggerPresent` / `TracerPid` / `P_TRACED`）、
+    frida|gadget|gum|jshook 模块与内存映射、Frida 的 `gmain`/`gum-js-loop` 线程、
+    `LD_PRELOAD`、`ptrace(PTRACE_TRACEME)`、API 入口首字节 inline hook（`E9`/`EB`/`CC`）
+  - **反制方式**：命中任意一项即置位标志，同时污染常量池密钥与栈帧基址 —— 程序
+    照常跑完并正常退出，但读写的寄存器全部错位。这里**没有可以 nop 掉的分支**，
+    因为校验代码本身就位于它所度量的区域之内
+  - `L2C_GUARD_REPORT=1` 可打印测量结果
+- **GUI 客户端**（`luac2c_flutter/`，Material You / Material Design 3）：
+  - 一键流水线：翻译 → 编译 → 运行 → 与 lua.exe 逐字节比对（多文件并发工作池）
   - **批量模式**：多选/拖入多个 `.lua` 文件依次处理，逐文件标记通过/失败
   - 工具自动探测：exe 同目录 → 根目录 → 系统 `PATH` 环境变量，可被 `luac2c_gui.ini` 覆盖
   - 三种翻译模式 + `--no-pool` / `--annotate`，实时日志，一键重建 luac2c
-  - **Apple Liquid Glass**：基于 [liquid_glass_widgets](https://pub.dev/packages/liquid_glass_widgets)
-    的着色器玻璃（GlassScaffold / GlassCard / GlassSegmentedControl / GlassSwitch / GlassButton / GlassToast），
-    遵循 Apple 设计规范（玻璃只用于导航与控制层，内容区保持可读），支持深色模式（右上角切换并持久化）
+  - 种子色调色盘 + 明暗主题（均持久化），进度条与「停止」按钮，分级超时与取消
 
 ## 构建客户端
 

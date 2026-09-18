@@ -680,6 +680,15 @@ static unsigned rng_u32(void) {
 static unsigned rng_below(unsigned n) {
     return n ? (unsigned)(((unsigned long long)rng_u32() * (unsigned long long)n) >> 32) : 0;
 }
+/* FNV-1a, the exact algorithm the emitted l2c_fnv() uses.  The generator
+** needs it to pre-compute the constant-pool signature that the generated
+** program re-derives at run time. */
+static unsigned fnv32(const unsigned char *p, size_t n, unsigned h) {
+    size_t i;
+    for (i = 0; i < n; i++) { h ^= (unsigned)p[i]; h *= 16777619u; }
+    return h;
+}
+
 static char *g_kblob = NULL, *g_kbuild = NULL, *g_kxor = NULL;
 
 /* Static-hardening switches.  Both default on in diversify mode and are
@@ -687,6 +696,9 @@ static char *g_kblob = NULL, *g_kbuild = NULL, *g_kxor = NULL;
 static int  g_flatten  = 1;    /* 1 = flatten every body into a state machine */
 static int  g_split    = 1;    /* 1 = one pointer-reached function per block  */
 static int  g_indirect = 1;    /* 1 = route Lua API calls through pointers   */
+static int  g_guard    = 1;    /* 1 = runtime anti-debug / anti-tamper guards */
+static int  g_opaque   = 1;    /* 1 = opaque predicates + junk + anti-disasm  */
+static unsigned g_pool_sig = 0;   /* FNV of the emitted constant-pool blob    */
 static unsigned g_st_a = 1u;   /* affine state encoding: st -> (id*a + b)    */
 static unsigned g_st_b = 0u;
 static unsigned g_pk1 = 0u, g_pk2 = 0u;   /* constant-pool key, two shares    */
@@ -1349,6 +1361,70 @@ static int writes_count (int op, Instruction ins) {
 ** Function emission
 ** ------------------------------------------------------------------------- */
 
+/* Opaque predicates, junk arithmetic and anti-disassembly filler, sprinkled
+** between the translated instructions.
+**
+** Every predicate is an identity over (unsigned)(uintptr_t)L -- a value neither
+** the optimiser nor IDA's decompiler can know, so the branch is never folded
+** and the taken/untaken decision never shows up statically:
+**     ((q | (q + 1)) & 1) == 1     always true  (q, q+1 are not both even)
+**     ((q | (q + 1)) & 1) == 0     always false
+**     (q ^ (q + 1)) == 0           always false
+**     ((q * 2) & 1) == 1           always false
+** The never-taken arms carry the payload: a bogus transfer to a real label
+** (which poisons the control-flow graph IDA reconstructs), a Lua call that
+** would be harmless even if it did run, and bytes that desynchronise a
+** linear-sweep disassembler. */
+static void emit_junk(Emitter *E, const int *is_target, int ncode) {
+    if (!g_opaque) return;
+    if (rng_below(100) >= 30) return;          /* keep the bloat in check */
+    int nt = 0;
+    for (int i = 0; i < ncode; i++) if (is_target[i]) nt++;
+    int pick = (int)rng_below(4);
+    if (pick == 2 && nt == 0) pick = 0;
+    unsigned k = rng_u32();
+    switch (pick) {
+        case 0:   /* taken: a dependency chain on the noise sink */
+            emit(E,
+                "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                "if ((((_q | (_q + 1u)) & 1u) == 1u)) "
+                "{ l2c_noise = l2c_noise * 33u + %uu; } }\n", k);
+            break;
+        case 1: { /* never taken: junk bytes that break linear disassembly */
+            unsigned b0 = rng_u32() & 0xffu, b1 = rng_u32() & 0xffu;
+            unsigned b2 = rng_u32() & 0xffu, b3 = rng_u32() & 0xffu;
+            emit(E,
+                "{ unsigned _q = (unsigned)(uintptr_t)L;\n"
+                "  if (((_q | (_q + 1u)) & 1u) == 0u) {\n"
+                "#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))\n"
+                "    __asm__ __volatile__(\"jmp 1f\\n\\t\"\n"
+                "      \".byte 0xE8,0x%02X,0x%02X,0x%02X,0x%02X\\n\\t\"\n"
+                "      \".byte 0x0F,0x1F,0x40,0x00\\n\\t\"\n"
+                "      \"1:\\n\\tnop\\n\\t\");\n"
+                "#endif\n"
+                "    l2c_noise ^= %uu;\n"
+                "  } }\n", b0, b1, b2, b3, k);
+            break;
+        }
+        case 2: { /* never taken: a transfer to a real label -> bogus CFG edge */
+            int want = (int)rng_below((unsigned)nt), id = 0;
+            for (int i = 0; i < ncode; i++) {
+                if (!is_target[i]) continue;
+                if (want-- == 0) { id = i; break; }
+            }
+            emit(E,
+                "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                "if ((_q ^ (_q + 1u)) == 0u) { goto L_%d; } }\n", id);
+            break;
+        }
+        default:  /* never taken: an API call that would be harmless anyway */
+            emit(E,
+                "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                "if (((_q * 2u) & 1u) == 1u) { lua_pushnil(L); lua_pop(L, 1); } }\n");
+            break;
+    }
+}
+
 static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
     int maxstack = p->maxstack;
     if (maxstack < 1) maxstack = 1;
@@ -1372,6 +1448,11 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
     }
 
     E_reset(E);
+
+    /* Re-check the code signature on entry.  Anything planted after start-up
+    ** -- Frida's inline hooks, a debugger's int3 -- shows up here. */
+    if (g_guard)
+        emit(E, "  if (l2c_guard_poll()) l2c_gflags |= 0x80000000u;\n");
 
     /* Registers captured by nested closures.  Their authoritative copy lives
     ** in a shared cell (see l2c_box* in the preamble); the register slot is
@@ -1460,6 +1541,11 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
     if (p->ncap > 0)
         emit(E, "  lua_createtable(L, %d, 0); lua_insert(L, 1); b = b + 1;\n", p->ncap);
 
+    /* Guards tripped => shift the frame base by one.  Every R() then addresses
+    ** the neighbouring slot, so the program keeps running and keeps exiting 0
+    ** while silently computing nonsense -- there is no branch to flip back. */
+    if (g_guard)
+        emit(E, "  b = b + (int)(l2c_gflags != 0u);\n");
     emit(E, "  lua_settop(L, b + %d);\n", fsz);
     emit(E, "  top = b + %d;\n", nparams + (isvatab ? 2 : 1));
 
@@ -1977,6 +2063,7 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
                         emit(E, " l2c_boxsync(L, 1, %d, R(%d));", r + 1, r);
         }
         emit(E, "\n");
+        emit_junk(E, is_target, p->ncode);
     }
     /* Tear the diversification macros down again: the next function defines
     ** its own (different) ones. */
@@ -1996,6 +2083,216 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
 /* -------------------------------------------------------------------------
 ** Runtime support emitted into every generated file
 ** ------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+** Runtime guards
+**
+** Four independent measurements feed one flag word:
+**   1. l2c_codesig()  -- FNV over the machine code of every generated function
+**      (the span [l2c_sig_a, l2c_sig_b)).  Sampled at start-up and re-checked
+**      on every entry to a generated function, so an inline hook or an int3
+**      planted *after* start-up -- exactly what Frida does -- is caught.
+**   2. l2c_scan_env() -- debugger and injection forensics: IsDebuggerPresent,
+**      TracerPid, loaded modules / mapped files named frida|gum|jshook, Frida's
+**      characteristic thread names, LD_PRELOAD, ptrace(PTRACE_TRACEME).
+**   3. l2c_hooks()    -- first byte of every resolved Lua entry point; an
+**      inline hook universally starts with jmp (E9/EB) or int3 (CC).
+**   4. l2c_poolsig()  -- FNV of the constant-pool blob, computed here at
+**      generation time and baked into the source, so a patched pool is caught.
+**
+** A non-zero flag word perturbs the constant-pool key *and* the stack frame
+** base, so a tampered build keeps running but reads every register from the
+** wrong slot.  Deliberately not an "exit(1)": there is no single branch to
+** patch out, and the check sits inside the region it measures.
+** ------------------------------------------------------------------------- */
+static void emit_guard_runtime(FILE *out) {
+    fprintf(out,
+        "#if defined(_WIN32)\n"
+        "#  include <windows.h>\n"
+        "#  include <tlhelp32.h>\n"
+        "#elif defined(__linux__)\n"
+        "#  include <unistd.h>\n"
+        "#  include <dirent.h>\n"
+        "#  include <errno.h>\n"
+        "#  include <sys/ptrace.h>\n"
+        "#elif defined(__APPLE__)\n"
+        "#  include <unistd.h>\n"
+        "#  include <sys/types.h>\n"
+        "#  include <sys/sysctl.h>\n"
+        "#  include <sys/proc.h>\n"
+        "#  include <mach-o/dyld.h>\n"
+        "#endif\n\n");
+
+    fprintf(out,
+        "/* Guard state.  l2c_noise is also the sink of the junk instructions\n"
+        "** scattered through the bodies: they form a dependency chain on it, so\n"
+        "** deleting them is observable rather than free. */\n"
+        "static unsigned l2c_gflags = 0;\n\n"
+        "static unsigned l2c_fnv (const unsigned char *p, size_t n, unsigned h) {\n"
+        "  size_t i;\n"
+        "  for (i = 0; i < n; i++) { h ^= (unsigned)p[i]; h *= 16777619u; }\n"
+        "  return h;\n"
+        "}\n\n"
+        "static void l2c_sig_a (void);\n"
+        "static void l2c_sig_b (void);\n\n"
+        "/* The protected span covers every generated function. */\n"
+        "static unsigned l2c_codesig (void) {\n"
+        "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_sig_a;\n"
+        "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_sig_b;\n"
+        "  size_t n;\n"
+        "  if (b <= a) return 0x9E3779B9u;\n"
+        "  n = (size_t)(b - a);\n"
+        "  if (n > ((size_t)1 << 24)) n = (size_t)1 << 24;\n"
+        "  return l2c_fnv(a, n, 2166136261u);\n"
+        "}\n"
+        "/* Sampled variant: cheap enough to run on every function entry. */\n"
+        "static unsigned l2c_codesig_q (void) {\n"
+        "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_sig_a;\n"
+        "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_sig_b;\n"
+        "  size_t n, i; unsigned h = 2166136261u ^ 0x5Au;\n"
+        "  if (b <= a) return h;\n"
+        "  n = (size_t)(b - a);\n"
+        "  if (n > (size_t)65536) n = 65536;\n"
+        "  for (i = 0; i < n; i += 97) { h ^= (unsigned)a[i]; h *= 16777619u; }\n"
+        "  return h;\n"
+        "}\n\n");
+
+    fprintf(out,
+        "/* Debugger / injection forensics.  Bit layout:\n"
+        "**   1 = debugger attached   2 = process traced   4 = frida module mapped\n"
+        "**   8 = frida thread        16 = forced preload  32 = API prologue hooked */\n"
+        "static int l2c_scan_env (void) {\n"
+        "  int f = 0;\n"
+        "#if defined(_WIN32)\n"
+        "  if (IsDebuggerPresent()) f |= 1;\n"
+        "  { BOOL rem = FALSE;\n"
+        "    CheckRemoteDebuggerPresent(GetCurrentProcess(), &rem);\n"
+        "    if (rem) f |= 2; }\n"
+        "  if (GetModuleHandleA(\"frida-agent.dll\") != NULL ||\n"
+        "      GetModuleHandleA(\"frida-gadget.dll\") != NULL) f |= 4;\n"
+        "  { HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE,\n"
+        "                                        GetCurrentProcessId());\n"
+        "    if (h != INVALID_HANDLE_VALUE) {\n"
+        "      MODULEENTRY32 me; me.dwSize = (DWORD)sizeof(me);\n"
+        "      if (Module32First(h, &me)) do {\n"
+        "        int i; char nm[MAX_PATH];\n"
+        "        /* Read as unsigned so the same code works whether szModule is\n"
+        "        ** char or wchar_t; non-ASCII folds to '?' (names are ASCII). */\n"
+        "        for (i = 0; i < MAX_PATH - 1; i++) {\n"
+        "          unsigned c = (unsigned)me.szModule[i];\n"
+        "          if (c == 0) break;\n"
+        "          if (c >= 'A' && c <= 'Z') c += 32u;\n"
+        "          if (c > 127u) c = '?';\n"
+        "          nm[i] = (char)c;\n"
+        "        }\n"
+        "        nm[i] = 0;\n"
+        "        if (strstr(nm, \"frida\") || strstr(nm, \"gadget\") ||\n"
+        "            strstr(nm, \"gum\")   || strstr(nm, \"jshook\") ||\n"
+        "            strstr(nm, \"substrate\") || strstr(nm, \"cycript\")) { f |= 8; break; }\n"
+        "      } while (Module32Next(h, &me));\n"
+        "      CloseHandle(h);\n"
+        "    } }\n"
+        "#elif defined(__linux__)\n"
+        "  { FILE *fp = fopen(\"/proc/self/maps\", \"r\");\n"
+        "    if (fp != NULL) { char ln[1024];\n"
+        "      while (fgets(ln, (int)sizeof ln, fp) != NULL) {\n"
+        "        if (strstr(ln, \"frida\") || strstr(ln, \"gadget\") ||\n"
+        "            strstr(ln, \"libgum\") || strstr(ln, \"linjector\")) { f |= 4; break; }\n"
+        "      }\n"
+        "      fclose(fp); } }\n"
+        "  { FILE *fp = fopen(\"/proc/self/status\", \"r\");\n"
+        "    if (fp != NULL) { char ln[512];\n"
+        "      while (fgets(ln, (int)sizeof ln, fp) != NULL)\n"
+        "        if (strncmp(ln, \"TracerPid:\", 10) == 0) {\n"
+        "          if (atoi(ln + 10) != 0) f |= 1;\n"
+        "          break;\n"
+        "        }\n"
+        "      fclose(fp); } }\n"
+        "  { DIR *d = opendir(\"/proc/self/task\");\n"
+        "    if (d != NULL) { struct dirent *e;\n"
+        "      while ((e = readdir(d)) != NULL) {\n"
+        "        char pb[512], nm[256]; FILE *fp;\n"
+        "        if (e->d_name[0] == '.') continue;\n"
+        "        snprintf(pb, sizeof pb, \"/proc/self/task/%%s/comm\", e->d_name);\n"
+        "        fp = fopen(pb, \"r\"); if (fp == NULL) continue;\n"
+        "        if (fgets(nm, (int)sizeof nm, fp) != NULL) {\n"
+        "          if (strstr(nm, \"frida\") || strstr(nm, \"gum-js-loop\") ||\n"
+        "              strstr(nm, \"gmain\") || strstr(nm, \"gdbus\")) f |= 8;\n"
+        "        }\n"
+        "        fclose(fp);\n"
+        "      }\n"
+        "      closedir(d); } }\n"
+        "  if (getenv(\"LD_PRELOAD\") != NULL) f |= 16;\n"
+        "  { errno = 0; if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) f |= 2; }\n"
+        "#elif defined(__APPLE__)\n"
+        "  { int mib[4]; struct kinfo_proc kp; size_t len = sizeof(kp);\n"
+        "    mib[0] = CTL_KERN; mib[1] = KERN_PROC; mib[2] = KERN_PROC_PID;\n"
+        "    mib[3] = getpid();\n"
+        "    if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0 &&\n"
+        "        (kp.kp_proc.p_flag & P_TRACED) != 0) f |= 1; }\n"
+        "  { uint32_t n = _dyld_image_count(), i;\n"
+        "    for (i = 0; i < n; i++) { const char *nm = _dyld_get_image_name(i);\n"
+        "      if (nm == NULL) continue;\n"
+        "      if (strstr(nm, \"frida\") || strstr(nm, \"gadget\") ||\n"
+        "          strstr(nm, \"libgum\")) { f |= 4; break; } } }\n"
+        "  if (getenv(\"DYLD_INSERT_LIBRARIES\") != NULL) f |= 16;\n"
+        "#endif\n"
+        "  return f;\n"
+        "}\n\n");
+}
+
+/* Inline-hook forensics over the decoded API table: Frida's Interceptor
+** rewrites the first bytes of the target, so a jmp or int3 there is a hook. */
+static void emit_hookscan(FILE *out) {
+    const char *t = g_api_tag;
+    fprintf(out,
+        "/* First byte of every resolved entry point: an inline hook is a jmp\n"
+        "** (E9/EB) or an int3 (CC).  Import thunks (FF 25) are deliberately not\n"
+        "** flagged -- those are legitimate when Lua is linked as a DLL. */\n"
+        "static int %s_hooks (void) {\n"
+        "  intptr_t k = (intptr_t)(uintptr_t)%s_k;\n"
+        "  int n = 0;\n", t, t);
+    for (int i = 0; i < L2C_NGAPI; i++) {
+        fprintf(out,
+            "  if (%s_t[%u].m0 != 0) { const unsigned char *c =\n"
+            "      (const unsigned char *)(uintptr_t)((intptr_t)%s_t[%u].m0\n"
+            "        ^ (k ^ (intptr_t)0x%016llXULL));\n"
+            "    if (c[0] == 0xCCu || c[0] == 0xE9u || c[0] == 0xEBu) n++; }\n",
+            t, g_api_slot[i], t, g_api_slot[i], g_api_k64[i]);
+    }
+    fprintf(out, "  return n;\n}\n\n");
+}
+
+/* Guard bookkeeping: the start-up baseline, and the check run on entry to
+** every generated function. */
+static void emit_guard_init(FILE *out) {
+    fprintf(out,
+        "static unsigned l2c_gsig0 = 0, l2c_gsigq0 = 0;\n\n"
+        "static void l2c_guard_init (void) {\n"
+        "  l2c_gflags = (unsigned)l2c_scan_env();\n");
+    if (g_indirect)
+        fprintf(out, "  if (%s_hooks() != 0) l2c_gflags |= 32u;\n", g_api_tag);
+    fprintf(out,
+        "  l2c_gsig0 = l2c_codesig();\n"
+        "  l2c_gsigq0 = l2c_codesig_q();\n"
+        "}\n\n"
+        "/* Cheap re-check: the sampled code signature must still match, and\n"
+        "** every 256th call re-runs the (much slower) environment scan so a\n"
+        "** Frida attach that happens after start-up is still caught. */\n"
+        "static int l2c_guard_poll (void) {\n"
+        "  static unsigned long ctr = 0;\n"
+        "  if (l2c_gsigq0 != 0 && l2c_codesig_q() != l2c_gsigq0) return 1;\n"
+        "  if ((++ctr & 255u) == 0) return (l2c_scan_env() != 0) ? 1 : 0;\n"
+        "  return 0;\n"
+        "}\n\n"
+        "/* Set L2C_GUARD_REPORT=1 to see what the guards measured. */\n"
+        "static void l2c_guard_report (void) {\n"
+        "  const char *r = getenv(\"L2C_GUARD_REPORT\");\n"
+        "  if (r == NULL || (r[0] != '1' && r[0] != 'y' && r[0] != 'Y')) return;\n"
+        "  fprintf(stderr, \"[l2c] code=%%08X base=%%08X flags=%%u noise=%%lu\\n\",\n"
+        "          l2c_gsig0, l2c_gsigq0, l2c_gflags, l2c_noise);\n"
+        "}\n\n");
+}
+
 static void emit_preamble(FILE *out, const char *in_path) {
     fprintf(out,
         "/* Generated by luac2c from %s.  Do not edit by hand. */\n"
@@ -2047,6 +2344,17 @@ static void emit_preamble(FILE *out, const char *in_path) {
                 t, g_api_slot[i], i, t, kk);
         }
         fprintf(out, "\n");
+    }
+
+    if (g_opaque)
+        fprintf(out,
+            "/* Sink for the junk instructions in the generated bodies. */\n"
+            "static unsigned long l2c_noise = 0;\n\n");
+
+    if (g_guard) {
+        emit_guard_runtime(out);
+        if (g_indirect) emit_hookscan(out);
+        emit_guard_init(out);
     }
 
     fprintf(out,
@@ -2231,6 +2539,9 @@ static void emit_pool(FILE *out) {
         return;
     }
     fprintf(out, "static const unsigned char l2c_%s[] = {\n", g_kblob);
+    /* The pool signature is taken over the encoded bytes exactly as they land
+    ** in .rodata, so the generated program can re-derive and compare it. */
+    unsigned sig = 0x1B873593u;
     for (int i = 0; i < g_pool_n; i++) {
         PoolEnt *e = &g_pool_tab[i];
         unsigned char raw[16];
@@ -2242,18 +2553,35 @@ static void emit_pool(FILE *out) {
         } else {
             len = (int)strlen(e->s); tag = 3;
         }
+        {   /* the three header bytes belong to the blob as well */
+            unsigned char hb[3];
+            hb[0] = (unsigned char)tag; hb[1] = (unsigned char)(len & 0xff);
+            hb[2] = (unsigned char)((len >> 8) & 0xff);
+            for (int z = 0; z < 3; z++) { sig ^= (unsigned)hb[z]; sig *= 16777619u; }
+        }
         fprintf(out, "  %d,%d,%d,", tag, len & 0xff, (len >> 8) & 0xff);
         for (int j = 0; j < len; j++) {
             unsigned char b = (tag == 3) ? (unsigned char)e->s[j] : raw[j];
-            fprintf(out, " %u,", (unsigned)(b ^ pool_xor(i, j)));
+            unsigned char enc = (unsigned char)(b ^ pool_xor(i, j));
+            sig ^= (unsigned)enc; sig *= 16777619u;
+            fprintf(out, " %u,", (unsigned)enc);
         }
         fprintf(out, "\n");
     }
     fprintf(out, "};\n\n");
+    g_pool_sig = sig;
+    fprintf(out, "#define L2C_POOL_SIG 0x%08Xu\n\n", g_pool_sig);
+    if (g_guard)
+        fprintf(out,
+            "/* Signature of the pool blob as it sits in .rodata: a hand-edited\n"
+            "** or byte-patched pool cannot match this. */\n"
+            "static unsigned l2c_poolsig (void) {\n"
+            "  return l2c_fnv(l2c_%s, sizeof(l2c_%s), 0x1B873593u);\n"
+            "}\n\n", g_kblob, g_kblob);
 
     fprintf(out,
-        "static unsigned char l2c_%s (int i, int j) {\n"
-        "  unsigned x = (%uu ^ %uu)\n"
+        "static unsigned char l2c_%s (int i, int j, unsigned rk) {\n"
+        "  unsigned x = (%uu ^ %uu ^ rk)\n"
         "             ^ (unsigned)i * 0x9E3779B9u\n"
         "             ^ (unsigned)j * 0x85EBCA6Bu;\n"
         "  x ^= x >> 15; x *= 0x2545F491u; x ^= x >> 13;\n"
@@ -2262,8 +2590,11 @@ static void emit_pool(FILE *out) {
         g_kxor, g_pk1, g_pk2);
 
     fprintf(out,
-        "/* Decode the blob above into a Lua table (indexed from 1). */\n"
-        "static void l2c_%s (lua_State *L) {\n"
+        "/* Decode the blob above into a Lua table (indexed from 1).  rk is the\n"
+        "** guard word: on an untampered build it is 0 and the pool decodes to\n"
+        "** the original constants; anything else shifts the stream, so the\n"
+        "** program keeps running on corrupted data instead of reporting. */\n"
+        "static void l2c_%s (lua_State *L, unsigned rk) {\n"
         "  const unsigned char *p = l2c_%s;\n"
         "  int i, n = %d;\n"
         "  lua_createtable(L, n, 0);\n"
@@ -2276,11 +2607,11 @@ static void emit_pool(FILE *out) {
         "      luaL_Buffer b;\n"
         "      luaL_buffinit(L, &b);\n"
         "      for (j = 0; j < len; j++)\n"
-        "        luaL_addchar(&b, (char)((unsigned char)p[j] ^ l2c_%s(i, j)));\n"
+        "        luaL_addchar(&b, (char)((unsigned char)p[j] ^ l2c_%s(i, j, rk)));\n"
         "      luaL_pushresult(&b);\n"
         "    } else {\n"
         "      unsigned char raw[8];\n"
-        "      for (j = 0; j < 8; j++) raw[j] = (unsigned char)(p[j] ^ l2c_%s(i, j));\n"
+        "      for (j = 0; j < 8; j++) raw[j] = (unsigned char)(p[j] ^ l2c_%s(i, j, rk));\n"
         "      if (tag == 1) { lua_Integer v; memcpy(&v, raw, 8); lua_pushinteger(L, v); }\n"
         "      else           { lua_Number  v; memcpy(&v, raw, 8); lua_pushnumber(L, v); }\n"
         "    }\n"
@@ -2672,7 +3003,20 @@ static void usage(const char *prog) {
         "  --static        emit the plain, fully predictable translation\n"
         "  --no-pool       keep string/number constants as C literals\n"
         "  --pool-all      move numbers into the run-time pool as well\n"
-        "  --annotate      keep the /* [pc] OPCODE */ markers\n",
+        "  --annotate      keep the /* [pc] OPCODE */ markers\n"
+        "  --no-guard      no anti-debug / anti-tamper runtime (default: on)\n"
+        "  --no-opaque     no opaque predicates / junk / anti-disasm (default: on)\n"
+        "\n"
+        "Hardening notes:\n"
+        "  The generated program measures itself: a signature over the machine\n"
+        "  code of every translated function, a signature over the constant-pool\n"
+        "  blob (fixed at generation time), and forensics for a debugger, a\n"
+        "  frida/gum module, Frida's threads, LD_PRELOAD, ptrace and inline\n"
+        "  hooks on the Lua entry points.  A hit perturbs the pool key and the\n"
+        "  frame base, so the build keeps running on wrong data instead of\n"
+        "  reporting -- there is no branch to patch out.\n"
+        "  To pin the code signature:  ./prog --l2c-sig   then rebuild with\n"
+        "  -DL2C_SIG=0x<code>.  Set L2C_GUARD_REPORT=1 to see what was measured.\n",
         prog);
     exit(1);
 }
@@ -2696,6 +3040,10 @@ int main(int argc, char **argv) {
             g_pool = 2;
         } else if (strcmp(argv[i], "--annotate") == 0) {
             g_annotate = 1;
+        } else if (strcmp(argv[i], "--no-guard") == 0) {
+            g_guard = 0;      /* no anti-debug / integrity runtime */
+        } else if (strcmp(argv[i], "--no-opaque") == 0) {
+            g_opaque = 0;     /* no opaque predicates / junk / anti-disasm */
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -2717,7 +3065,9 @@ int main(int argc, char **argv) {
     rng_seed(seed);
     /* --static is the readable, byte-reproducible baseline, so it forces every
     ** static-hardening transform back off; diversify mode turns them on. */
-    if (!g_diversify) { g_flatten = 0; g_split = 0; g_indirect = 0; }
+    if (!g_diversify) {
+        g_flatten = 0; g_split = 0; g_indirect = 0; g_guard = 0; g_opaque = 0;
+    }
     if (g_diversify) {
         g_pk1  = rng_u32();                 /* two shares of the pool key */
         g_pk2  = rng_u32();
@@ -2781,7 +3131,14 @@ int main(int argc, char **argv) {
     ** planned.  Nothing above this point has touched the output file. */
     emit_preamble(out, in_path);
 
-    fprintf(out, "static void l2c_%s (lua_State *L);\n\n", g_kbuild);
+    /* Start of the guarded region.  Everything between this and l2c_sig_b is
+    ** covered by the run-time code signature.  The two markers differ so the
+    ** linker cannot fold them into one symbol and collapse the span to zero. */
+    if (g_guard)
+        fprintf(out, "static void l2c_sig_a (void) "
+                     "{ volatile int z = 1; (void)z; }\n\n");
+
+    fprintf(out, "static void l2c_%s (lua_State *L, unsigned rk);\n\n", g_kbuild);
 
     for (int i = 0; i < lcount; i++)
         fprintf(out, "%sint %s(lua_State *L);\n", (i == 0) ? "" : "static ", g_fnames[i]);
@@ -2821,6 +3178,11 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* End of the guarded region. */
+    if (g_guard)
+        fprintf(out, "static void l2c_sig_b (void) "
+                     "{ volatile int z = 2; (void)z; }\n\n");
+
     /* The pool is filled while the bodies are emitted, so it comes last. */
     emit_pool(out);
 
@@ -2838,23 +3200,46 @@ int main(int argc, char **argv) {
     char apt_init[64] = "";
     if (g_indirect) snprintf(apt_init, sizeof apt_init, "  %s_init();\n", g_api_tag);
 
+    fprintf(out, "int main(int argc, char **argv) {\n  int status;\n");
+    fprintf(out, "%s", apt_init);            /* decode the API table first */
+    if (g_guard) {
+        /* The hook scan reads the entry points the table just resolved. */
+        fprintf(out, "  l2c_guard_init();\n");
+        if (g_pool_n > 0)
+            fprintf(out,
+                "  if (l2c_poolsig() != L2C_POOL_SIG) l2c_gflags |= 64u;\n");
+        fprintf(out,
+            "  /* Optional second-pass signature: build once, read the value with\n"
+            "  ** --l2c-sig, then rebuild with -DL2C_SIG=0x<code> to pin it. */\n"
+            "#if defined(L2C_SIG) && (L2C_SIG) != 0\n"
+            "  if (l2c_codesig() != (unsigned)(L2C_SIG)) l2c_gflags |= 128u;\n"
+            "#endif\n"
+            "  l2c_guard_report();\n"
+            "  if (argc > 1 && strcmp(argv[1], \"--l2c-sig\") == 0) {\n"
+            "    printf(\"codesig=%%08X\\n\", l2c_gsig0);\n");
+        if (g_pool_n > 0)
+            fprintf(out, "    printf(\"poolsig=%%08X\\n\", l2c_poolsig());\n");
+        fprintf(out,
+            "    printf(\"flags=%%u\\n\", l2c_gflags);\n"
+            "    return 0;\n"
+            "  }\n");
+    } else {
+        fprintf(out, "  (void)argc; (void)argv;\n");
+    }
     fprintf(out,
-        "int main(int argc, char **argv) {\n"
-        "  int status;\n"
-        "  (void)argc; (void)argv;\n"
-        "%s"
         "  lua_State *L = luaL_newstate();\n"
         "  if (L == NULL) { fprintf(stderr, \"cannot create state\\n\"); return 1; }\n"
         "  luaL_openlibs(L);\n"
         "  lua_pushcclosure(L, l2c_report, 0);\n"
         "  lua_pushglobaltable(L);\n"
-        "  l2c_%s(L);\n"                    /* _ENV, then the constant pool */
+        "  l2c_%s(L, %s);\n"      /* _ENV, then the constant pool */
         "  lua_pushcclosure(L, %s, 2);\n"
         "  status = lua_pcall(L, 0, 0, 1);\n"
-        "  if (status != LUA_OK) { lua_close(L); return 1; }\n"
-        "  lua_close(L);\n"
-        "  return 0;\n"
-        "}\n", apt_init, g_kbuild, g_fnames[0]);
+        "  if (status != LUA_OK) { lua_close(L); return 1; }\n",
+        g_kbuild, g_guard ? "l2c_gflags" : "0u", g_fnames[0]);
+    if (g_opaque)
+        fprintf(out, "  (void)l2c_noise;\n");   /* keeps the junk chain alive */
+    fprintf(out, "  lua_close(L);\n  return 0;\n}\n");
 
     fclose(out);
     free(E.labels);
