@@ -44,11 +44,21 @@ out.exe                          # 3. 运行，输出与 lua.exe 完全一致
     为基准，之后每次进入生成的函数都复查 —— Frida / 调试器在运行途中安装的
     inline hook、`int3` 断点都会改变它
   - **常量池签名**：blob 的校验和在生成期算好烧进源码，blob 被改即失配
-  - **固化签名（两遍构建）**：先 `./prog --l2c-sig` 读出签名，再用
-    `gcc out.c -DL2C_SIG=0x<code>` 重新编译，此后对受保护区的任何字节改动都会被检出
+  - **后链接签名（推荐，堵住"改文件后重启"）**：启动基准只能抓运行途中下的钩子，
+    抓不到**已经躺在文件里的补丁**（基准本身就会从被改的字节上量出来）。要堵这个洞，
+    期望值必须在链接之后才产生，所以签名是一个独立的后处理步骤：
+    ```
+    ./prog --l2c-sig                          # 打印 codesig 与受保护区 rva_a / rva_b
+    luac2c --sign prog.exe <rva_a> <rva_b>    # 把期望哈希写回二进制的签名槽
+    ```
+    之后每次启动都会把受保护区在**文件里**的字节与槽中的期望值比对（对文件而非内存
+    计算，因此不受重定位影响），并同时校验文件大小。实测改 1 个字节即失配。
+    没有第二个工具时，也可 `./prog --l2c-sig` 后用 `-DL2C_SIG=0x<code>` 重编替代
+  - **`--require-sig`**：未签名的映像直接视为被篡改（防止直接删掉签名槽）
   - **环境取证**：调试器（`IsDebuggerPresent` / `TracerPid` / `P_TRACED`）、
     frida|gadget|gum|jshook 模块与内存映射、Frida 的 `gmain`/`gum-js-loop` 线程、
-    `LD_PRELOAD`、`ptrace(PTRACE_TRACEME)`、API 入口首字节 inline hook（`E9`/`EB`/`CC`）
+    `LD_PRELOAD`、`ptrace(PTRACE_TRACEME)`、API 入口首字节 inline hook（`E9`/`EB`/`CC`）、
+    以及受保护区所在代码页的可写属性（Frida 下钩子前必须先把它改成可写）
   - **反制方式**：命中任意一项即置位标志，同时污染常量池密钥与栈帧基址 —— 程序
     照常跑完并正常退出，但读写的寄存器全部错位。这里**没有可以 nop 掉的分支**，
     因为校验代码本身就位于它所度量的区域之内

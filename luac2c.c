@@ -698,6 +698,7 @@ static int  g_split    = 1;    /* 1 = one pointer-reached function per block  */
 static int  g_indirect = 1;    /* 1 = route Lua API calls through pointers   */
 static int  g_guard    = 1;    /* 1 = runtime anti-debug / anti-tamper guards */
 static int  g_opaque   = 1;    /* 1 = opaque predicates + junk + anti-disasm  */
+static int  g_requiresig = 0;  /* 1 = an unsigned image counts as tampered    */
 static unsigned g_pool_sig = 0;   /* FNV of the emitted constant-pool blob    */
 static unsigned g_st_a = 1u;   /* affine state encoding: st -> (id*a + b)    */
 static unsigned g_st_b = 0u;
@@ -2238,6 +2239,123 @@ static void emit_guard_runtime(FILE *out) {
         "#endif\n"
         "  return f;\n"
         "}\n\n");
+
+    fprintf(out,
+        "/* The guarded span is code and must never be writable.  Frida has to\n"
+        "** make it writable before it can plant a hook, so a page that reads\n"
+        "** back as writable is a strong signal even when it is later restored. */\n"
+        "static int l2c_scan_pages (void) {\n"
+        "#if defined(_WIN32)\n"
+        "  MEMORY_BASIC_INFORMATION mi;\n"
+        "  if (VirtualQuery((void *)(uintptr_t)&l2c_sig_a, &mi, sizeof mi) != 0) {\n"
+        "    DWORD p = mi.Protect;\n"
+        "    if (p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY ||\n"
+        "        p == PAGE_READWRITE || p == PAGE_WRITECOPY) return 1;\n"
+        "  }\n"
+        "#elif defined(__linux__)\n"
+        "  { FILE *f = fopen(\"/proc/self/maps\", \"r\"); char ln[1024];\n"
+        "    unsigned long lo = 0, hi = 0; char perms[8];\n"
+        "    unsigned long tgt = (unsigned long)(uintptr_t)&l2c_sig_a;\n"
+        "    if (f != NULL) {\n"
+        "      while (fgets(ln, (int)sizeof ln, f) != NULL) {\n"
+        "        if (sscanf(ln, \"%%lx-%%lx %%7s\", &lo, &hi, perms) == 3 &&\n"
+        "            tgt >= lo && tgt < hi) {\n"
+        "          int w = (perms[1] == 'w');\n"
+        "          fclose(f);\n"
+        "          return w;\n"
+        "        }\n"
+        "      }\n"
+        "      fclose(f);\n"
+        "    } }\n"
+        "#endif\n"
+        "  return 0;\n"
+        "}\n\n");
+
+    /* ---- post-link signature -------------------------------------------
+    ** The start-up baseline above catches hooks planted *while running*, but
+    ** not a patch that is already in the file: the baseline would simply be
+    ** measured from the patched bytes.  Closing that hole needs an expected
+    ** value that only exists after linking, so the program carries a slot for
+    ** it and 'luac2c --sign' fills the slot in the finished binary:
+    **     [0] magic 'LCS1'   [1] file offset of the guarded span
+    **     [2] file end       [3] 1 = signed
+    **     [4] expected hash  [5] image size when signed
+    **     [6] reserved       [7] tail magic
+    ** The magic pair is what lets the signer locate the slot in a file that
+    ** has no symbols.  Verifying against the *file* rather than against
+    ** memory keeps it independent of relocations. */
+    fprintf(out,
+        "static unsigned l2c_sigslot[8] = {\n"
+        "  0x3143534Cu, 0u, 0u, 0u, 0u, 0u, 0u, 0x9E3779B9u\n"
+        "};\n\n"
+        "static int l2c_selfpath (char *buf, int n) {\n"
+        "#if defined(_WIN32)\n"
+        "  return GetModuleFileNameA(NULL, buf, (DWORD)n) > 0;\n"
+        "#elif defined(__linux__)\n"
+        "  { ssize_t k = readlink(\"/proc/self/exe\", buf, (size_t)n - 1);\n"
+        "    if (k <= 0) return 0;\n"
+        "    buf[k] = 0; return 1; }\n"
+        "#elif defined(__APPLE__)\n"
+        "  { uint32_t sz = (uint32_t)n;\n"
+        "    return _NSGetExecutablePath(buf, &sz) == 0; }\n"
+        "#else\n"
+        "  (void)buf; (void)n; return 0;\n"
+        "#endif\n"
+        "}\n\n"
+        "/* Hash the guarded span as it sits in the executable file, using the\n"
+        "** offsets the signer recorded.  Returns 0 when it cannot be read, so a\n"
+        "** deleted or moved image reads as a mismatch rather than as 'clean'. */\n"
+        "static unsigned l2c_img_hash (unsigned *psize) {\n"
+        "  char path[1024]; FILE *fp; unsigned char tmp[4096];\n"
+        "  unsigned fa, fb, left, h = 2166136261u;\n"
+        "  if (psize != NULL) *psize = 0;\n"
+        "  fa = l2c_sigslot[1]; fb = l2c_sigslot[2];\n"
+        "  if (fa == 0u || fb <= fa) return 0;\n"
+        "  if (!l2c_selfpath(path, (int)sizeof path)) return 0;\n"
+        "  fp = fopen(path, \"rb\");\n"
+        "  if (fp == NULL) return 0;\n"
+        "  if (psize != NULL) {            /* appended data or an extra section\n"
+        "                                  ** must not slip past the signature */\n"
+        "    long end;\n"
+        "    if (fseek(fp, 0, SEEK_END) == 0 && (end = ftell(fp)) > 0)\n"
+        "      *psize = (unsigned)end;\n"
+        "  }\n"
+        "  if (fseek(fp, (long)fa, SEEK_SET) != 0) { fclose(fp); return 0; }\n"
+        "  left = fb - fa;\n"
+        "  if (left > ((unsigned)1 << 24)) left = (unsigned)1 << 24;\n"
+        "  while (left > 0) {\n"
+        "    unsigned want = (left < (unsigned)sizeof tmp) ? left : (unsigned)sizeof tmp;\n"
+        "    size_t got = fread(tmp, 1, want, fp);\n"
+        "    if (got == 0) break;\n"
+        "    h = l2c_fnv(tmp, got, h);\n"
+        "    left -= (unsigned)got;\n"
+        "  }\n"
+        "  fclose(fp);\n"
+        "  return h;\n"
+        "}\n\n"
+        "/* Load-base-relative address of the markers: what the signer needs to\n"
+        "** turn them into file offsets. */\n"
+        "static unsigned long l2c_rva_of (void *p) {\n"
+        "  const char *base = (const char *)0;\n"
+        "#if defined(_WIN32)\n"
+        "  base = (const char *)GetModuleHandleA(NULL);\n"
+        "#elif defined(__linux__)\n"
+        "  { FILE *f = fopen(\"/proc/self/maps\", \"r\"); char ln[512];\n"
+        "    unsigned long lo = 0, hi = 0; char perms[8];\n"
+        "    unsigned long tgt = (unsigned long)(uintptr_t)p;\n"
+        "    if (f != NULL) {\n"
+        "      while (fgets(ln, (int)sizeof ln, f) != NULL) {\n"
+        "        if (sscanf(ln, \"%%lx-%%lx %%7s\", &lo, &hi, perms) == 3 &&\n"
+        "            tgt >= lo && tgt < hi && perms[2] == 'x') { base = (const char *)lo; break; }\n"
+        "      }\n"
+        "      fclose(f);\n"
+        "    } }\n"
+        "#elif defined(__APPLE__)\n"
+        "  base = (const char *)_dyld_get_image_vmaddr_slide(0);\n"
+        "#endif\n"
+        "  if (base == (const char *)0) return 0;\n"
+        "  return (unsigned long)((const char *)p - base);\n"
+        "}\n\n");
 }
 
 /* Inline-hook forensics over the decoded API table: Frida's Interceptor
@@ -2281,7 +2399,10 @@ static void emit_guard_init(FILE *out) {
         "static int l2c_guard_poll (void) {\n"
         "  static unsigned long ctr = 0;\n"
         "  if (l2c_gsigq0 != 0 && l2c_codesig_q() != l2c_gsigq0) return 1;\n"
-        "  if ((++ctr & 255u) == 0) return (l2c_scan_env() != 0) ? 1 : 0;\n"
+        "  if ((++ctr & 255u) == 0) {\n"
+        "    if (l2c_scan_pages() != 0) return 1;\n"
+        "    return (l2c_scan_env() != 0) ? 1 : 0;\n"
+        "  }\n"
         "  return 0;\n"
         "}\n\n"
         "/* Set L2C_GUARD_REPORT=1 to see what the guards measured. */\n"
@@ -2995,6 +3116,177 @@ static void flatten_emit(FILE *body, FILE *pre, FILE *src, const char *kw,
 }
 
 
+/* ---------------------------------------------------------------------------
+** Post-link signing
+**
+** A patch that is already in the file is invisible to a start-up baseline,
+** because the baseline would simply be measured from the patched bytes.  The
+** only place an expected value for the code can come from is the finished
+** binary, so signing is a separate pass:
+**
+**     ./prog --l2c-sig                      -> prints rva_a and rva_b
+**     luac2c --sign prog.exe <rva_a> <rva_b>
+**
+** The signer maps those load-relative addresses back to file offsets, hashes
+** the span in the file and stores the result in the 32-byte slot the generated
+** program carries (located by its magic pair, so no symbols are needed).
+** ------------------------------------------------------------------------- */
+static unsigned char *l2c_read_file(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    unsigned char *b = (unsigned char *)malloc((size_t)sz + 1);
+    if (!b) { fclose(f); return NULL; }
+    if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return NULL; }
+    fclose(f);
+    *n = (size_t)sz;
+    return b;
+}
+
+static unsigned l2c_rd32(const unsigned char *p) {
+    return (unsigned)p[0] | ((unsigned)p[1] << 8) |
+           ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+}
+
+static void l2c_wr32(unsigned char *p, unsigned v) {
+    p[0] = (unsigned char)(v & 0xffu);
+    p[1] = (unsigned char)((v >> 8) & 0xffu);
+    p[2] = (unsigned char)((v >> 16) & 0xffu);
+    p[3] = (unsigned char)((v >> 24) & 0xffu);
+}
+
+/* RVA -> file offset; 0 when the address is not inside any raw section. */
+static size_t l2c_rva_to_off(const unsigned char *img, size_t n,
+                             unsigned long rva) {
+    if (n < 64 || img == NULL) return 0;
+    if (img[0] == 0x7f && img[1] == 'E' && img[2] == 'L' && img[3] == 'F') {
+        unsigned long long phoff = 0;
+        unsigned phent = 0, phnum = 0;
+        if (img[4] == 2) {                       /* ELF64 */
+            memcpy(&phoff, img + 32, 8);
+            memcpy(&phent, img + 54, 2);
+            memcpy(&phnum, img + 56, 2);
+        } else if (img[4] == 1) {                /* ELF32 */
+            unsigned t = 0;
+            memcpy(&t, img + 28, 4); phoff = t;
+            memcpy(&phent, img + 42, 2);
+            memcpy(&phnum, img + 44, 2);
+        } else return 0;
+        for (unsigned i = 0; i < phnum; i++) {
+            const unsigned char *ph = img + phoff + (size_t)i * phent;
+            if (ph + 56 > img + n) break;
+            unsigned type = l2c_rd32(ph);
+            if (type != 1) continue;             /* PT_LOAD */
+            unsigned long long off = 0, vaddr = 0, filesz = 0;
+            if (img[4] == 2) {
+                memcpy(&off, ph + 8, 8); memcpy(&vaddr, ph + 16, 8);
+                memcpy(&filesz, ph + 32, 8);
+            } else {
+                unsigned x = 0;
+                memcpy(&x, ph + 4, 4); off = x;
+                memcpy(&x, ph + 8, 4); vaddr = x;
+                memcpy(&x, ph + 16, 4); filesz = x;
+            }
+            if (rva >= vaddr && rva < vaddr + filesz) {
+                size_t o = (size_t)off + (size_t)(rva - vaddr);
+                return o < n ? o : 0;
+            }
+        }
+        return 0;
+    }
+    if (img[0] == 'M' && img[1] == 'Z') {        /* PE */
+        unsigned long pe = l2c_rd32(img + 0x3c);
+        if (pe + 24 >= n || memcmp(img + pe, "PE\0\0", 4) != 0) return 0;
+        /* COFF header: Machine(+4) NumberOfSections(+6) ... SizeOfOptionalHeader
+        ** sits at +20, not +16 -- +16 is NumberOfSymbols. */
+        unsigned nsec = 0, soh = 0;
+        memcpy(&nsec, img + pe + 6, 2);
+        memcpy(&soh, img + pe + 20, 2);
+        size_t sec = (size_t)pe + 24 + soh;
+        for (unsigned i = 0; i < nsec; i++) {
+            const unsigned char *s = img + sec + (size_t)i * 40;
+            if (s + 40 > img + n) break;
+            unsigned vs = l2c_rd32(s + 8), va = l2c_rd32(s + 12);
+            unsigned rs = l2c_rd32(s + 16), ro = l2c_rd32(s + 20);
+            unsigned span = vs ? vs : rs;
+            if (rva >= va && rva < va + span) {
+                size_t o = (size_t)ro + (size_t)(rva - va);
+                return o < n ? o : 0;
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+/* The slot: magic 'LCS1' at offset 0, 0x9E3779B9 at offset 28. */
+static size_t l2c_find_slot(const unsigned char *img, size_t n) {
+    for (size_t i = 0; i + 32 <= n; i += 4) {
+        if (l2c_rd32(img + i) == 0x3143534Cu &&
+            l2c_rd32(img + i + 28) == 0x9E3779B9u) {
+            unsigned f = l2c_rd32(img + i + 12);
+            if (f == 0u || f == 1u) return i;
+        }
+    }
+    return 0;
+}
+
+static int cmd_sign(int argc, char **argv) {
+    if (argc < 5) {
+        fprintf(stderr,
+            "Usage: luac2c --sign <program> <rva_a> <rva_b>\n"
+            "  Sign the guarded code span of an already-linked program.\n"
+            "  Run the program with --l2c-sig first to print rva_a / rva_b.\n");
+        return 1;
+    }
+    const char *path = argv[2];
+    unsigned long ra = strtoul(argv[3], NULL, 0);
+    unsigned long rb = strtoul(argv[4], NULL, 0);
+    size_t n = 0;
+    unsigned char *img = l2c_read_file(path, &n);
+    if (!img) { perror(path); return 1; }
+    size_t fa = l2c_rva_to_off(img, n, ra), fb = l2c_rva_to_off(img, n, rb);
+    if (fa == 0 || fb == 0 || fb <= fa) {
+        fprintf(stderr,
+            "luac2c: cannot map rva_a=0x%lX rva_b=0x%lX into %s\n", ra, rb, path);
+        free(img);
+        return 1;
+    }
+    size_t slot = l2c_find_slot(img, n);
+    if (slot == 0) {
+        fprintf(stderr,
+            "luac2c: signature slot not found (was it built with guards on?)\n");
+        free(img);
+        return 1;
+    }
+    size_t span = fb - fa;
+    if (span > ((size_t)1 << 24)) span = (size_t)1 << 24;
+    unsigned h = fnv32(img + fa, span, 2166136261u);
+    l2c_wr32(img + slot + 4, (unsigned)fa);
+    l2c_wr32(img + slot + 8, (unsigned)fb);
+    l2c_wr32(img + slot + 12, 1u);
+    l2c_wr32(img + slot + 16, h);
+    l2c_wr32(img + slot + 20, (unsigned)n);
+    FILE *f = fopen(path, "r+b");
+    if (!f) { perror(path); free(img); return 1; }
+    if (fseek(f, (long)slot, SEEK_SET) != 0 ||
+        fwrite(img + slot, 1, 32, f) != 32) {
+        perror(path);
+        fclose(f);
+        free(img);
+        return 1;
+    }
+    fclose(f);
+    free(img);
+    printf("signed %s\n  span  rva 0x%lX..0x%lX\n  span  file 0x%lX..0x%lX (%lu bytes)\n"
+           "  hash  0x%08X\n",
+           path, ra, rb, (unsigned long)fa, (unsigned long)fb,
+           (unsigned long)span, h);
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s input.luac [-o output.c] [options]\n"
@@ -3006,6 +3298,9 @@ static void usage(const char *prog) {
         "  --annotate      keep the /* [pc] OPCODE */ markers\n"
         "  --no-guard      no anti-debug / anti-tamper runtime (default: on)\n"
         "  --no-opaque     no opaque predicates / junk / anti-disasm (default: on)\n"
+        "  --require-sig   treat an unsigned image as tampered (default: off)\n"
+        "  --sign EXE RVA_A RVA_B\n"
+        "                  sign the guarded code span of a linked program\n"
         "\n"
         "Hardening notes:\n"
         "  The generated program measures itself: a signature over the machine\n"
@@ -3015,13 +3310,23 @@ static void usage(const char *prog) {
         "  hooks on the Lua entry points.  A hit perturbs the pool key and the\n"
         "  frame base, so the build keeps running on wrong data instead of\n"
         "  reporting -- there is no branch to patch out.\n"
-        "  To pin the code signature:  ./prog --l2c-sig   then rebuild with\n"
-        "  -DL2C_SIG=0x<code>.  Set L2C_GUARD_REPORT=1 to see what was measured.\n",
+        "  Measuring the code needs an expected value that only exists after\n"
+        "  linking, so there are two ways to supply one:\n"
+        "    ./prog --l2c-sig                      # print codesig and the span\n"
+        "    luac2c --sign prog.exe <rva_a> <rva_b>   # bake it into the binary\n"
+        "  or, without a second tool: rebuild with -DL2C_SIG=0x<code>.  Without\n"
+        "  either, only the start-up baseline applies (runtime hooks are caught,\n"
+        "  a patch already present in the file is not).\n"
+        "  Set L2C_GUARD_REPORT=1 to see what was measured.\n",
         prog);
     exit(1);
 }
 
 int main(int argc, char **argv) {
+    /* '--sign' operates on a linked executable, not on a .luac input, so it
+    ** is handled before the normal argument scan. */
+    if (argc >= 2 && strcmp(argv[1], "--sign") == 0) return cmd_sign(argc, argv);
+
     const char *in_path = NULL;
     const char *out_path = NULL;
     unsigned long long seed = 0;
@@ -3044,6 +3349,8 @@ int main(int argc, char **argv) {
             g_guard = 0;      /* no anti-debug / integrity runtime */
         } else if (strcmp(argv[i], "--no-opaque") == 0) {
             g_opaque = 0;     /* no opaque predicates / junk / anti-disasm */
+        } else if (strcmp(argv[i], "--require-sig") == 0) {
+            g_requiresig = 1; /* treat an unsigned image as tampered */
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -3205,6 +3512,18 @@ int main(int argc, char **argv) {
     if (g_guard) {
         /* The hook scan reads the entry points the table just resolved. */
         fprintf(out, "  l2c_guard_init();\n");
+        /* Post-link signature: catches a patch that is already in the file --
+        ** the case the start-up baseline cannot see, because it would simply
+        ** have measured the patched bytes. */
+        fprintf(out,
+            "  if (l2c_sigslot[3] == 1u) {\n"
+            "    unsigned fsz = 0, h = l2c_img_hash(&fsz);\n"
+            "    if (h == 0u || h != l2c_sigslot[4]) l2c_gflags |= 128u;\n"
+            "    else if (l2c_sigslot[5] != 0u && fsz != l2c_sigslot[5])\n"
+            "      l2c_gflags |= 128u;\n"
+            "  }");
+        if (g_requiresig) fprintf(out, " else l2c_gflags |= 256u;\n");
+        else fprintf(out, "\n");
         if (g_pool_n > 0)
             fprintf(out,
                 "  if (l2c_poolsig() != L2C_POOL_SIG) l2c_gflags |= 64u;\n");
@@ -3216,7 +3535,12 @@ int main(int argc, char **argv) {
             "#endif\n"
             "  l2c_guard_report();\n"
             "  if (argc > 1 && strcmp(argv[1], \"--l2c-sig\") == 0) {\n"
-            "    printf(\"codesig=%%08X\\n\", l2c_gsig0);\n");
+            "    unsigned long ra = l2c_rva_of((void *)(uintptr_t)&l2c_sig_a);\n"
+            "    unsigned long rb = l2c_rva_of((void *)(uintptr_t)&l2c_sig_b);\n"
+            "    printf(\"codesig=%%08X\\n\", l2c_gsig0);\n"
+            "    /* The two RVAs are what 'luac2c --sign' needs to find the\n"
+            "    ** guarded span inside the file. */\n"
+            "    printf(\"rva_a=%%lX rva_b=%%lX signed=%%u\\n\", ra, rb, l2c_sigslot[3]);\n");
         if (g_pool_n > 0)
             fprintf(out, "    printf(\"poolsig=%%08X\\n\", l2c_poolsig());\n");
         fprintf(out,

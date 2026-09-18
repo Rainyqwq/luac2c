@@ -1,1 +1,1 @@
-dark=1
+dark=0;seed=0
