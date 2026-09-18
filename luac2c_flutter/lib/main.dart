@@ -1,130 +1,154 @@
-﻿// luac2c 客户端 (Flutter Windows Desktop, Cupertino / iOS 设计风格)
+﻿// luac2c 客户端 (Flutter Windows Desktop, Material You / Material Design 3)
 //
 // 与 Win32 原生版 luac2c_gui.c 功能一致：
 //   一键流水线: luac.exe -> luac2c.exe -> gcc -> 运行生成物 -> 与 lua.exe 输出比对
 //   仅翻译 C / 重建 luac2c.exe / 三种模式 + --no-pool / --annotate
 //   拖拽 .lua 文件（runner 原生 WM_DROPFILES）、日志窗格、luac2c_gui.ini [paths] 路径覆盖
+//
+// 设计规范：Material Design 3（Material You）—— 全部配色来自 ColorScheme.fromSeed
+// 生成的种子配色方案，组件一律用 M3 组件（SegmentedButton / FilledButton / Switch /
+// NavigationBar / Card / SnackBar），明暗双主题，状态层用 surfaceContainer 系列。
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/cupertino.dart';
-// 以下三个仅存在于 material：日志可选中文本、悬浮提示、分隔线
-import 'package:flutter/material.dart' show SelectableText, Tooltip, Divider;
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await ThemeCtl.I.load();
-  await LiquidGlassWidgets.initialize(); // 预热着色器
   runApp(const Luac2cApp());
-  // 诊断：确认首帧真的完成了
-  WidgetsBinding.instance.addPostFrameCallback((_) {
-    debugPrint('FIRST_FRAME_OK');
-  });
-}
-
-/// 低对比点阵网格画笔（折射纹理源）
-class _DotGridPainter extends CustomPainter {
-  final Color color;
-  final double spacing;
-  final double dotSize;
-  const _DotGridPainter(
-      {required this.color, required this.spacing, required this.dotSize});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()..color = color;
-    for (double x = spacing / 2; x < size.width; x += spacing) {
-      for (double y = spacing / 2; y < size.height; y += spacing) {
-        canvas.drawCircle(Offset(x, y), dotSize, paint);
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _DotGridPainter old) =>
-      old.color != color || old.spacing != spacing;
 }
 
 // ---------------------------------------------------------------- 主题控制
-/// 明暗主题状态（持久化到 exe 同目录的 client_prefs.txt）
+/// 明暗 + 种子色状态（持久化到 exe 同目录的 client_prefs.txt）
 class ThemeCtl extends ChangeNotifier {
   ThemeCtl._();
   static final ThemeCtl I = ThemeCtl._();
 
   bool dark = false;
+  int seedIndex = 0;
+
+  /// Material You 的几套种子色（蓝 / 青 / 紫 / 绿 / 橙）
+  static const seeds = <Color>[
+    Color(0xFF00639B), // Blue（默认）
+    Color(0xFF00696E), // Teal
+    Color(0xFF6B4EFF), // Violet
+    Color(0xFF386A20), // Green
+    Color(0xFF984100), // Orange
+  ];
+
+  Color get seed => seeds[seedIndex];
 
   Future<void> load() async {
     try {
       final exeDir = File(Platform.resolvedExecutable).parent.path;
       final f = File('$exeDir\\client_prefs.txt');
       if (f.existsSync()) {
-        dark = (await f.readAsString()).trim() == 'dark=1';
+        final t = (await f.readAsString()).trim();
+        for (final kv in t.split(';')) {
+          final p = kv.split('=');
+          if (p.length != 2) continue;
+          if (p[0] == 'dark') dark = p[1] == '1';
+          if (p[0] == 'seed') seedIndex = int.tryParse(p[1])?.clamp(0, 4) ?? 0;
+        }
       }
     } catch (_) {/* 读取失败用默认值 */}
+  }
+
+  Future<void> _save() async {
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      await File('$exeDir\\client_prefs.txt')
+          .writeAsString('dark=${dark ? 1 : 0};seed=$seedIndex');
+    } catch (_) {/* 写失败不影响运行 */}
   }
 
   Future<void> set(bool d) async {
     if (dark == d) return;
     dark = d;
     notifyListeners();
-    try {
-      final exeDir = File(Platform.resolvedExecutable).parent.path;
-      await File('$exeDir\\client_prefs.txt')
-          .writeAsString(d ? 'dark=1' : 'dark=0');
-    } catch (_) {/* 写失败不影响运行 */}
+    await _save();
   }
 
   void toggle() => set(!dark);
+
+  /// 切换 Material You 种子配色
+  Future<void> cycleSeed() async {
+    seedIndex = (seedIndex + 1) % seeds.length;
+    notifyListeners();
+    await _save();
+  }
 }
 
-// ---------------------------------------------------------------- Liquid Glass 调色板
-/// 玻璃材质由 liquid_glass_widgets 提供；这里只保留页面底色、折射色斑与日志终端色
-class Glass {
-  static bool get dark => ThemeCtl.I.dark;
+// ---------------------------------------------------------------- Material You 主题
+class AppTheme {
+  /// 由种子色生成完整 M3 配色方案（Material You 的核心：一套种子 → 整套角色色）
+  static ColorScheme scheme(Brightness b, Color seed) =>
+      ColorScheme.fromSeed(seedColor: seed, brightness: b);
 
-  // 页面底色（模糊与折射感知的底）
-  static Color get pageTop => dark ? const Color(0xFF101018) : const Color(0xFFEEF1F8);
-  static Color get pageBottom => dark ? const Color(0xFF050508) : const Color(0xFFE2E6F0);
-
-  // 背景色斑（液态玻璃的"折射源"）
-  static Color get blob1 => dark
-      ? CupertinoColors.systemIndigo.withValues(alpha: 0.35)
-      : CupertinoColors.systemBlue.withValues(alpha: 0.30);
-  static Color get blob2 => dark
-      ? CupertinoColors.systemPurple.withValues(alpha: 0.28)
-      : CupertinoColors.systemPurple.withValues(alpha: 0.22);
-  static Color get blob3 => dark
-      ? CupertinoColors.systemTeal.withValues(alpha: 0.22)
-      : CupertinoColors.systemPink.withValues(alpha: 0.20);
-
-  // 普通填充（非玻璃控件：输入框等）
-  static Color get fill => dark
-      ? const Color(0x1FFFFFFF)
-      : CupertinoColors.tertiarySystemFill;
-
-  // 日志终端（两种模式都保持深色控制台，暗色下更深）
-  static Color get logBg => dark ? const Color(0xFF101014) : const Color(0xFF1C1C1E);
-  static const Color logFg = Color(0xFFE8E8ED);
-  static Color get logBorder => dark ? const Color(0xFF2C2C30) : const Color(0xFF3A3A3C);
-
-  static CupertinoThemeData theme() => CupertinoThemeData(
-        brightness: dark ? Brightness.dark : Brightness.light,
-        scaffoldBackgroundColor: pageBottom,
-        primaryColor: CupertinoColors.systemBlue,
-        barBackgroundColor: dark
-            ? const Color(0xCC16161C)
-            : const Color(0xCCFBFBFD),
-        textTheme: const CupertinoTextThemeData(
-          textStyle: TextStyle(
-            fontFamily: 'Microsoft YaHei UI',
-            fontSize: 14,
-            color: CupertinoColors.label,
-          ),
+  static ThemeData build(Brightness b, Color seed) {
+    final cs = scheme(b, seed);
+    final base = ThemeData(
+      useMaterial3: true,
+      colorScheme: cs,
+      // Windows 上保证中文正常显示
+      fontFamily: 'Microsoft YaHei UI',
+      visualDensity: VisualDensity.standard,
+      // M3 动效规范：emphasized 减速曲线
+      pageTransitionsTheme: const PageTransitionsTheme(
+        builders: <TargetPlatform, PageTransitionsBuilder>{
+          TargetPlatform.windows: FadeForwardsPageTransitionsBuilder(),
+        },
+      ),
+    );
+    return base.copyWith(
+      scaffoldBackgroundColor: cs.surface,
+      appBarTheme: AppBarTheme(
+        centerTitle: false,
+        elevation: 0,
+        scrolledUnderElevation: 3,
+        backgroundColor: cs.surface,
+        surfaceTintColor: cs.surfaceTint,
+        foregroundColor: cs.onSurface,
+        titleTextStyle: base.textTheme.titleMedium?.copyWith(
+          fontWeight: FontWeight.w600,
+          color: cs.onSurface,
         ),
-      );
+      ),
+      cardTheme: CardThemeData(
+        elevation: 0,
+        color: cs.surfaceContainerLow,
+        surfaceTintColor: cs.surfaceTint,
+        margin: EdgeInsets.zero,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          minimumSize: const Size(0, 48),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        ),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(
+          minimumSize: const Size(0, 44),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        ),
+      ),
+      segmentedButtonTheme: SegmentedButtonThemeData(
+        style: ButtonStyle(
+          shape: WidgetStatePropertyAll(
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20))),
+        ),
+      ),
+      snackBarTheme: SnackBarThemeData(
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+      dividerTheme: DividerThemeData(color: cs.outlineVariant, thickness: 1),
+    );
+  }
 }
 
 class Luac2cApp extends StatelessWidget {
@@ -134,20 +158,13 @@ class Luac2cApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: ThemeCtl.I,
-      builder: (context, _) => LiquidGlassWidgets.wrap(
-        // 把明暗主题接入库的 brightness 级联（玻璃明暗、光泽随之切换）
-        theme: GlassThemeData(
-          brightness: ThemeCtl.I.dark ? Brightness.dark : Brightness.light,
-        ),
-        // 开启自适应质量：Windows 上会把质量上限压到 standard，
-        // 避免 GlassAppBar 内部强制 premium 多通道着色器导致白屏
-        adaptiveQuality: true,
-        child: CupertinoApp(
-          title: 'luac2c 客户端',
-          debugShowCheckedModeBanner: false,
-          theme: Glass.theme(),
-          home: const HomePage(),
-        ),
+      builder: (context, _) => MaterialApp(
+        title: 'luac2c 客户端',
+        debugShowCheckedModeBanner: false,
+        theme: AppTheme.build(Brightness.light, ThemeCtl.I.seed),
+        darkTheme: AppTheme.build(Brightness.dark, ThemeCtl.I.seed),
+        themeMode: ThemeCtl.I.dark ? ThemeMode.dark : ThemeMode.light,
+        home: const HomePage(),
       ),
     );
   }
@@ -283,16 +300,17 @@ class SectionTitle extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
     return Row(children: [
       if (icon != null) ...[
-        Icon(icon, size: 15, color: CupertinoColors.systemGrey),
+        Icon(icon, size: 16, color: cs.primary),
         const SizedBox(width: 6),
       ],
       Text(text,
-          style: const TextStyle(
+          style: TextStyle(
               fontSize: 12.5,
               fontWeight: FontWeight.w600,
-              color: CupertinoColors.systemGrey,
+              color: cs.primary,
               letterSpacing: 0.2)),
       const Spacer(),
       ?trailing,
@@ -300,7 +318,7 @@ class SectionTitle extends StatelessWidget {
   }
 }
 
-/// 工具状态指示灯
+/// 工具状态指示灯（M3：error / primary 容器配色）
 class StatusDot extends StatelessWidget {
   final bool ok;
   final String label;
@@ -310,32 +328,24 @@ class StatusDot extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
     return Tooltip(
       message: path,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
-          color: (ok ? CupertinoColors.systemGreen : CupertinoColors.systemRed)
-              .withValues(alpha: 0.10),
-          borderRadius: BorderRadius.circular(20),
+          color: ok ? cs.primaryContainer : cs.errorContainer,
+          borderRadius: BorderRadius.circular(8),
         ),
         child: Row(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 7,
-            height: 7,
-            decoration: BoxDecoration(
-                color:
-                    ok ? CupertinoColors.systemGreen : CupertinoColors.systemRed,
-                shape: BoxShape.circle),
-          ),
+          Icon(ok ? Icons.check_circle : Icons.error,
+              size: 13, color: ok ? cs.onPrimaryContainer : cs.onErrorContainer),
           const SizedBox(width: 6),
           Text(label,
               style: TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w500,
-                  color: ok
-                      ? CupertinoColors.systemGreen
-                      : CupertinoColors.systemRed)),
+                  color: ok ? cs.onPrimaryContainer : cs.onErrorContainer)),
         ]),
       ),
     );
@@ -646,158 +656,87 @@ class _HomePageState extends State<HomePage> {
     log('! $m');
     setStatus(m);
     if (mounted) {
-      GlassToast.show(context,
-          message: m, type: GlassToastType.info, position: GlassToastPosition.top);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(m), behavior: SnackBarBehavior.floating),
+      );
     }
   }
 
   // ---------------------------------------------------------------- UI
   @override
   Widget build(BuildContext context) {
-    // 遵循 liquid_glass_widgets 的 iOS 26 设计哲学：
-    // 玻璃材质保留给导航层与控制层（顶栏、分段控件、开关、按钮），
-    // 内容区（源文件列表、工具链、日志）用不透明/半透明卡片。
-    return GlassScaffold(
-      // 玻璃的"折射源"：对角渐变 + 三团柔和色斑 + 细点阵纹理（折射需要背景有细节）
-      background: SizedBox.expand(child: _glassBackdrop()),
-      backgroundColor: Glass.pageBottom,
-      statusBarStyle: GlassStatusBarStyle.none,
-      // 页面级共享玻璃层参数：加厚玻璃、增强折射与边缘光
-      settings: LiquidGlassSettings(
-        glassColor:
-            ThemeCtl.I.dark ? const Color(0x1FFFFFFF) : const Color(0x5CFFFFFF),
-        thickness: 24, // 玻璃厚度：折射变形范围
-        blur: 12, // 磨砂强度（过大会糊且费性能）
-        refractiveIndex: 1.45, // 折射率：越大边缘变形越明显
-        lightAngle: 0.6,
-        lightIntensity: 1.3,
-        ambientStrength: 0.8,
-        ambientRim: 0.6,
-        fresnelStrength: 0.9, // 菲涅尔边缘光
-        saturation: 1.1,
-      ),
-      // Windows 固定高度布局，不需要滚动边缘淡出
-      extendBody: false,
-      edgeFade: false,
-      appBar: GlassAppBar(
+    // Material You：配色全部来自 ColorScheme，组件用 M3 组件
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      backgroundColor: cs.surfaceContainerLowest,
+      appBar: AppBar(
         title: Row(mainAxisSize: MainAxisSize.min, children: [
           Container(
-            width: 22,
-            height: 22,
+            width: 28,
+            height: 28,
             decoration: BoxDecoration(
-              color: CupertinoColors.systemBlue,
-              borderRadius: BorderRadius.circular(6),
+              color: cs.primaryContainer,
+              borderRadius: BorderRadius.circular(8),
             ),
             alignment: Alignment.center,
-            child: const Icon(CupertinoIcons.chevron_left_slash_chevron_right,
-                size: 13, color: CupertinoColors.white),
+            child: Icon(Icons.code, size: 16, color: cs.onPrimaryContainer),
           ),
-          const SizedBox(width: 8),
-          const Text('luac2c 客户端',
-              style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600)),
+          const SizedBox(width: 10),
+          const Text('luac2c 客户端'),
         ]),
         actions: [
-          GlassButton(
+          // Material You 种子配色切换
+          IconButton(
+            icon: const Icon(Icons.palette_outlined),
+            tooltip: '切换配色（Material You 种子色）',
+            onPressed: () => ThemeCtl.I.cycleSeed(),
+          ),
+          // 明暗主题
+          IconButton(
+            tooltip: ThemeCtl.I.dark ? '切换到浅色' : '切换到深色',
             icon: AnimatedSwitcher(
               duration: const Duration(milliseconds: 250),
               transitionBuilder: (c, a) => FadeTransition(opacity: a, child: c),
               child: Icon(
                 key: ValueKey<bool>(ThemeCtl.I.dark),
-                ThemeCtl.I.dark
-                    ? CupertinoIcons.sun_max_fill
-                    : CupertinoIcons.moon_fill,
-                size: 19,
-                color: ThemeCtl.I.dark
-                    ? CupertinoColors.systemYellow
-                    : CupertinoColors.systemIndigo,
+                ThemeCtl.I.dark ? Icons.light_mode : Icons.dark_mode,
               ),
             ),
-            onTap: () => ThemeCtl.I.toggle(),
-            width: 38,
-            height: 38,
+            onPressed: () => ThemeCtl.I.toggle(),
           ),
-          const SizedBox(width: 8),
-          GlassButton(
-            icon: const Icon(CupertinoIcons.info_circle, size: 19),
-            onTap: _showAbout,
-            width: 38,
-            height: 38,
+          IconButton(
+            icon: const Icon(Icons.info_outline),
+            tooltip: '关于',
+            onPressed: _showAbout,
           ),
+          const SizedBox(width: 6),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _sourceCard(),
-            const SizedBox(height: 12),
-            _modeSection(),
-            const SizedBox(height: 12),
-            _toolsCard(),
-            const SizedBox(height: 12),
-            _actionsSection(),
-            const SizedBox(height: 10),
-            _statusBar(),
-            const SizedBox(height: 10),
-            Expanded(child: _logCard()),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// 玻璃背后的"折射源"：对角渐变 + 三团柔和色斑 + 细点阵（折射可见性）
-  Widget _glassBackdrop() {
-    final dot =
-        (ThemeCtl.I.dark ? const Color(0x14FFFFFF) : const Color(0x12000000));
-    return IgnorePointer(
-      child: Container(
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: [Glass.pageTop, Glass.pageBottom],
-          ),
-        ),
-        child: Stack(children: [
-          // 点阵网格：玻璃折射会把点拉弯，效果立刻可见
-          Positioned.fill(
-            child: CustomPaint(
-              painter: _DotGridPainter(color: dot, spacing: 22, dotSize: 1.6),
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 760),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _sourceCard(),
+                  const SizedBox(height: 12),
+                  _modeSection(),
+                  const SizedBox(height: 12),
+                  _toolsCard(),
+                  const SizedBox(height: 12),
+                  _actionsSection(),
+                  const SizedBox(height: 10),
+                  _statusBar(),
+                  const SizedBox(height: 10),
+                  Expanded(child: _logCard()),
+                ],
+              ),
             ),
           ),
-          Positioned(
-            top: -110,
-            left: -70,
-            child: _blob(320, Glass.blob1),
-          ),
-          Positioned(
-            top: 180,
-            right: -90,
-            child: _blob(360, Glass.blob2),
-          ),
-          Positioned(
-            bottom: -120,
-            left: 60,
-            child: _blob(300, Glass.blob3),
-          ),
-        ]),
-      ),
-    );
-  }
-
-  /// 单个径向渐变模糊色斑
-  Widget _blob(double size, Color color) {
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        gradient: RadialGradient(colors: [
-          color,
-          color.withValues(alpha: 0.0),
-        ]),
+        ),
       ),
     );
   }
@@ -805,29 +744,26 @@ class _HomePageState extends State<HomePage> {
   // ---- 源文件（批量列表） ----
   Widget _sourceCard() {
     final hasFiles = _files.isNotEmpty;
-    return GlassCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SectionTitle(
-            hasFiles ? '源文件（${_files.length} 个）' : '源文件',
-            icon: CupertinoIcons.doc_text,
-            trailing: hasFiles
-                ? CupertinoButton(
-                    padding: EdgeInsets.zero,
-                    minimumSize: const Size(0, 22),
-                    onPressed: _busy
-                        ? null
-                        : () => setState(() {
-                              _files.clear();
-                              _results.clear();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SectionTitle(
+              hasFiles ? '源文件（${_files.length} 个）' : '源文件',
+              icon: Icons.description_outlined,
+              trailing: hasFiles
+                  ? TextButton(
+                      onPressed: _busy
+                          ? null
+                          : () => setState(() {
+                                _files.clear();
+                                _results.clear();
                               _doneCount = 0;
                               _totalCount = 0;
                             }),
-                    child: const Text('全部移除',
-                        style: TextStyle(
-                            fontSize: 12,
-                            color: CupertinoColors.systemRed)),
+                    child: const Text('全部移除'),
                   )
                 : null,
           ),
@@ -839,72 +775,33 @@ class _HomePageState extends State<HomePage> {
                 : Container(
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: Glass.fill,
-                      borderRadius: BorderRadius.circular(9),
+                      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                      borderRadius: BorderRadius.circular(12),
                     ),
-                    child: const Text('点击「添加文件」多选，或把多个 .lua 文件拖进窗口',
+                    child: Text('点击「添加文件」多选，或把多个 .lua 文件拖进窗口',
                         style: TextStyle(
                             fontSize: 12.5,
-                            color: CupertinoColors.placeholderText)),
+                            color: Theme.of(context).colorScheme.onSurfaceVariant)),
                   ),
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 12),
           Row(children: [
             Expanded(
-              child: SizedBox(
-                height: 36,
-                child: CupertinoButton(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  borderRadius: BorderRadius.circular(9),
-                  color: Glass.fill,
-                  onPressed: _busy ? null : pickFile,
-                  child: const Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(CupertinoIcons.plus_circle,
-                            size: 14, color: CupertinoColors.activeBlue),
-                        SizedBox(width: 6),
-                        Text('添加文件（可多选）',
-                            style: TextStyle(
-                                fontSize: 12.5,
-                                color: CupertinoColors.activeBlue)),
-                      ]),
-                ),
+              child: OutlinedButton.icon(
+                onPressed: _busy ? null : pickFile,
+                icon: const Icon(Icons.add, size: 18),
+                label: const Text('添加文件（可多选）'),
               ),
             ),
             const SizedBox(width: 10),
-            SizedBox(
-              height: 36,
-              child: CupertinoButton.filled(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                borderRadius: BorderRadius.circular(9),
-                onPressed: _busy ? null : () => _addFiles(_sampleFiles()),
-                child: const Text('加入示例', style: TextStyle(fontSize: 12.5)),
-              ),
-            ),
-            const SizedBox(width: 10),
-            SizedBox(
-              height: 36,
-              child: CupertinoButton(
-                padding: const EdgeInsets.symmetric(horizontal: 14),
-                borderRadius: BorderRadius.circular(9),
-                color: Glass.fill,
-                onPressed: openOutDir,
-                child: const Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(CupertinoIcons.folder_open,
-                          size: 14, color: CupertinoColors.activeBlue),
-                      SizedBox(width: 6),
-                      Text('目录',
-                          style: TextStyle(
-                              fontSize: 12.5,
-                              color: CupertinoColors.activeBlue)),
-                    ]),
-              ),
+            FilledButton.tonalIcon(
+              onPressed: _busy ? null : () => _addFiles(_sampleFiles()),
+              icon: const Icon(Icons.auto_awesome, size: 18),
+              label: const Text('加入示例'),
             ),
           ]),
         ],
+      ),
       ),
     );
   }
@@ -923,128 +820,132 @@ class _HomePageState extends State<HomePage> {
 
   /// 文件列表（带每个文件的通过/失败标记与移除按钮）
   Widget _fileList() {
+    final cs = Theme.of(context).colorScheme;
     return Container(
       decoration: BoxDecoration(
-        color: Glass.fill,
-        borderRadius: BorderRadius.circular(9),
+        color: cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
       ),
       child: ListView.separated(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
         itemCount: _files.length,
-        separatorBuilder: (_, _) =>
-            const Divider(height: 1, thickness: 0.5),
+        separatorBuilder: (_, _) => Divider(height: 1, color: cs.outlineVariant),
         itemBuilder: (context, i) {
           final p = _files[i];
           final name = p.split(r'\').last;
           final res = _results[p];
-          return Row(children: [
-            Icon(
+          final c = res == null
+              ? cs.onSurfaceVariant
+              : res
+                  ? cs.primary
+                  : cs.error;
+          return ListTile(
+            dense: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+            leading: Icon(
                 res == null
-                    ? CupertinoIcons.doc_text
+                    ? Icons.description_outlined
                     : res
-                        ? CupertinoIcons.checkmark_circle_fill
-                        : CupertinoIcons.xmark_circle_fill,
-                size: 14,
-                color: res == null
-                    ? CupertinoColors.systemGrey
-                    : res
-                        ? CupertinoColors.systemGreen
-                        : CupertinoColors.systemRed),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 12.5)),
-            ),
-            Expanded(
-              flex: 2,
-              child: Text(p.substring(0, p.lastIndexOf(r'\')),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      fontSize: 10.5, color: CupertinoColors.systemGrey)),
-            ),
-            CupertinoButton(
-              padding: EdgeInsets.zero,
-              minimumSize: const Size(0, 22),
+                        ? Icons.check_circle
+                        : Icons.cancel,
+                size: 18,
+                color: c),
+            title: Text(name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12.5)),
+            subtitle: Text(p.substring(0, p.lastIndexOf(r'\')),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 10.5, color: cs.onSurfaceVariant)),
+            trailing: IconButton(
+              icon: const Icon(Icons.close, size: 16),
+              tooltip: '移除',
               onPressed: _busy
                   ? null
                   : () => setState(() {
                         _files.removeAt(i);
                         _results.remove(p);
                       }),
-              child: const Icon(CupertinoIcons.xmark,
-                  size: 13, color: CupertinoColors.systemGrey),
             ),
-          ]);
+          );
         },
       ),
     );
   }
 
-  // ---- 翻译模式与选项（玻璃控制层：控件直接浮在背景上，遵循 Apple 的玻璃分层原则） ----
+  // ---- 翻译模式与选项（M3：SegmentedButton + Switch） ----
   Widget _modeSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const SectionTitle('翻译模式',
-            icon: CupertinoIcons.slider_horizontal_3),
-        const SizedBox(height: 10),
-        Row(children: [
-          Expanded(
-            child: GlassSegmentedControl(
-              segments: const [
-                GlassSegment(label: '默认多样化'),
-                GlassSegment(label: '指定种子'),
-                GlassSegment(label: '--static'),
-              ],
-              selectedIndex: _mode,
-              onSegmentSelected: (i) {
-                if (!_busy) setState(() => _mode = i);
-              },
-            ),
-          ),
-          const SizedBox(width: 10),
-          Opacity(
-            opacity: _mode == 1 ? 1 : 0.45,
-            child: SizedBox(
-              width: 78,
-              height: 32,
-              child: CupertinoTextField(
-                controller: _seed,
-                enabled: !_busy && _mode == 1,
-                placeholder: 'seed',
-                textAlign: TextAlign.center,
-                keyboardType: TextInputType.number,
-                style: const TextStyle(fontSize: 12.5),
-                padding: const EdgeInsets.symmetric(horizontal: 6),
-                decoration: BoxDecoration(
-                  color: Glass.fill,
-                  borderRadius: BorderRadius.circular(8),
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SectionTitle('翻译模式', icon: Icons.tune),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(
+                child: SegmentedButton<int>(
+                  segments: const [
+                    ButtonSegment<int>(
+                        value: 0,
+                        label: Text('默认多样化'),
+                        icon: Icon(Icons.shuffle)),
+                    ButtonSegment<int>(
+                        value: 1, label: Text('指定种子'), icon: Icon(Icons.tag)),
+                    ButtonSegment<int>(
+                        value: 2,
+                        label: Text('--static'),
+                        icon: Icon(Icons.lock_outline)),
+                  ],
+                  selected: {_mode},
+                  onSelectionChanged: (s) {
+                    if (!_busy) setState(() => _mode = s.first);
+                  },
                 ),
               ),
+              const SizedBox(width: 10),
+              Opacity(
+                opacity: _mode == 1 ? 1 : 0.45,
+                child: SizedBox(
+                  width: 78,
+                  height: 40,
+                  child: TextField(
+                    controller: _seed,
+                    enabled: !_busy && _mode == 1,
+                    decoration: const InputDecoration(
+                      labelText: 'seed',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                    textAlign: TextAlign.center,
+                    keyboardType: TextInputType.number,
+                    style: const TextStyle(fontSize: 12.5),
+                  ),
+                ),
+              ),
+            ]),
+            const SizedBox(height: 6),
+            const Divider(height: 22),
+            _switchRow(
+              icon: Icons.inventory_2_outlined,
+              title: '--no-pool',
+              subtitle: '关闭常量池，字面量直接进源码，便于调试',
+              value: _nopool,
+              onChanged: (v) => _nopool = v,
             ),
-          ),
-        ]),
-        const SizedBox(height: 6),
-        const Divider(height: 22, thickness: 0.5),
-        _switchRow(
-          icon: CupertinoIcons.cube,
-          title: '--no-pool',
-          subtitle: '关闭常量池，字面量直接进源码，便于调试',
-          value: _nopool,
-          onChanged: (v) => _nopool = v,
+            const SizedBox(height: 4),
+            _switchRow(
+              icon: Icons.comment_outlined,
+              title: '--annotate',
+              subtitle: '在生成的 C 代码中保留 opcode 注释',
+              value: _annot,
+              onChanged: (v) => _annot = v,
+            ),
+          ],
         ),
-        const SizedBox(height: 4),
-        _switchRow(
-          icon: CupertinoIcons.text_alignleft,
-          title: '--annotate',
-          subtitle: '在生成的 C 代码中保留 opcode 注释',
-          value: _annot,
-          onChanged: (v) => _annot = v,
-        ),
-      ],
+      ),
     );
   }
 
@@ -1055,9 +956,10 @@ class _HomePageState extends State<HomePage> {
     required bool value,
     required ValueChanged<bool> onChanged,
   }) {
+    final cs = Theme.of(context).colorScheme;
     return Row(children: [
-      Icon(icon, size: 16, color: CupertinoColors.systemGrey),
-      const SizedBox(width: 9),
+      Icon(icon, size: 18, color: cs.onSurfaceVariant),
+      const SizedBox(width: 10),
       Expanded(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1067,12 +969,11 @@ class _HomePageState extends State<HomePage> {
                     fontSize: 13.5, fontWeight: FontWeight.w500)),
             const SizedBox(height: 1),
             Text(subtitle,
-                style: const TextStyle(
-                    fontSize: 11, color: CupertinoColors.systemGrey)),
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
           ],
         ),
       ),
-      GlassSwitch(
+      Switch(
         value: value,
         onChanged: (x) {
           if (!_busy) setState(() => onChanged(x));
@@ -1083,194 +984,181 @@ class _HomePageState extends State<HomePage> {
 
   // ---- 工具链 ----
   Widget _toolsCard() {
-    return GlassCard(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SectionTitle(
-            '工具链',
-            icon: CupertinoIcons.wrench,
-            trailing: _tools.allOk
-                ? const StatusDot(ok: true, label: '就绪', path: '全部工具已找到')
-                : const StatusDot(ok: false, label: '有缺失', path: '见下方指示灯'),
-          ),
-          const SizedBox(height: 9),
-          Wrap(spacing: 8, runSpacing: 8, children: [
-            StatusDot(ok: _tools.luacOk, label: 'luac', path: _tools.luac),
-            StatusDot(ok: _tools.l2cOk, label: 'luac2c', path: _tools.l2c),
-            StatusDot(ok: _tools.luaOk, label: 'lua', path: _tools.lua),
-            StatusDot(ok: _tools.gccOk, label: 'gcc', path: _tools.gcc),
-          ]),
-          const SizedBox(height: 9),
-          Text(_tools.root,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                  fontSize: 11,
-                  color: CupertinoColors.systemGrey,
-                  fontFamily: 'Consolas')),
-        ],
+    final cs = Theme.of(context).colorScheme;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SectionTitle(
+              '工具链',
+              icon: Icons.build_outlined,
+              trailing: _tools.allOk
+                  ? const StatusDot(ok: true, label: '就绪', path: '全部工具已找到')
+                  : const StatusDot(
+                      ok: false, label: '有缺失', path: '见下方指示灯'),
+            ),
+            const SizedBox(height: 10),
+            Wrap(spacing: 8, runSpacing: 8, children: [
+              StatusDot(ok: _tools.luacOk, label: 'luac', path: _tools.luac),
+              StatusDot(ok: _tools.l2cOk, label: 'luac2c', path: _tools.l2c),
+              StatusDot(ok: _tools.luaOk, label: 'lua', path: _tools.lua),
+              StatusDot(ok: _tools.gccOk, label: 'gcc', path: _tools.gcc),
+            ]),
+            const SizedBox(height: 10),
+            Text(_tools.root,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 11,
+                    color: cs.onSurfaceVariant,
+                    fontFamily: 'Consolas')),
+          ],
+        ),
       ),
     );
   }
 
-  // ---- 操作按钮（玻璃控制层） ----
+  // ---- 操作按钮（M3：FilledButton 主操作 / OutlinedButton 次操作） ----
   Widget _actionsSection() {
     return Column(children: [
-      GlassButton.custom(
-        onTap: () => runPipeline(full: true),
-        enabled: !_busy,
-        height: 44,
+      SizedBox(
         width: double.infinity,
-        shape: const LiquidRoundedSuperellipse(borderRadius: 14),
-        style: GlassButtonStyle.prominent,
-        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          if (_busy)
-            const CupertinoActivityIndicator(radius: 8)
-          else
-            const Icon(CupertinoIcons.play_arrow_solid, size: 15),
-          const SizedBox(width: 8),
-          const Text('一键流水线',
-              style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600)),
-          const SizedBox(width: 4),
-          Text('（翻译 → 编译 → 运行 → 比对）',
-              style: TextStyle(
-                  fontSize: 11.5,
-                  color: CupertinoColors.white.withValues(alpha: 0.75))),
-        ]),
+        child: FilledButton.icon(
+          onPressed: _busy ? null : () => runPipeline(full: true),
+          icon: _busy
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.play_arrow, size: 20),
+          label: const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Text('一键流水线', style: TextStyle(fontSize: 15)),
+          ),
+        ),
       ),
-      const SizedBox(height: 9),
+      const SizedBox(height: 10),
       Row(children: [
         Expanded(
-            child: _minorButton(CupertinoIcons.doc_plaintext, '仅翻译 C',
+            child: _minorButton(Icons.description_outlined, '仅翻译 C',
                 () => runPipeline(full: false))),
-        const SizedBox(width: 9),
-        Expanded(
-            child: _minorButton(CupertinoIcons.arrow_2_circlepath,
-                '重建 luac2c', rebuildLuac2c)),
-        const SizedBox(width: 9),
+        const SizedBox(width: 10),
         Expanded(
             child: _minorButton(
-                CupertinoIcons.folder_open, '输出目录', openOutDir)),
+                Icons.build_outlined, '重建 luac2c', rebuildLuac2c)),
+        const SizedBox(width: 10),
+        Expanded(
+            child: _minorButton(Icons.folder_open_outlined, '输出目录', openOutDir)),
       ]),
     ]);
   }
 
   Widget _minorButton(IconData icon, String label, VoidCallback onTap) {
-    return GlassButton.custom(
-      onTap: onTap,
-      enabled: !_busy,
-      height: 36,
-      shape: const LiquidRoundedSuperellipse(borderRadius: 11),
-      child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-        Icon(icon, size: 14, color: CupertinoColors.activeBlue),
-        const SizedBox(width: 6),
-        Flexible(
-          child: Text(label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                  fontSize: 12.5, color: CupertinoColors.activeBlue)),
-        ),
-      ]),
+    return OutlinedButton.icon(
+      onPressed: _busy ? null : onTap,
+      icon: Icon(icon, size: 16),
+      label: Flexible(
+        child: Text(label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 12.5)),
+      ),
     );
   }
 
-  // ---- 状态条 ----
+  // ---- 状态条（M3：容器色 + onContainer 前景色） ----
   Widget _statusBar() {
+    final cs = Theme.of(context).colorScheme;
     final ok = _status.startsWith('通过') ||
         _status.startsWith('翻译完成') ||
         _status.contains('已重建') ||
         _status.contains('已复制');
     final bad = _status.startsWith('失败') || _status.startsWith('不一致');
-    final color = bad
-        ? CupertinoColors.systemRed
+    final bg = bad
+        ? cs.errorContainer
         : ok
-            ? CupertinoColors.systemGreen
-            : CupertinoColors.systemGrey;
+            ? cs.primaryContainer
+            : cs.surfaceContainerHighest;
+    final fg = bad
+        ? cs.onErrorContainer
+        : ok
+            ? cs.onPrimaryContainer
+            : cs.onSurfaceVariant;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.10),
-        borderRadius: BorderRadius.circular(9),
+        color: bg,
+        borderRadius: BorderRadius.circular(12),
       ),
       child: Row(children: [
         Icon(
             bad
-                ? CupertinoIcons.xmark_circle_fill
+                ? Icons.error_outline
                 : ok
-                    ? CupertinoIcons.checkmark_circle_fill
-                    : CupertinoIcons.info_circle,
-            size: 15,
-            color: color),
-        const SizedBox(width: 8),
+                    ? Icons.check_circle_outline
+                    : Icons.info_outline,
+            size: 18,
+            color: fg),
+        const SizedBox(width: 10),
         Expanded(
           child: Text(_status,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                  fontSize: 12.5, fontWeight: FontWeight.w600, color: color)),
+              style:
+                  TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: fg)),
         ),
         if (_busy)
-          const CupertinoActivityIndicator(radius: 7)
+          SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2, color: fg),
+          )
         else if (_logLines.isNotEmpty)
           Text('${_logLines.length} 行',
-              style: const TextStyle(
-                  fontSize: 11, color: CupertinoColors.systemGrey)),
+              style: TextStyle(fontSize: 11, color: fg)),
       ]),
     );
   }
 
-  // ---- 日志 ----
+  // ---- 日志（M3：surface 容器 + 等宽字体） ----
   Widget _logCard() {
-    final logFg = Glass.logFg;
-    return Container(
-      decoration: BoxDecoration(
-        color: Glass.logBg,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Glass.logBorder, width: 0.8),
-      ),
+    final cs = Theme.of(context).colorScheme;
+    return Card(
+      clipBehavior: Clip.antiAlias,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 8, 6),
+            padding: const EdgeInsets.fromLTRB(14, 8, 6, 4),
             child: Row(children: [
-              Icon(CupertinoIcons.doc_richtext, size: 13, color: logFg),
-              const SizedBox(width: 7),
+              Icon(Icons.terminal, size: 16, color: cs.onSurfaceVariant),
+              const SizedBox(width: 8),
               Text('输出日志',
                   style: TextStyle(
-                      fontSize: 12.5,
+                      fontSize: 13,
                       fontWeight: FontWeight.w600,
-                      color: logFg)),
+                      color: cs.onSurface)),
               const Spacer(),
-              CupertinoButton(
-                minimumSize: const Size(0, 26),
-                padding: const EdgeInsets.symmetric(horizontal: 8),
+              TextButton.icon(
                 onPressed: copyLog,
-                child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(CupertinoIcons.doc_on_doc, size: 12, color: logFg),
-                  const SizedBox(width: 4),
-                  Text('复制', style: TextStyle(fontSize: 11.5, color: logFg)),
-                ]),
+                icon: const Icon(Icons.copy_all, size: 15),
+                label: const Text('复制'),
               ),
-              CupertinoButton(
-                minimumSize: const Size(0, 26),
-                padding: const EdgeInsets.symmetric(horizontal: 8),
+              TextButton.icon(
                 onPressed: () => setState(_logLines.clear),
-                child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  Icon(CupertinoIcons.trash, size: 12, color: logFg),
-                  const SizedBox(width: 4),
-                  Text('清空', style: TextStyle(fontSize: 11.5, color: logFg)),
-                ]),
+                icon: const Icon(Icons.delete_outline, size: 15),
+                label: const Text('清空'),
               ),
             ]),
           ),
-          Divider(height: 1, thickness: 1, color: Glass.logBorder),
+          Divider(height: 1, color: cs.outlineVariant),
           Expanded(
-            child: CupertinoScrollbar(
+            child: Scrollbar(
               controller: _logScroll,
+              thumbVisibility: true,
               child: SingleChildScrollView(
                 controller: _logScroll,
                 padding: const EdgeInsets.all(12),
@@ -1278,10 +1166,10 @@ class _HomePageState extends State<HomePage> {
                   _logLines.isEmpty ? '（暂无输出）' : _logLines.join('\n'),
                   style: TextStyle(
                       fontFamily: 'Consolas',
-                      fontFamilyFallback: ['Microsoft YaHei UI'],
+                      fontFamilyFallback: const ['Microsoft YaHei UI'],
                       fontSize: 12,
                       height: 1.45,
-                      color: logFg),
+                      color: cs.onSurface),
                 ),
               ),
             ),
@@ -1292,36 +1180,51 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _showAbout() {
-    showCupertinoDialog(
+    showDialog(
       context: context,
-      builder: (ctx) => CupertinoAlertDialog(
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.code),
         title: const Text('luac2c 客户端'),
-        content: Padding(
-          padding: const EdgeInsets.only(top: 8),
+        content: SizedBox(
+          width: 460,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
               const Text('把 Lua 5.5 字节码翻译成调用 Lua C API 的 C 源码，'
                   '并一键编译、运行、与 lua.exe 逐字节比对。'),
-              const SizedBox(height: 10),
-              Text('根目录：${_tools.root}',
-                  style: const TextStyle(fontSize: 12)),
-              Text('luac：${_tools.luac}',
-                  style: const TextStyle(fontSize: 12)),
-              Text('luac2c：${_tools.l2c}',
-                  style: const TextStyle(fontSize: 12)),
-              Text('lua：${_tools.lua}', style: const TextStyle(fontSize: 12)),
-              Text('gcc：${_tools.gcc}', style: const TextStyle(fontSize: 12)),
+              const SizedBox(height: 12),
+              const Divider(),
+              const SizedBox(height: 8),
+              _aboutRow('根目录', _tools.root),
+              _aboutRow('luac', _tools.luac),
+              _aboutRow('luac2c', _tools.l2c),
+              _aboutRow('lua', _tools.lua),
+              _aboutRow('gcc', _tools.gcc),
             ],
           ),
         ),
         actions: [
-          CupertinoDialogAction(
-              child: const Text('好'),
-              onPressed: () => Navigator.of(ctx).pop()),
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('好')),
         ],
       ),
+    );
+  }
+
+  Widget _aboutRow(String k, String v) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(
+            width: 62,
+            child: Text(k, style: TextStyle(fontSize: 12, color: cs.primary))),
+        Expanded(
+            child: Text(v,
+                style: const TextStyle(fontSize: 11.5, fontFamily: 'Consolas'))),
+      ]),
     );
   }
 }

@@ -19,11 +19,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   flutter::DartProject project(L"data");
 
-  // liquid_glass_widgets 的多通道玻璃着色器在部分 Windows GPU 的 Impeller(GLES)
-  // 下会陷入着色器编译死循环：内存暴涨、首帧永远无法完成、窗口不显示。
-  // 强制回退 Skia 渲染后端（该库明确支持 Windows 的 Skia 轻量 2D 着色器路径）。
-  project.set_impeller_switch(flutter::ImpellerSwitch::Disabled);
-
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
 
