@@ -17,7 +17,7 @@ out.exe                          # 3. 运行，输出与 lua.exe 完全一致
 ├── lua-5.5.1/            # vendored Lua 5.5（src + build/liblua.a）
 ├── lua5.5-include/       # 对外暴露的头文件
 ├── test/                 # 20 个端到端用例 + 测试脚本（test.ps1 / runall.ps1 / sweep.ps1 / sweepall.ps1）
-├── luac2c_flutter/       # Windows GUI 客户端（Flutter, Cupertino 风格）
+├── luac2c_flutter/       # Windows GUI 客户端（Flutter, Material You / M3）
 │   └── lib/main.dart
 ├── luac2c_client.exe     # 客户端构建产物（build 后拷到根目录）
 ├── luac.exe / lua.exe    # Lua 5.5 工具链（可由 lua-5.5.1 重建）
@@ -64,10 +64,16 @@ out.exe                          # 3. 运行，输出与 lua.exe 完全一致
     因为校验代码本身就位于它所度量的区域之内
   - `L2C_GUARD_REPORT=1` 可打印测量结果
 - **GUI 客户端**（`luac2c_flutter/`，Material You / Material Design 3）：
-  - 一键流水线：翻译 → 编译 → 运行 → 与 lua.exe 逐字节比对（多文件并发工作池）
+  - **一键构建并比对**：编译字节码 → 转译为 C → gcc 编译 → 运行 → 与 lua.exe 逐字节比对
+    （多文件并发工作池），另有「仅生成 C 源码」只跑前两步
   - **批量模式**：多选/拖入多个 `.lua` 文件依次处理，逐文件标记通过/失败
-  - 工具自动探测：exe 同目录 → 根目录 → 系统 `PATH` 环境变量，可被 `luac2c_gui.ini` 覆盖
-  - 三种翻译模式 + `--no-pool` / `--annotate`，实时日志，一键重建 luac2c
+  - 工具自动探测：exe 同目录 → 根目录 → 系统 `PATH` 环境变量，可被 `luac2c_gui.ini` 覆盖；
+    指示灯用「字节码编译器 / 转译器 / 脚本引擎 / C 编译器」标注，悬停看具体路径
+  - **代码布局三选一**：随机（默认，每次不同）/ 固定种子（可复现）/ 不混淆（`--static`，原样直译）；
+    开关项：运行时防护（默认开，关 = `--no-guard`）、关闭常量池（`--no-pool`）、
+    保留指令注释（`--annotate`）
+  - 实时运行日志，一键重新编译 luac2c.exe，种子色调色盘 + 明暗主题（均持久化），
+    进度条与「停止」按钮，分级超时与取消
   - 种子色调色盘 + 明暗主题（均持久化），进度条与「停止」按钮，分级超时与取消
 
 ## 构建客户端

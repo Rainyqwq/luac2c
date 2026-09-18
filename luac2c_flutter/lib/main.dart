@@ -1,8 +1,8 @@
 ﻿// luac2c 客户端 (Flutter Windows Desktop, Material You / Material Design 3)
 //
 // 与 Win32 原生版 luac2c_gui.c 功能一致：
-//   一键流水线: luac.exe -> luac2c.exe -> gcc -> 运行生成物 -> 与 lua.exe 输出比对
-//   仅翻译 C / 重建 luac2c.exe / 三种模式 + --no-pool / --annotate
+//   完整流程: 编译字节码 -> 转译为 C -> gcc 编译 -> 运行 -> 与 lua.exe 输出比对
+//   仅生成 C 源码 / 重新编译 luac2c.exe / 三种代码布局 + 常量池、注释等输出选项
 //   拖拽 .lua 文件（runner 原生 WM_DROPFILES）、日志窗格、luac2c_gui.ini [paths] 路径覆盖
 //
 // 设计规范：Material Design 3（Material You）—— 全部配色来自 ColorScheme.fromSeed
@@ -189,11 +189,12 @@ class Tools {
   }
 
   /// 缺失的工具名列表（用于一次性提示，而不是跑到一半才报错）
+  /// 给的是"干什么用的 + 可执行文件名"，而不是裸的 luac / luac2c
   List<String> missing({required bool full}) => <String>[
-        if (!luacOk) 'luac',
-        if (!l2cOk) 'luac2c',
-        if (full && !gccOk) 'gcc',
-        if (full && !luaOk) 'lua',
+        if (!luacOk) '字节码编译器 luac.exe',
+        if (!l2cOk) '转译器 luac2c.exe',
+        if (full && !gccOk) 'C 编译器 gcc.exe',
+        if (full && !luaOk) '脚本引擎 lua.exe',
       ];
 }
 
@@ -532,8 +533,11 @@ class _HomePageState extends State<HomePage> {
   final Map<String, bool> _results = <String, bool>{};
   int _doneCount = 0, _totalCount = 0;
   Tools _tools = Tools();
-  int _mode = 0; // 0 多样化 1 指定种子 2 --static
+  // 代码布局：0 随机（每次不同） 1 固定种子（可复现） 2 不混淆（原始直译）
+  int _mode = 0;
   bool _nopool = false, _annot = false, _busy = false;
+  // 运行时防护：反调试 + 代码/常量完整性自校验（关闭等价于 --no-guard）
+  bool _guard = true;
   // 取消标志：用户点"停止"后，流水线在下一个步骤边界退出
   bool _cancel = false;
   String _status = '就绪';
@@ -659,6 +663,7 @@ class _HomePageState extends State<HomePage> {
     args.addAll(['-o', outC]);
     if (_nopool) args.add('--no-pool');
     if (_annot) args.add('--annotate');
+    if (!_guard) args.add('--no-guard');
     return args;
   }
 
@@ -726,8 +731,8 @@ class _HomePageState extends State<HomePage> {
       await Future.wait(List.generate(workers, (_) => worker()));
       if (_cancel) log('■ 已停止，剩余任务未执行');
     } catch (e) {
-      log('! 流水线异常：$e');
-      setStatus('流水线异常：$e');
+      log('! 流程异常：$e');
+      setStatus('流程异常：$e');
     } finally {
       _flushLog();
       if (mounted) setState(() => _busy = false);
@@ -821,7 +826,7 @@ class _HomePageState extends State<HomePage> {
       if (!File(pC).existsSync()) throw 'luac2c 未生成 $pC';
       p('      → $pC  (${r.ms}ms)');
       if (!full) {
-        p('✓ 仅翻译完成 → $pC');
+        p('✓ C 源码已生成 → $pC');
         ok = true;
         return FileOutcome(srcPath, true, out, ms: sw.elapsedMilliseconds);
       }
@@ -897,7 +902,7 @@ class _HomePageState extends State<HomePage> {
     if (_busy) return;
     setState(() => _busy = true);
     log('');
-    log('[重建] gcc luac2c.c -O2 -o luac2c.exe');
+    log('[重新编译] gcc luac2c.c -O2 -o luac2c.exe');
     try {
       if (!_tools.gccOk) throw '找不到 gcc.exe';
       final r = await runCapture(
@@ -912,15 +917,15 @@ class _HomePageState extends State<HomePage> {
           _tools.root);
       _logOut(r);
       if (r.exitCode == 0) {
-        log('      ✓ luac2c.exe 已重建');
-        setStatus('luac2c.exe 已重建');
+        log('      ✓ luac2c.exe 已重新编译');
+        setStatus('luac2c.exe 已重新编译');
       } else {
         log('      ✗ gcc 退出码 ${r.exitCode}');
-        setStatus('重建失败');
+        setStatus('重新编译失败');
       }
     } catch (e) {
       log('      ✗ $e');
-      setStatus('重建失败');
+      setStatus('重新编译失败');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -1077,7 +1082,7 @@ class _HomePageState extends State<HomePage> {
             FilledButton.tonalIcon(
               onPressed: _busy ? null : () => _addFiles(_sampleFiles()),
               icon: const Icon(Icons.auto_awesome, size: 18),
-              label: const Text('加入示例'),
+              label: const Text('加入示例脚本'),
             ),
           ]),
         ],
@@ -1154,7 +1159,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // ---- 翻译模式与选项（M3：SegmentedButton + Switch） ----
+  // ---- 代码布局与输出选项（M3：SegmentedButton + Switch） ----
   Widget _modeSection() {
     return Card(
       child: Padding(
@@ -1162,22 +1167,20 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const SectionTitle('翻译模式', icon: Icons.tune),
+            const SectionTitle('代码布局与防护', icon: Icons.tune),
             const SizedBox(height: 10),
             Row(children: [
               Expanded(
                 child: SegmentedButton<int>(
                   segments: const [
                     ButtonSegment<int>(
-                        value: 0,
-                        label: Text('默认多样化'),
-                        icon: Icon(Icons.shuffle)),
+                        value: 0, label: Text('随机'), icon: Icon(Icons.shuffle)),
                     ButtonSegment<int>(
-                        value: 1, label: Text('指定种子'), icon: Icon(Icons.tag)),
+                        value: 1, label: Text('固定种子'), icon: Icon(Icons.tag)),
                     ButtonSegment<int>(
                         value: 2,
-                        label: Text('--static'),
-                        icon: Icon(Icons.lock_outline)),
+                        label: Text('不混淆'),
+                        icon: Icon(Icons.lock_open_outlined)),
                   ],
                   selected: {_mode},
                   onSelectionChanged: (s) {
@@ -1195,7 +1198,7 @@ class _HomePageState extends State<HomePage> {
                     controller: _seed,
                     enabled: !_busy && _mode == 1,
                     decoration: const InputDecoration(
-                      labelText: 'seed',
+                      labelText: '种子',
                       isDense: true,
                       border: OutlineInputBorder(),
                     ),
@@ -1206,20 +1209,36 @@ class _HomePageState extends State<HomePage> {
                 ),
               ),
             ]),
+            const SizedBox(height: 8),
+            Text(_modeHint,
+                style: TextStyle(
+                    fontSize: 11.5,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant)),
             const SizedBox(height: 6),
             const Divider(height: 22),
             _switchRow(
+              icon: Icons.security_outlined,
+              title: '运行时防护',
+              subtitle: _mode == 2
+                  ? '「不混淆」布局下 luac2c 不会注入防护（--static 一并关闭）'
+                  : '注入反调试与完整性自校验，被改动时结果自动跑偏（关闭 = --no-guard）',
+              value: _guard && _mode != 2,
+              enabled: _mode != 2,
+              onChanged: (v) => _guard = v,
+            ),
+            const SizedBox(height: 4),
+            _switchRow(
               icon: Icons.inventory_2_outlined,
-              title: '--no-pool',
-              subtitle: '关闭常量池，字面量直接进源码，便于调试',
+              title: '关闭常量池',
+              subtitle: '字面量直接写进 C 源码（--no-pool）：好读，但常量不再运行时解码',
               value: _nopool,
               onChanged: (v) => _nopool = v,
             ),
             const SizedBox(height: 4),
             _switchRow(
               icon: Icons.comment_outlined,
-              title: '--annotate',
-              subtitle: '在生成的 C 代码中保留 opcode 注释',
+              title: '保留指令注释',
+              subtitle: '在生成的 C 源码里逐条标注字节码指令（--annotate）',
               value: _annot,
               onChanged: (v) => _annot = v,
             ),
@@ -1229,12 +1248,25 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// 三种布局的一句话说明（免得「随机 / 固定种子 / 不混淆」看着没头没尾）
+  String get _modeHint {
+    switch (_mode) {
+      case 1:
+        return '固定种子：按种子值打乱布局，同种子产物完全一致，便于复现与对比。';
+      case 2:
+        return '不混淆：原样直译，不做布局变换，也不注入运行时防护（--static，最好读）。';
+      default:
+        return '随机：每次转译都换一套布局与命名，产物每次都不同（默认，防护最强）。';
+    }
+  }
+
   Widget _switchRow({
     required IconData icon,
     required String title,
     required String subtitle,
     required bool value,
     required ValueChanged<bool> onChanged,
+    bool enabled = true,
   }) {
     final cs = Theme.of(context).colorScheme;
     return Row(children: [
@@ -1255,9 +1287,11 @@ class _HomePageState extends State<HomePage> {
       ),
       Switch(
         value: value,
-        onChanged: (x) {
-          if (!_busy) setState(() => onChanged(x));
-        },
+        onChanged: enabled
+            ? (x) {
+                if (!_busy) setState(() => onChanged(x));
+              }
+            : null,
       ),
     ]);
   }
@@ -1281,13 +1315,16 @@ class _HomePageState extends State<HomePage> {
             ),
             const SizedBox(height: 10),
             Wrap(spacing: 8, runSpacing: 8, children: [
-              StatusDot(ok: _tools.luacOk, label: 'luac', path: _tools.luac),
-              StatusDot(ok: _tools.l2cOk, label: 'luac2c', path: _tools.l2c),
-              StatusDot(ok: _tools.luaOk, label: 'lua', path: _tools.lua),
-              StatusDot(ok: _tools.gccOk, label: 'gcc', path: _tools.gcc),
+              StatusDot(
+                  ok: _tools.luacOk,
+                  label: '字节码编译器',
+                  path: _tools.luac),
+              StatusDot(ok: _tools.l2cOk, label: '转译器', path: _tools.l2c),
+              StatusDot(ok: _tools.luaOk, label: '脚本引擎', path: _tools.lua),
+              StatusDot(ok: _tools.gccOk, label: 'C 编译器', path: _tools.gcc),
             ]),
             const SizedBox(height: 10),
-            Text(_tools.root,
+            Text('根目录  ${_tools.root}',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
@@ -1305,18 +1342,21 @@ class _HomePageState extends State<HomePage> {
     return Column(children: [
       Row(children: [
         Expanded(
-          child: FilledButton.icon(
-            onPressed: _busy ? null : () => runPipeline(full: true),
-            icon: _busy
-                ? const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.play_arrow, size: 20),
-            label: const Padding(
-              padding: EdgeInsets.symmetric(vertical: 12),
-              child: Text('一键流水线', style: TextStyle(fontSize: 15)),
+          child: Tooltip(
+            message: '完整流程：编译字节码 → 转译为 C → gcc 编译 → 运行生成物 → 与 lua.exe 输出比对',
+            child: FilledButton.icon(
+              onPressed: _busy ? null : () => runPipeline(full: true),
+              icon: _busy
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.play_arrow, size: 20),
+              label: const Padding(
+                padding: EdgeInsets.symmetric(vertical: 12),
+                child: Text('一键构建并比对', style: TextStyle(fontSize: 15)),
+              ),
             ),
           ),
         ),
@@ -1345,21 +1385,26 @@ class _HomePageState extends State<HomePage> {
       const SizedBox(height: 10),
       Row(children: [
         Expanded(
-            child: _minorButton(Icons.description_outlined, '仅翻译 C',
-                () => runPipeline(full: false))),
+            child: _minorButton(Icons.description_outlined, '仅生成 C 源码',
+                () => runPipeline(full: false),
+                tip: '只跑字节码编译 + 转译，不编译、不运行、不比对')),
         const SizedBox(width: 10),
         Expanded(
             child: _minorButton(
-                Icons.build_outlined, '重建 luac2c', rebuildLuac2c)),
+                Icons.build_outlined, '重新编译 luac2c', rebuildLuac2c,
+                tip: '用 gcc 重新编译 luac2c.c，生成新的 luac2c.exe')),
         const SizedBox(width: 10),
         Expanded(
-            child: _minorButton(Icons.folder_open_outlined, '输出目录', openOutDir)),
+            child: _minorButton(Icons.folder_open_outlined, '打开输出目录',
+                openOutDir,
+                tip: '在资源管理器中打开源文件所在目录（产物也在这里）')),
       ]),
     ]);
   }
 
-  Widget _minorButton(IconData icon, String label, VoidCallback onTap) {
-    return OutlinedButton.icon(
+  Widget _minorButton(IconData icon, String label, VoidCallback onTap,
+      {String? tip}) {
+    final btn = OutlinedButton.icon(
       onPressed: _busy ? null : onTap,
       icon: Icon(icon, size: 16),
       label: Flexible(
@@ -1369,16 +1414,19 @@ class _HomePageState extends State<HomePage> {
             style: const TextStyle(fontSize: 12.5)),
       ),
     );
+    return tip == null ? btn : Tooltip(message: tip, child: btn);
   }
 
   // ---- 状态条（M3：容器色 + onContainer 前景色） ----
   Widget _statusBar() {
     final cs = Theme.of(context).colorScheme;
     final ok = _status.startsWith('通过') ||
-        _status.startsWith('翻译完成') ||
-        _status.contains('已重建') ||
+        _status.startsWith('批量通过') ||
+        _status.contains('已重新编译') ||
         _status.contains('已复制');
-    final bad = _status.startsWith('失败') || _status.startsWith('不一致');
+    final bad = _status.startsWith('失败') ||
+        _status.startsWith('不一致') ||
+        _status.endsWith('失败');
     final bg = bad
         ? cs.errorContainer
         : ok
@@ -1436,7 +1484,7 @@ class _HomePageState extends State<HomePage> {
             child: Row(children: [
               Icon(Icons.terminal, size: 16, color: cs.onSurfaceVariant),
               const SizedBox(width: 8),
-              Text('输出日志',
+              Text('运行日志',
                   style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
@@ -1519,10 +1567,10 @@ class _HomePageState extends State<HomePage> {
               const Divider(),
               const SizedBox(height: 8),
               _aboutRow('根目录', _tools.root),
-              _aboutRow('luac', _tools.luac),
-              _aboutRow('luac2c', _tools.l2c),
-              _aboutRow('lua', _tools.lua),
-              _aboutRow('gcc', _tools.gcc),
+              _aboutRow('字节码编译器', _tools.luac),
+              _aboutRow('转译器', _tools.l2c),
+              _aboutRow('脚本引擎', _tools.lua),
+              _aboutRow('C 编译器', _tools.gcc),
             ],
           ),
         ),
@@ -1541,7 +1589,7 @@ class _HomePageState extends State<HomePage> {
       padding: const EdgeInsets.symmetric(vertical: 3),
       child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
         SizedBox(
-            width: 62,
+            width: 80,
             child: Text(k, style: TextStyle(fontSize: 12, color: cs.primary))),
         Expanded(
             child: Text(v,
