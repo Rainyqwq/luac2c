@@ -2987,7 +2987,9 @@ static void emit_pool(FILE *out) {
 
     fprintf(out,
         "static unsigned char l2c_%s (int i, int j, unsigned rk) {\n"
-        "  unsigned x = (%uu ^ %uu ^ rk)\n"
+        /* Hex, not decimal: a decimal 10 next to '^' makes GCC read the line
+        ** as a power and fire -Wxor-used-as-pow (part of -Wall). */
+        "  unsigned x = (0x%08Xu ^ 0x%08Xu ^ rk)\n"
         "             ^ (unsigned)i * 0x9E3779B9u\n"
         "             ^ (unsigned)j * 0x85EBCA6Bu;\n"
         "  x ^= x >> 15; x *= 0x2545F491u; x ^= x >> 13;\n"
