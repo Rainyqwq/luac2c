@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <time.h>
 #include <limits.h>
+#include <sys/stat.h>   /* mkdir(): create the watermark ledger's directory */
 
 typedef uint32_t Instruction;
 typedef uint8_t  lu_byte;
@@ -847,6 +848,32 @@ static unsigned g_pool_sig = 0;   /* FNV of the emitted constant-pool blob    */
 static unsigned g_st_a = 1u;   /* affine state encoding: st -> (id*a + b)    */
 static unsigned g_st_b = 0u;
 static unsigned g_pk1 = 0u, g_pk2 = 0u;   /* constant-pool key, two shares    */
+
+/* ---------------------------------------------------------------------------
+** User watermark (--fingerprint)
+**
+** The point is traceability: a build handed to one user must be traceable
+** back to that user later, from the binary alone.  It is deliberately NOT a
+** readable string.  The user id is folded into one 32-bit word that is
+** stored in the reserved field of the signature slot -- a static 8-word
+** array bracketed by two magics, i.e. the thing an analyst already reads as
+** "integrity metadata".  Nothing in the image spells out an id, so there is
+** no string to grep for and nothing to recognise as a watermark.
+**
+** It is not decoration either: the same word is baked into the guarded code
+** region and XOR-ed into the constant-pool key.  Zeroing or editing the slot
+** no longer matches, the pool decodes to a different stream, and the build
+** keeps running on wrong data -- the same silent response every other
+** tamper path uses.  Editing the copy in the code instead breaks the code
+** signature.  So a watermark cannot be removed without breaking the program,
+** and cannot be forged without re-signing.
+**
+** Reading it back needs the id list (or the ledger), so the word itself
+** gives an attacker nothing: 'luac2c --who prog.exe users.txt' hashes every
+** candidate and reports which one it was.
+** ------------------------------------------------------------------------- */
+static const char *g_fp_uid = NULL;   /* the id as given on the command line */
+static unsigned    g_fp_wm  = 0u;     /* 32-bit fold of it; 0 = no watermark */
 
 /* ---------------------------------------------------------------------------
 ** Indirect Lua-API dispatch
@@ -2381,6 +2408,8 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
 ** wrong slot.  Deliberately not an "exit(1)": there is no single branch to
 ** patch out, and the check sits inside the region it measures.
 ** ------------------------------------------------------------------------- */
+static void emit_wm_slot(FILE *out);   /* the watermark slot (defined below) */
+
 static void emit_guard_runtime(FILE *out) {
     fprintf(out,
         "#if defined(_WIN32)\n"
@@ -2556,14 +2585,16 @@ static void emit_guard_runtime(FILE *out) {
     **     [0] magic 'LCS1'   [1] file offset of the guarded span
     **     [2] file end       [3] 1 = signed
     **     [4] expected hash  [5] image size when signed
-    **     [6] reserved       [7] tail magic
+    **     [6] watermark      [7] tail magic
+    ** Slot 6 is the build's watermark: a 32-bit fold of the id given to
+    ** --fingerprint, and it is also part of the constant-pool key, so editing
+    ** it shifts the pool stream instead of removing a mark.  Zero means the
+    ** build was made without --fingerprint.
     ** The magic pair is what lets the signer locate the slot in a file that
     ** has no symbols.  Verifying against the *file* rather than against
     ** memory keeps it independent of relocations. */
+    emit_wm_slot(out);
     fprintf(out,
-        "static unsigned l2c_sigslot[8] = {\n"
-        "  0x3143534Cu, 0u, 0u, 0u, 0u, 0u, 0u, 0x9E3779B9u\n"
-        "};\n\n"
         "static int l2c_selfpath (char *buf, int n) {\n"
         "#if defined(_WIN32)\n"
         "  return GetModuleFileNameA(NULL, buf, (DWORD)n) > 0;\n"
@@ -3689,6 +3720,24 @@ static size_t l2c_find_slot(const unsigned char *img, size_t n) {
     return 0;
 }
 
+static void emit_wm_slot(FILE *out) {
+    /* Slot 6 is the reserved field, and it is where the watermark lives.  The
+    ** signer writes 1..5 and never touches it, so the word survives signing. */
+    fprintf(out,
+        "static unsigned l2c_sigslot[8] = {\n"
+        "  0x3143534Cu, 0u, 0u, 0u, 0u, 0u, 0x%08Xu, 0x9E3779B9u\n"
+        "};\n\n", g_fp_wm);
+}
+
+static void emit_wm_check(FILE *out) {
+    /* Inside the guarded span on purpose: the expected word is then covered by
+    ** the code signature, so the pair (slot, code) cannot be edited into a
+    ** different user without re-signing.  Returns 0 when the slot is intact. */
+    fprintf(out,
+        "static unsigned l2c_wmchk (void) "
+        "{ return l2c_sigslot[6] ^ 0x%08Xu; }\n\n", g_fp_wm);
+}
+
 static int cmd_sign(int argc, char **argv) {
     if (argc < 5) {
         fprintf(stderr,
@@ -3743,6 +3792,162 @@ static int cmd_sign(int argc, char **argv) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+** --who: read a watermark back out of a finished binary
+**
+** The image holds one 32-bit word and no id, so reading it is only half the
+** job -- the word has to be turned back into a person.  Two ways to do that:
+** an id list (one id per line, folded and compared: nothing is stored in the
+** clear, so the binary alone still says nothing), or the ledger the tool keeps
+** as it builds.  'L2C_WM_LEDGER' moves the ledger.
+** ------------------------------------------------------------------------- */
+static unsigned wm_fold(const char *s) {
+    unsigned h = fnv32((const unsigned char *)s, strlen(s), 2166136261u);
+    return h ? h : 0xA5A5A5A5u;   /* 0 means "no watermark", never an id */
+}
+
+static const char *wm_ledger_path(void) {
+    static char buf[1024];
+    const char *e = getenv("L2C_WM_LEDGER");
+    if (e && e[0]) return e;
+#if defined(_WIN32)
+    { const char *a = getenv("APPDATA");
+      snprintf(buf, sizeof buf, "%s\\luac2c\\watermarks.tsv", a ? a : "."); }
+#else
+    { const char *h = getenv("HOME");
+      snprintf(buf, sizeof buf, "%s/.luac2c/watermarks.tsv", h ? h : "."); }
+#endif
+    return buf;
+}
+
+/** Append "<word> <id> <time>" to the ledger.  Best effort: a build must
+** never fail because the ledger could not be written.  A (word, id) pair is
+** recorded once, so a 100-file batch adds one line, not a hundred. */
+static void wm_ledger_add(const char *uid, unsigned wm) {
+    const char *p = wm_ledger_path();
+    char prefix[600];
+    int n = snprintf(prefix, sizeof prefix, "%08X\t%s", wm, uid);
+    if (n <= 0) return;
+    {   /* skip the append when the pair is already on file */
+        FILE *chk = fopen(p, "r");
+        if (chk) {
+            char line[1024];
+            int have = 0;
+            while (!have && fgets(line, sizeof line, chk))
+                if (strncmp(line, prefix, (size_t)n) == 0 && line[n] == '\t')
+                    have = 1;
+            fclose(chk);
+            if (have) return;
+        }
+    }
+    FILE *f = fopen(p, "a");
+    if (!f) {
+        /* The parent directory usually does not exist on the first build. */
+        char dir[1024];
+        size_t k = strlen(p);
+        while (k > 0 && p[k - 1] != '/' && p[k - 1] != '\\') k--;
+        if (k > 0) {
+            memcpy(dir, p, k - 1); dir[k - 1] = 0;
+#if defined(_WIN32)
+            mkdir(dir);
+#else
+            mkdir(dir, 0700);
+#endif
+            f = fopen(p, "a");
+        }
+    }
+    if (!f) return;
+    time_t t = time(NULL);
+    char stamp[32];
+    strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", localtime(&t));
+    fprintf(f, "%08X\t%s\t%s\n", wm, uid, stamp);
+    fclose(f);
+}
+
+/** Look a word up in the ledger (or in an id list).  Returns 1 on a hit. */
+static int wm_lookup(unsigned wm, const char *list, char *out, size_t outsz) {
+    char word[16];
+    snprintf(word, sizeof word, "%08X", wm);
+    if (list) {
+        FILE *f = fopen(list, "r");
+        if (f) {
+            char line[512];
+            while (fgets(line, sizeof line, f)) {
+                size_t k = strlen(line);
+                while (k && (line[k - 1] == '\n' || line[k - 1] == '\r')) line[--k] = 0;
+                if (!line[0]) continue;
+                if (wm_fold(line) == wm) {
+                    snprintf(out, outsz, "%s", line);
+                    fclose(f);
+                    return 1;
+                }
+            }
+            fclose(f);
+        } else {
+            fprintf(stderr, "luac2c: cannot read the id list (%s)\n", list);
+        }
+    }
+    FILE *f = fopen(wm_ledger_path(), "r");
+    if (f) {
+        char line[1024];
+        while (fgets(line, sizeof line, f)) {
+            char id[512], stamp[64];
+            char w2[32];
+            if (sscanf(line, "%31s\t%511[^\t]\t%63s", w2, id, stamp) < 2) continue;
+            int same = 1;   /* the word is hex, so compare it case-insensitively */
+            for (int z = 0; same && w2[z] && word[z]; z++)
+                same = (tolower((unsigned char)w2[z]) == tolower((unsigned char)word[z]));
+            if (same && strlen(w2) == strlen(word)) { snprintf(out, outsz, "%s", id); fclose(f); return 1; }
+        }
+        fclose(f);
+    }
+    return 0;
+}
+
+static int cmd_who(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr,
+            "Usage: luac2c --who <program> [id-list]\n"
+            "  Print the watermark a built program carries, and the user it\n"
+            "  belongs to when the id list or the ledger knows that word.\n"
+            "  The list is one id per line; each line is folded and compared,\n"
+            "  so no id has to exist anywhere in the clear.\n"
+            "  The ledger lives at %s\n"
+            "  (override with L2C_WM_LEDGER).\n", wm_ledger_path());
+        return 1;
+    }
+    const char *path = argv[2];
+    const char *list = (argc > 3 && argv[3][0] != '-') ? argv[3] : NULL;
+    size_t n = 0;
+    unsigned char *img = l2c_read_file(path, &n);
+    if (!img) { perror(path); return 1; }
+    size_t slot = l2c_find_slot(img, n);
+    if (slot == 0) {
+        fprintf(stderr,
+            "luac2c: %s carries no signature slot (built with --no-guard "
+            "and without --fingerprint?)\n", path);
+        free(img);
+        return 1;
+    }
+    unsigned wm    = l2c_rd32(img + slot + 24);
+    unsigned sgnd  = l2c_rd32(img + slot + 12);
+    free(img);
+    printf("file       %s\n", path);
+    printf("watermark  %08X\n", wm);
+    printf("signed     %u\n", sgnd);
+    if (wm == 0) {
+        printf("user       (none -- built without --fingerprint)\n");
+        return 0;
+    }
+    char who[512];
+    if (wm_lookup(wm, list, who, sizeof who))
+        printf("user       %s\n", who);
+    else
+        printf("user       (unknown: no id in the list or the ledger folds to "
+               "%08X)\n", wm);
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s input.luac [-o output.c] [options]\n"
@@ -3755,8 +3960,13 @@ static void usage(const char *prog) {
         "  --no-guard      no anti-debug / anti-tamper runtime (default: on)\n"
         "  --no-opaque     no opaque predicates / junk / anti-disasm (default: on)\n"
         "  --require-sig   treat an unsigned image as tampered (default: off)\n"
+        "  --fingerprint ID\n"
+        "                  stamp the build with ID so a copy can be traced\n"
+        "                  back to it later (L2C_FINGERPRINT as a default)\n"
         "  --sign EXE RVA_A RVA_B\n"
         "                  sign the guarded code span of a linked program\n"
+        "  --who EXE [ID-LIST]\n"
+        "                  read the watermark out of a built program\n"
         "\n"
         "Hardening notes:\n"
         "  The generated program measures itself: a signature over the machine\n"
@@ -3773,7 +3983,19 @@ static void usage(const char *prog) {
         "  or, without a second tool: rebuild with -DL2C_SIG=0x<code>.  Without\n"
         "  either, only the start-up baseline applies (runtime hooks are caught,\n"
         "  a patch already present in the file is not).\n"
-        "  Set L2C_GUARD_REPORT=1 to see what was measured.\n",
+        "  Set L2C_GUARD_REPORT=1 to see what was measured.\n"
+        "\n"
+        "Watermarking:\n"
+        "  --fingerprint ID folds ID into one 32-bit word that is written to\n"
+        "  the reserved field of the signature slot -- an 8-word array between\n"
+        "  two magics, i.e. something that already reads as integrity data.\n"
+        "  No id is stored anywhere, so there is nothing to grep for.  The word\n"
+        "  is also XOR-ed into the constant-pool key from inside the signed\n"
+        "  region, so editing the slot makes the pool decode to a different\n"
+        "  stream (the program keeps running, on wrong data) and editing the\n"
+        "  code breaks the signature.  To trace a copy:\n"
+        "    luac2c --who prog.exe users.txt    # one id per line\n"
+        "  or let the ledger the tool keeps do it: luac2c --who prog.exe\n",
         prog);
     exit(1);
 }
@@ -3782,6 +4004,7 @@ int main(int argc, char **argv) {
     /* '--sign' operates on a linked executable, not on a .luac input, so it
     ** is handled before the normal argument scan. */
     if (argc >= 2 && strcmp(argv[1], "--sign") == 0) return cmd_sign(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "--who") == 0) return cmd_who(argc, argv);
 
     const char *in_path = NULL;
     const char *out_path = NULL;
@@ -3807,6 +4030,8 @@ int main(int argc, char **argv) {
             g_opaque = 0;     /* no opaque predicates / junk / anti-disasm */
         } else if (strcmp(argv[i], "--require-sig") == 0) {
             g_requiresig = 1; /* treat an unsigned image as tampered */
+        } else if (strcmp(argv[i], "--fingerprint") == 0 && i + 1 < argc) {
+            g_fp_uid = argv[++i];
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -3842,6 +4067,16 @@ int main(int argc, char **argv) {
     if (!g_pool) g_pool = 0;
 
     load_opmodes();
+
+    /* The watermark: an environment default lets a build host stamp everything
+    ** it produces without every caller having to remember the option. */
+    if (!g_fp_uid || !g_fp_uid[0]) g_fp_uid = getenv("L2C_FINGERPRINT");
+    if (g_fp_uid && g_fp_uid[0]) {
+        g_fp_wm = wm_fold(g_fp_uid);
+        wm_ledger_add(g_fp_uid, g_fp_wm);   /* so --who can name the user later */
+    } else {
+        g_fp_uid = NULL;
+    }
 
     Reader R = {0};
     R.fp = fopen(in_path, "rb");
@@ -3909,6 +4144,13 @@ int main(int argc, char **argv) {
     if (g_guard)
         fprintf(out, "static void l2c_sig_a (void) "
                      "{ volatile int z = 1; (void)z; }\n\n");
+    else if (g_fp_uid)
+        emit_wm_slot(out);        /* no guard runtime, but still watermarked */
+
+    /* Both halves of the watermark go here, between the two markers: the
+    ** expected word is then part of the signed code, so it cannot be rewritten
+    ** to point at somebody else without the code signature failing too. */
+    if (g_fp_uid) emit_wm_check(out);
 
     fprintf(out, "static void l2c_%s (lua_State *L, unsigned rk);\n\n", g_kbuild);
 
@@ -3982,6 +4224,16 @@ int main(int argc, char **argv) {
     char apt_init[64] = "";
     if (g_indirect) snprintf(apt_init, sizeof apt_init, "  %s_init();\n", g_api_tag);
 
+    /* Guard word handed to the constant-pool decoder: the tamper flags, plus
+    ** the watermark mismatch.  Both are 0 on an intact build, so the pool
+    ** decodes to the real constants; anything else shifts the whole stream. */
+    char rkbuf[80];
+    if (g_fp_uid)
+        snprintf(rkbuf, sizeof rkbuf, "%s(l2c_wmchk())",
+                 g_guard ? "l2c_gflags ^ " : "");
+    else
+        snprintf(rkbuf, sizeof rkbuf, "%s", g_guard ? "l2c_gflags" : "0u");
+
     fprintf(out, "int main(int argc, char **argv) {\n  int status;\n");
     fprintf(out, "%s", apt_init);            /* decode the API table first */
     if (g_guard) {
@@ -4018,6 +4270,8 @@ int main(int argc, char **argv) {
             "    printf(\"rva_a=%%lX rva_b=%%lX signed=%%u\\n\", ra, rb, l2c_sigslot[3]);\n");
         if (g_pool_n > 0)
             fprintf(out, "    printf(\"poolsig=%%08X\\n\", l2c_poolsig());\n");
+        if (g_fp_uid)
+            fprintf(out, "    printf(\"watermark=%%08X\\n\", l2c_sigslot[6]);\n");
         fprintf(out,
             "    printf(\"flags=%%u\\n\", l2c_gflags);\n"
             "    return 0;\n"
@@ -4035,7 +4289,7 @@ int main(int argc, char **argv) {
         "  lua_pushcclosure(L, %s, 2);\n"
         "  status = lua_pcall(L, 0, 0, 1);\n"
         "  if (status != LUA_OK) { lua_close(L); return 1; }\n",
-        g_kbuild, g_guard ? "l2c_gflags" : "0u", g_fnames[0]);
+        g_kbuild, rkbuf, g_fnames[0]);
     if (g_opaque)
         fprintf(out, "  (void)l2c_noise;\n");   /* keeps the junk chain alive */
     fprintf(out, "  lua_close(L);\n  return 0;\n}\n");

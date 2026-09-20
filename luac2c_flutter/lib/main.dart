@@ -15,9 +15,13 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'account.dart';
+import 'mine_page.dart';
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await ThemeCtl.I.load();
+  await AccountCtl.I.load();   // 恢复"记住我"的会话
   runApp(const Luac2cApp());
 }
 
@@ -164,10 +168,151 @@ class Luac2cApp extends StatelessWidget {
         theme: AppTheme.build(Brightness.light, ThemeCtl.I.seed),
         darkTheme: AppTheme.build(Brightness.dark, ThemeCtl.I.seed),
         themeMode: ThemeCtl.I.dark ? ThemeMode.dark : ThemeMode.light,
-        home: const HomePage(),
+        home: const AppShell(),
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------- 外壳
+/// 底部导航栏（M3 NavigationBar）在两个界面之间切换：
+/// 「防护」是构建与加固的主界面，「我的」是账号与用户指纹。
+/// 每个界面自己不带 AppBar，标题栏由外壳统一提供。
+class AppShell extends StatefulWidget {
+  const AppShell({super.key});
+
+  @override
+  State<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<AppShell> {
+  int _index = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      backgroundColor: cs.surfaceContainerLowest,
+      appBar: AppBar(
+        title: Row(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 28,
+            height: 28,
+            decoration: BoxDecoration(
+              color: cs.primaryContainer,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            alignment: Alignment.center,
+            child: Icon(_index == 0 ? Icons.shield_outlined : Icons.person_outline,
+                size: 16, color: cs.onPrimaryContainer),
+          ),
+          const SizedBox(width: 10),
+          const Text('luac2c 客户端'),
+        ]),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.palette_outlined),
+            tooltip: '切换配色（Material You 种子色）',
+            onPressed: () => ThemeCtl.I.cycleSeed(),
+          ),
+          IconButton(
+            tooltip: ThemeCtl.I.dark ? '切换到浅色' : '切换到深色',
+            icon: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 250),
+              transitionBuilder: (c, a) => FadeTransition(opacity: a, child: c),
+              child: Icon(
+                key: ValueKey<bool>(ThemeCtl.I.dark),
+                ThemeCtl.I.dark ? Icons.light_mode : Icons.dark_mode,
+              ),
+            ),
+            onPressed: () => ThemeCtl.I.toggle(),
+          ),
+          IconButton(
+            icon: const Icon(Icons.info_outline),
+            tooltip: '关于',
+            onPressed: () => _showAbout(context),
+          ),
+          const SizedBox(width: 6),
+        ],
+      ),
+      // IndexedStack 保留两个界面的状态：切走再切回来，日志和列表都还在。
+      body: IndexedStack(
+        index: _index,
+        children: const [HomePage(), MinePage(),],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _index,
+        onDestinationSelected: (i) => setState(() => _index = i),
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.shield_outlined),
+            selectedIcon: Icon(Icons.shield),
+            label: '防护',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.person_outline),
+            selectedIcon: Icon(Icons.person),
+            label: '我的',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+void _showAbout(BuildContext context) {
+  final t = findTools();
+  showDialog(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      icon: const Icon(Icons.code),
+      title: const Text('luac2c 客户端'),
+      content: SizedBox(
+        width: 460,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('把 Lua 5.5 字节码翻译成调用 Lua C API 的 C 源码，'
+                '并一键编译、运行、与 lua.exe 逐字节比对。'),
+            const SizedBox(height: 12),
+            const Divider(),
+            const SizedBox(height: 8),
+            _aboutRow(context, '根目录', t.root),
+            _aboutRow(context, '字节码编译器', t.luac),
+            _aboutRow(context, '转译器', t.l2c),
+            _aboutRow(context, '脚本引擎', t.lua),
+            _aboutRow(context, 'C 编译器', t.gcc),
+            const SizedBox(height: 8),
+            const Divider(),
+            const SizedBox(height: 8),
+            _aboutRow(context, '账号', AccountCtl.I.loggedIn
+                ? '${AccountCtl.I.name}（指纹 ${AccountCtl.I.fingerprint}）'
+                : '未登录，产物不带指纹'),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.of(ctx).pop(), child: const Text('好')),
+      ],
+    ),
+  );
+}
+
+Widget _aboutRow(BuildContext context, String k, String v) {
+  final cs = Theme.of(context).colorScheme;
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 3),
+    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      SizedBox(
+          width: 80,
+          child: Text(k, style: TextStyle(fontSize: 12, color: cs.primary))),
+      Expanded(
+          child: Text(v,
+              style: const TextStyle(fontSize: 11.5, fontFamily: 'Consolas'))),
+    ]),
+  );
 }
 
 // ---------------------------------------------------------------- 工具解析
@@ -664,6 +809,10 @@ class _HomePageState extends State<HomePage> {
     if (_nopool) args.add('--no-pool');
     if (_annot) args.add('--annotate');
     if (!_guard) args.add('--no-guard');
+    // 登录后把账号标识交给 luac2c：产物里会嵌入这个账号的指纹，
+    // 之后拿 luac2c --who 就能从任意一份副本反查归属。
+    final uid = AccountCtl.I.uid;
+    if (uid != null && uid.isNotEmpty) args.addAll(['--fingerprint', uid]);
     return args;
   }
 
@@ -825,6 +974,9 @@ class _HomePageState extends State<HomePage> {
       if (r.exitCode != 0) throw 'luac2c 退出码 ${r.exitCode}';
       if (!File(pC).existsSync()) throw 'luac2c 未生成 $pC';
       p('      → $pC  (${r.ms}ms)');
+      if (AccountCtl.I.loggedIn) {
+        p('      指纹 ${AccountCtl.I.fingerprint}（账号 ${AccountCtl.I.name}）');
+      }
       if (!full) {
         p('✓ C 源码已生成 → $pC');
         ok = true;
@@ -950,79 +1102,82 @@ class _HomePageState extends State<HomePage> {
   // ---------------------------------------------------------------- UI
   @override
   Widget build(BuildContext context) {
-    // Material You：配色全部来自 ColorScheme，组件用 M3 组件
-    final cs = Theme.of(context).colorScheme;
-    return Scaffold(
-      backgroundColor: cs.surfaceContainerLowest,
-      appBar: AppBar(
-        title: Row(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 28,
-            height: 28,
-            decoration: BoxDecoration(
-              color: cs.primaryContainer,
-              borderRadius: BorderRadius.circular(8),
+    // 左右双栏：左栏操作区可滚动，右栏是整屏高度的运行日志。
+    // 原先所有卡片排在一列里，固定高度的部分把窗口占满之后，日志那个
+    // Expanded 只剩 0 高度 —— 这就是"终端显示不出来"的原因。
+    return SafeArea(
+      child: LayoutBuilder(
+        builder: (context, box) {
+          final left = (box.maxWidth * 0.42).clamp(320.0, 460.0);
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                SizedBox(
+                  width: left,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _loginStrip(),
+                        const SizedBox(height: 12),
+                        _sourceCard(),
+                        const SizedBox(height: 12),
+                        _modeSection(),
+                        const SizedBox(height: 12),
+                        _toolsCard(),
+                        const SizedBox(height: 12),
+                        _actionsSection(),
+                        const SizedBox(height: 10),
+                        _statusBar(),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(child: _logCard()),
+              ],
             ),
-            alignment: Alignment.center,
-            child: Icon(Icons.code, size: 16, color: cs.onPrimaryContainer),
+          );
+        },
+      ),
+    );
+  }
+
+  // ---- 登录状态 / 指纹提示 ----
+  /// 主界面顶部的一条窄提示：产物到底带不带指纹，一眼能看到。
+  Widget _loginStrip() {
+    return AnimatedBuilder(
+      animation: AccountCtl.I,
+      builder: (context, _) {
+        final cs = Theme.of(context).colorScheme;
+        final on = AccountCtl.I.loggedIn;
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: on ? cs.primaryContainer : cs.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(12),
           ),
-          const SizedBox(width: 10),
-          const Text('luac2c 客户端'),
-        ]),
-        actions: [
-          // Material You 种子配色切换
-          IconButton(
-            icon: const Icon(Icons.palette_outlined),
-            tooltip: '切换配色（Material You 种子色）',
-            onPressed: () => ThemeCtl.I.cycleSeed(),
-          ),
-          // 明暗主题
-          IconButton(
-            tooltip: ThemeCtl.I.dark ? '切换到浅色' : '切换到深色',
-            icon: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 250),
-              transitionBuilder: (c, a) => FadeTransition(opacity: a, child: c),
-              child: Icon(
-                key: ValueKey<bool>(ThemeCtl.I.dark),
-                ThemeCtl.I.dark ? Icons.light_mode : Icons.dark_mode,
+          child: Row(children: [
+            Icon(on ? Icons.fingerprint : Icons.person_off_outlined,
+                size: 16,
+                color: on ? cs.onPrimaryContainer : cs.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                on
+                    ? '已登录 ${AccountCtl.I.name} · 产物指纹 ${AccountCtl.I.fingerprint}'
+                    : '未登录 · 产物不含指纹，可在「我的」里登录',
+                style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: on ? cs.onPrimaryContainer : cs.onSurfaceVariant),
               ),
             ),
-            onPressed: () => ThemeCtl.I.toggle(),
-          ),
-          IconButton(
-            icon: const Icon(Icons.info_outline),
-            tooltip: '关于',
-            onPressed: _showAbout,
-          ),
-          const SizedBox(width: 6),
-        ],
-      ),
-      body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 760),
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  _sourceCard(),
-                  const SizedBox(height: 12),
-                  _modeSection(),
-                  const SizedBox(height: 12),
-                  _toolsCard(),
-                  const SizedBox(height: 12),
-                  _actionsSection(),
-                  const SizedBox(height: 10),
-                  _statusBar(),
-                  const SizedBox(height: 10),
-                  Expanded(child: _logCard()),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
+          ]),
+        );
+      },
     );
   }
 
@@ -1549,52 +1704,4 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  void _showAbout() {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        icon: const Icon(Icons.code),
-        title: const Text('luac2c 客户端'),
-        content: SizedBox(
-          width: 460,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('把 Lua 5.5 字节码翻译成调用 Lua C API 的 C 源码，'
-                  '并一键编译、运行、与 lua.exe 逐字节比对。'),
-              const SizedBox(height: 12),
-              const Divider(),
-              const SizedBox(height: 8),
-              _aboutRow('根目录', _tools.root),
-              _aboutRow('字节码编译器', _tools.luac),
-              _aboutRow('转译器', _tools.l2c),
-              _aboutRow('脚本引擎', _tools.lua),
-              _aboutRow('C 编译器', _tools.gcc),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('好')),
-        ],
-      ),
-    );
-  }
-
-  Widget _aboutRow(String k, String v) {
-    final cs = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        SizedBox(
-            width: 80,
-            child: Text(k, style: TextStyle(fontSize: 12, color: cs.primary))),
-        Expanded(
-            child: Text(v,
-                style: const TextStyle(fontSize: 11.5, fontFamily: 'Consolas'))),
-      ]),
-    );
-  }
 }
