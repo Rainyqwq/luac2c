@@ -1,5 +1,5 @@
 name: luac2c_client
-description: "luac2c 客户端 — Lua 5.5 字节码 → Lua C API（Cupertino 风格）"
+description: "luac2c 客户端 — Lua 5.5 字节码 → Lua C API（Material You 风格）"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -9,7 +9,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8
 
 dev_dependencies:
   flutter_test:
