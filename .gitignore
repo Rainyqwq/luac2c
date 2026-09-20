@@ -9,6 +9,7 @@ client_prefs.txt
 *_sws.exe
 test/_test_report.txt
 test/_sweep.txt
+test/.rt/
 _hash*.txt
 _hash*.json
 

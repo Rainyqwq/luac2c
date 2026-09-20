@@ -28,6 +28,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <time.h>
+#include <limits.h>
 
 typedef uint32_t Instruction;
 typedef uint8_t  lu_byte;
@@ -134,6 +135,54 @@ static void fatal(const char *fmt, ...) {
 }
 
 /* -------------------------------------------------------------------------
+** Safe allocation and input limits
+**
+** A .luac file is untrusted input: every count in it is attacker-controlled.
+** Sizes therefore go through the x*alloc wrappers (which refuse
+** multiplication overflow) and through the limits below, so that a hostile
+** dump can only ever get a clean diagnostic, never a wild pointer.
+** ------------------------------------------------------------------------- */
+#define LUAC2C_MAX_CODE      (1 << 22)   /* instructions per function     */
+#define LUAC2C_MAX_CONST     (1 << 22)   /* constants per function        */
+#define LUAC2C_MAX_SUBPROTO  (1 << 20)   /* nested protos per function    */
+#define LUAC2C_MAX_UPVAL     255         /* Lua's own hard limit          */
+#define LUAC2C_MAX_STR       (1 << 26)   /* bytes in a single string      */
+#define LUAC2C_MAX_STRINGS   (1 << 22)   /* entries in the string table   */
+#define LUAC2C_MAX_PROTOS    (1 << 20)   /* functions in one chunk        */
+#define LUAC2C_MAX_DEPTH     200         /* proto nesting depth           */
+
+static void oom(const char *what) {
+    fprintf(stderr, "luac2c: out of memory (%s)\n", what);
+    exit(1);
+}
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n ? n : 1);
+    if (!p) oom("malloc");
+    return p;
+}
+
+static void *xcalloc(size_t n, size_t sz) {
+    if (n != 0 && sz > ((size_t)-1) / n) {
+        fprintf(stderr, "luac2c: allocation size overflow\n");
+        exit(1);
+    }
+    void *p = calloc(n ? n : 1, sz ? sz : 1);
+    if (!p) oom("calloc");
+    return p;
+}
+
+static void *xrealloc(void *old, size_t n, size_t sz) {
+    if (n != 0 && sz > ((size_t)-1) / n) {
+        fprintf(stderr, "luac2c: allocation size overflow\n");
+        exit(1);
+    }
+    void *p = realloc(old, (n ? n : 1) * (sz ? sz : 1));
+    if (!p) oom("realloc");
+    return p;
+}
+
+/* -------------------------------------------------------------------------
 ** Instruction decode helpers
 ** ------------------------------------------------------------------------- */
 static inline int getop(Instruction i)   { return (int)((i >> POS_OP) & 0x7F); }
@@ -191,8 +240,6 @@ static long long r_readvarint(Reader *R) {
     return (long long)x;
 }
 
-static int r_readsize(Reader *R) { return (int)r_readvarint(R); }
-
 /* zigzag-encoded integer (matches Lua's loadInteger) */
 static long long r_readinteger(Reader *R) {
     unsigned long long cx = (unsigned long long)r_readvarint(R);
@@ -228,13 +275,31 @@ static void r_readraw(Reader *R, void *buf, size_t n) {
     R->off += n;
 }
 
-static void r_skip(Reader *R, size_t n) {
-    if (n == 0) return;
-    if (fseek(R->fp, (long)n, SEEK_CUR) != 0) {
-        r_error(R, "fseek: %s", strerror(errno));
-        return;
+/* Read a varint count and enforce 0 <= n <= limit.  Every array size in the
+** dump goes through here, so a hostile file gets a diagnostic instead of a
+** bogus allocation or an endless loop.  Returns -1 (with R->err set) on
+** failure. */
+static long long r_readcount(Reader *R, size_t limit, const char *what) {
+    long long n = r_readvarint(R);
+    if (R->err) return -1;
+    if (n < 0 || (unsigned long long)n > (unsigned long long)limit) {
+        r_error(R, "%s out of range: %lld (limit %lld)",
+                what, n, (long long)limit);
+        return -1;
     }
-    R->off += n;
+    return n;
+}
+
+/* Skip n bytes by actually reading them.  fseek() would happily seek past
+** EOF and leave the stream desynchronised, and on Windows its 'long'
+** argument cannot express offsets past 2 GiB. */
+static void r_skip(Reader *R, size_t n) {
+    unsigned char buf[1024];
+    while (n > 0 && !R->err) {
+        size_t k = n < sizeof buf ? n : sizeof buf;
+        r_readraw(R, buf, k);
+        n -= k;
+    }
 }
 
 /* Mirror of loadAlign: skip padding so R->off is a multiple of 'align'. */
@@ -300,14 +365,15 @@ struct Proto {
     int *capreg;
     int  ncap;
     int *kmap;      /* K index -> constant-pool index */
+    int  id;        /* index in the flattened proto list; set by flatten_protos
+                    ** and used as the CLOSURE operand */
 
     struct Proto **p;
     int sizep;
 };
 
 static Proto *proto_new(void) {
-    Proto *p = (Proto*)calloc(1, sizeof(Proto));
-    return p;
+    return (Proto*)xcalloc(1, sizeof(Proto));
 }
 
 static void proto_free(Proto *p) {
@@ -327,16 +393,20 @@ static void proto_free(Proto *p) {
 
 static char *r_dup(const char *s) {
     size_t n = strlen(s) + 1;
-    char *r = (char*)malloc(n);
+    char *r = (char*)xmalloc(n);
     memcpy(r, s, n);
     return r;
 }
 
 static void r_savestring(Reader *R, const char *s) {
+    if (R->nstr >= LUAC2C_MAX_STRINGS) {
+        r_error(R, "too many strings in chunk (%d)", R->nstr);
+        return;
+    }
     if (R->nstr == R->strcap) {
         int cap = R->strcap ? R->strcap * 2 : 32;
-        R->strs = (char**)realloc(R->strs, (size_t)cap * sizeof(char*));
-        if (!R->strs) { fprintf(stderr, "oom\n"); exit(1); }
+        if (cap > LUAC2C_MAX_STRINGS) cap = LUAC2C_MAX_STRINGS;
+        R->strs = (char**)xrealloc(R->strs, (size_t)cap, sizeof(char*));
         R->strcap = cap;
     }
     R->strs[R->nstr++] = r_dup(s);
@@ -346,7 +416,7 @@ static void r_savestring(Reader *R, const char *s) {
 ** size==0 means "reuse the saved string at the following index" (index 0 ==
 ** NULL); size>=1 is a new string of size-1 bytes, which gets saved. */
 static char *r_readstring(Reader *R) {
-    int sz = r_readsize(R);
+    long long sz = r_readcount(R, LUAC2C_MAX_STR, "string size");
     if (R->err) return NULL;
     if (sz == 0) {
         long long idx = r_readvarint(R);
@@ -358,24 +428,26 @@ static char *r_readstring(Reader *R) {
         }
         return r_dup(R->strs[idx - 1]);
     }
-    sz -= 1;
-    char *buf = (char*)malloc((size_t)sz + 1);
-    /* the dump includes the trailing '\0', so read sz+1 bytes */
-    r_readraw(R, buf, (size_t)sz + 1);
+    /* size includes the trailing '\0', so the string is sz-1 bytes. */
+    size_t len = (size_t)(sz - 1);
+    char *buf = (char*)xmalloc(len + 1);
+    r_readraw(R, buf, len + 1);
     if (R->err) { free(buf); return NULL; }
-    buf[sz] = 0;
+    buf[len] = 0;
     r_savestring(R, buf);
     return buf;
 }
 
 static void loadConstants(Reader *R, Proto *f) {
-    int n = (int)r_readvarint(R);
+    long long nll = r_readcount(R, LUAC2C_MAX_CONST, "constant count");
     if (R->err) return;
-    f->k = (Constant*)calloc((size_t)n, sizeof(Constant));
+    int n = (int)nll;
+    f->k = (Constant*)xcalloc((size_t)n, sizeof(Constant));
     f->sizek = n;
     for (int i = 0; i < n; i++) {
         Constant *c = &f->k[i];
         c->tag = r_read1(R);
+        if (R->err) return;
         switch (c->tag) {
             case KNIL:    break;
             case KFALSE:  break;
@@ -388,72 +460,100 @@ static void loadConstants(Reader *R, Proto *f) {
                 r_error(R, "unknown constant tag 0x%02x", c->tag);
                 return;
         }
+        /* Never keep decoding after an error: r_read1() returns 0 at EOF, so
+        ** an unchecked loop would spin through the remaining entries. */
+        if (R->err) return;
     }
 }
 
 static void loadUpvalues(Reader *R, Proto *f) {
-    int n = (int)r_readvarint(R);
+    long long nll = r_readcount(R, LUAC2C_MAX_UPVAL, "upvalue count");
     if (R->err) return;
-    f->upvalues = (UpvalDesc*)calloc((size_t)n, sizeof(UpvalDesc));
+    int n = (int)nll;
+    f->upvalues = (UpvalDesc*)xcalloc((size_t)n, sizeof(UpvalDesc));
     f->nupvalues = n;
     for (int i = 0; i < n; i++) {
         f->upvalues[i].instack = r_read1(R);
         f->upvalues[i].idx     = r_read1(R);
         f->upvalues[i].kind    = r_read1(R);
+        if (R->err) return;
     }
 }
 
-static void loadFunction(Reader *R, Proto *f);
+static void loadFunction(Reader *R, Proto *f, int depth);
 
-static void loadProtos(Reader *R, Proto *f) {
-    int n = (int)r_readvarint(R);
+/* Total number of protos loaded so far, shared by every nesting level, so a
+** chunk cannot make us allocate without bound through deep nesting. */
+static long long g_nprotos = 0;
+
+static void loadProtos(Reader *R, Proto *f, int depth) {
+    long long nll = r_readcount(R, LUAC2C_MAX_SUBPROTO, "nested proto count");
     if (R->err) return;
-    f->p = (Proto**)calloc((size_t)n, sizeof(Proto*));
+    int n = (int)nll;
+    f->p = (Proto**)xcalloc((size_t)n, sizeof(Proto*));
     f->sizep = n;
     for (int i = 0; i < n; i++) {
+        if (++g_nprotos > LUAC2C_MAX_PROTOS) {
+            r_error(R, "too many functions in chunk (limit %d)",
+                    LUAC2C_MAX_PROTOS);
+            return;
+        }
         f->p[i] = proto_new();
-        loadFunction(R, f->p[i]);
+        loadFunction(R, f->p[i], depth + 1);
         if (R->err) return;
     }
 }
 
 static void loadDebug(Reader *R, Proto *f) {
-    int n = (int)r_readvarint(R);                 /* lineinfo: n signed bytes */
+    long long nll = r_readcount(R, LUAC2C_MAX_CODE, "line info size");
     if (R->err) return;
-    r_skip(R, (size_t)n);
-    n = (int)r_readvarint(R);                     /* abslineinfo */
+    r_skip(R, (size_t)nll);                       /* lineinfo: n signed bytes */
     if (R->err) return;
-    if (n > 0) {
+
+    nll = r_readcount(R, 1u << 22, "abs line info count");
+    if (R->err) return;
+    if (nll > 0) {
         r_align(R, sizeof(int));
-        r_skip(R, (size_t)n * 2 * sizeof(int));   /* AbsLineInfo { int pc, line } */
+        /* AbsLineInfo { int pc, line } */
+        r_skip(R, (size_t)nll * 2 * sizeof(int));
+        if (R->err) return;
     }
-    n = (int)r_readvarint(R);                     /* locvars */
+
+    nll = r_readcount(R, 1u << 20, "local variable count");
     if (R->err) return;
-    for (int i = 0; i < n; i++) {
+    for (long long i = 0; i < nll; i++) {
         char *s = r_readstring(R); free(s);
         r_readvarint(R); r_readvarint(R);
         if (R->err) return;
     }
-    n = (int)r_readvarint(R);                     /* upvalue names */
+
+    nll = r_readcount(R, LUAC2C_MAX_UPVAL, "upvalue name count");
     if (R->err) return;
-    if (n != 0) n = f->nupvalues;
-    for (int i = 0; i < n; i++) {
+    if (nll != 0) nll = f->nupvalues;
+    for (long long i = 0; i < nll; i++) {
         char *s = r_readstring(R); free(s);
         if (R->err) return;
     }
 }
 
 static void loadCode(Reader *R, Proto *f) {
-    int n = (int)r_readvarint(R);
+    long long nll = r_readcount(R, LUAC2C_MAX_CODE, "code size");
     if (R->err) return;
-    if (n < 0) { r_error(R, "bad code size %d", n); return; }
+    int n = (int)nll;
     r_align(R, sizeof(Instruction));
-    f->code = (Instruction*)calloc((size_t)n + 1, sizeof(Instruction));
+    if (R->err) return;
+    f->code = (Instruction*)xcalloc((size_t)n + 1, sizeof(Instruction));
     f->ncode = n;
     r_readraw(R, f->code, (size_t)n * sizeof(Instruction));
 }
 
-static void loadFunction(Reader *R, Proto *f) {
+static void loadFunction(Reader *R, Proto *f, int depth) {
+    /* loadProtos recurses through this function, so the depth check is what
+    ** keeps a hand-crafted dump from blowing the C stack. */
+    if (depth > LUAC2C_MAX_DEPTH) {
+        r_error(R, "function nesting too deep (limit %d)", LUAC2C_MAX_DEPTH);
+        return;
+    }
     f->linedefined     = (int)r_readvarint(R);
     f->lastlinedefined = (int)r_readvarint(R);
     f->numparams       = r_read1(R);
@@ -466,7 +566,7 @@ static void loadFunction(Reader *R, Proto *f) {
     if (R->err) return;
     loadUpvalues(R, f);
     if (R->err) return;
-    loadProtos(R, f);
+    loadProtos(R, f, depth);
     if (R->err) return;
     f->source = r_readstring(R);
     if (R->err) return;
@@ -482,13 +582,58 @@ static void loadHeader(Reader *R) {
     if (ver != 0x55) r_error(R, "unsupported Lua version byte 0x%02x (only 0x55 / 5.5 supported)", ver);
     if (fmt != 0)    r_error(R, "unsupported format %d", fmt);
     r_checkliteral(R, "\x19\x93\r\n\x1a\n");
-    /* checknum: 4 blocks of (size_byte, then size raw bytes).
-     * Use static buffers to make the call syntactically valid. */
-    int isz = r_read1(R); { char buf[8] = {0}; r_readraw(R, buf, (size_t)isz); }
-    int instsz = r_read1(R); { char buf[8] = {0}; r_readraw(R, buf, (size_t)instsz); }
-    int intsz = r_read1(R); { char buf[8] = {0}; r_readraw(R, buf, (size_t)intsz); }
-    int numsz = r_read1(R); { char buf[8] = {0}; r_readraw(R, buf, (size_t)numsz); }
-    (void)0;
+    if (R->err) return;
+
+    /* checknum: four blocks of (size byte, then that many raw bytes holding a
+    ** sample value).  The size is attacker-controlled, so it is range-checked
+    ** before any read -- the previous version trusted it and could overflow.
+    ** Comparing size *and* sample value is what makes a dump from a different
+    ** data model or byte order fail loudly instead of producing garbage C. */
+    static const int   want_sz[4]   = { (int)sizeof(int), (int)sizeof(Instruction),
+                                        (int)sizeof(long long), (int)sizeof(double) };
+    static const char *want_nm[4]   = { "int", "Instruction",
+                                        "lua_Integer", "lua_Number" };
+    unsigned char raw[4][32];
+    int got_sz[4];
+    for (int i = 0; i < 4; i++) {
+        got_sz[i] = r_read1(R);
+        if (R->err) return;
+        if (got_sz[i] < 0 || (size_t)got_sz[i] > sizeof raw[i]) {
+            r_error(R, "implausible %s size %d in header", want_nm[i], got_sz[i]);
+            return;
+        }
+        if (got_sz[i] > 0) r_readraw(R, raw[i], (size_t)got_sz[i]);
+        if (R->err) return;
+        if (got_sz[i] != want_sz[i]) {
+            r_error(R, "chunk was built for %d-byte %s, this build uses %d bytes",
+                    got_sz[i], want_nm[i], want_sz[i]);
+            return;
+        }
+    }
+    /* Sizes now match the host, so decoding the samples is safe.  LUAC_*
+    ** values come from lundump.h. */
+    int iv; unsigned instv; long long lv; double dv;
+    memcpy(&iv,    raw[0], sizeof iv);
+    memcpy(&instv, raw[1], sizeof instv);
+    memcpy(&lv,    raw[2], sizeof lv);
+    memcpy(&dv,    raw[3], sizeof dv);
+    if (iv != -0x5678) {
+        r_error(R, "int sample is 0x%x, expected 0x%x (different byte order or data model)",
+                (unsigned)iv, (unsigned)(-0x5678 & 0xFFFFFFFFu));
+        return;
+    }
+    if (instv != 0x12345678u) {
+        r_error(R, "instruction sample is 0x%x, expected 0x12345678", instv);
+        return;
+    }
+    if (lv != (long long)-0x5678) {
+        r_error(R, "lua_Integer sample mismatch (different byte order or data model)");
+        return;
+    }
+    if (dv != (double)-370.5) {
+        r_error(R, "lua_Number sample mismatch (different byte order or data model)");
+        return;
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -628,8 +773,7 @@ static int E_LABEL(Emitter *E, int pc) {
     if (pc < 0) return 0;
     if (pc >= E->nlabels) {
         int nnew = pc + 16;
-        int *nlabels = (int*)realloc(E->labels, (size_t)nnew * sizeof(int));
-        if (!nlabels) { fprintf(stderr, "oom\n"); exit(1); }
+        int *nlabels = (int*)xrealloc(E->labels, (size_t)nnew, sizeof(int));
         for (int i = E->nlabels; i < nnew; i++) nlabels[i] = 0;
         E->labels = nlabels;
         E->nlabels = nnew;
@@ -728,6 +872,57 @@ static const char *const g_api_names[] = {
 };
 #define L2C_NGAPI ((int)(sizeof g_api_names / sizeof g_api_names[0]))
 
+/* The same entries as pointer-to-function typedefs, one per name, in the same
+** order.  The emitted dispatch table used to declare its members with
+** __typeof__(&(fn)), which is a GNU extension: any compiler without it
+** (MSVC, for instance) could not build the generated C at all.  These are
+** plain C99 typedefs, so the output no longer depends on a compiler
+** extension.  Keep in sync with g_api_names. */
+static const char *const g_api_ptype[] = {
+    "void (*%s)(lua_State *, int)",                             /* lua_arith */
+    "void (*%s)(lua_State *, int, int, lua_KContext, lua_KFunction)", /* callk */
+    "void (*%s)(lua_State *)",                                  /* lua_close */
+    "void (*%s)(lua_State *, int)",                             /* closeslot */
+    "int (*%s)(lua_State *, int, int, int)",                    /* compare   */
+    "void (*%s)(lua_State *, int)",                             /* concat    */
+    "void (*%s)(lua_State *, int, int)",                        /* copy      */
+    "void (*%s)(lua_State *, int, int)",                        /* createtable */
+    "int (*%s)(lua_State *, int, lua_Integer)",                 /* geti      */
+    "int (*%s)(lua_State *, int)",                              /* gettable  */
+    "int (*%s)(lua_State *)",                                   /* gettop    */
+    "int (*%s)(lua_State *, int)",                              /* isinteger */
+    "void (*%s)(lua_State *, int)",                             /* len       */
+    "int (*%s)(lua_State *, int, int, int, lua_KContext, lua_KFunction)", /* pcallk */
+    "void (*%s)(lua_State *, int)",                             /* pushboolean */
+    "void (*%s)(lua_State *, lua_CFunction, int)",              /* pushcclosure */
+    "void (*%s)(lua_State *, lua_Integer)",                     /* pushinteger */
+    "const char *(*%s)(lua_State *, const char *, size_t)",     /* pushlstring */
+    "void (*%s)(lua_State *)",                                  /* pushnil   */
+    "void (*%s)(lua_State *, lua_Number)",                      /* pushnumber */
+    "void (*%s)(lua_State *, int)",                             /* pushvalue */
+    "int (*%s)(lua_State *, int, int)",                         /* rawequal  */
+    "int (*%s)(lua_State *, int, lua_Integer)",                 /* rawgeti   */
+    "void (*%s)(lua_State *, int, lua_Integer)",                /* rawseti   */
+    "void (*%s)(lua_State *, int, int)",                        /* rotate    */
+    "void (*%s)(lua_State *, int, const char *)",               /* setfield  */
+    "void (*%s)(lua_State *, int, lua_Integer)",                /* seti      */
+    "void (*%s)(lua_State *, int)",                             /* settable  */
+    "void (*%s)(lua_State *, int)",                             /* settop    */
+    "int (*%s)(lua_State *, int)",                              /* toboolean */
+    "void (*%s)(lua_State *, int)",                             /* toclose   */
+    "lua_Integer (*%s)(lua_State *, int, int *)",               /* tointegerx */
+    "lua_Number (*%s)(lua_State *, int, int *)",                /* tonumberx */
+    "const char *(*%s)(lua_State *, int, size_t *)",            /* tolstring */
+    "int (*%s)(lua_State *, int)",                              /* type      */
+    "void (*%s)(lua_State *, luaL_Buffer *)",                   /* buffinit  */
+    "void (*%s)(lua_State *, int, const char *)",               /* checkstack */
+    "int (*%s)(lua_State *, const char *, ...)",                /* error     */
+    "lua_State *(*%s)(void)",                                   /* newstate  */
+    "void (*%s)(lua_State *, int, int)",                        /* openselectedlibs */
+    "char *(*%s)(luaL_Buffer *, size_t)",                       /* prepbuffsize */
+    "void (*%s)(luaL_Buffer *)"                                 /* pushresult */
+};
+
 static unsigned g_api_slot[L2C_NGAPI];   /* table index chosen for each name */
 static unsigned long long g_api_k64[L2C_NGAPI];   /* per-entry xor mask      */
 static int      g_api_ntab = 0;          /* total slots in the emitted table */
@@ -771,8 +966,7 @@ static unsigned st_enc(int id) {
 
 static char *xstrdup(const char *s) {
     size_t n = strlen(s) + 1;
-    char *q = (char*)malloc(n);
-    if (!q) { fprintf(stderr, "out of memory\n"); exit(1); }
+    char *q = (char*)xmalloc(n);
     memcpy(q, s, n);
     return q;
 }
@@ -789,6 +983,15 @@ static int pool_intern(Proto *p, int idx);
 /* Emit C source that pushes constant K[idx].  Strings (and, with
 ** --pool-all, numbers) are fetched from the run-time constant pool so that
 ** they never appear as literals in the object file. */
+/* LLONG_MIN cannot be written as a literal: 9223372036854775808 does not fit
+** in a signed long long, so '-9223372036854775808LL' is really an unsigned
+** constant that is then negated and draws "integer constant is so large that
+** it is unsigned".  Spell the boundary value as a subtraction instead. */
+static void emit_iconst(Emitter *E, long long v) {
+    if (v == LLONG_MIN) emit(E, "(-9223372036854775807LL - 1)");
+    else                emit(E, "%lldLL", v);
+}
+
 static void emit_pushk(Emitter *E, Proto *p, int idx) {
     if (idx < 0 || idx >= p->sizek)
         fatal("%s: constant %d is out of range (%d constants)",
@@ -800,7 +1003,7 @@ static void emit_pushk(Emitter *E, Proto *p, int idx) {
         case KTRUE:  emit(E, "lua_pushboolean(L, 1)"); break;
         case KINT:
             if (g_pool >= 2) emit(E, "lua_rawgeti(L, KP, %d)", pool_intern(p, idx) + 1);
-            else             emit(E, "lua_pushinteger(L, %lldLL)", (long long)c->i);
+            else { emit(E, "lua_pushinteger(L, "); emit_iconst(E, (long long)c->i); emit(E, ")"); }
             break;
         case KFLT:
             if (g_pool >= 2) emit(E, "lua_rawgeti(L, KP, %d)", pool_intern(p, idx) + 1);
@@ -936,7 +1139,7 @@ static void plan_function(FnCtx *C, Proto *p) {
 
     memset(C, 0, sizeof *C);
     C->fsz   = maxstack + (g_diversify ? (int)rng_below(9) : 0);
-    C->perm  = (int*)malloc((size_t)maxstack * sizeof(int));
+    C->perm  = (int*)xmalloc((size_t)maxstack * sizeof(int));
     for (int i = 0; i < maxstack; i++) C->perm[i] = i;
 
     /* Registers targeted by OP_TBC -- and the generic-for closing slot that
@@ -946,24 +1149,22 @@ static void plan_function(FnCtx *C, Proto *p) {
     ** / luaF_close then walk that chain by physical address.  A free
     ** permutation would move a later <close> below an earlier one and corrupt
     ** the chain, so those slots are pinned and only the rest is shuffled. */
-    unsigned char *pinned = (unsigned char*)calloc((size_t)maxstack, 1);
+    unsigned char *pinned = (unsigned char*)xcalloc((size_t)maxstack, 1);
     int npinned = 0;
-    if (pinned) {
-        for (int i = 0; i < p->ncode; i++) {
-            int op = getop(p->code[i]);
-            int a;
-            if (op == OP_TBC) {
-                a = getA(p->code[i]);
-            } else if (op == OP_TFORPREP) {
-                /* OP_TFORPREP swaps R[A+2] (control) with R[A+3] (closing) and
-                ** then marks the closing value -- now back in R[A+2] -- as
-                ** to-be-closed, so that is the slot that must stay put. */
-                a = getA(p->code[i]) + 2;
-            } else {
-                continue;
-            }
-            if (a >= 0 && a < maxstack && !pinned[a]) { pinned[a] = 1; npinned++; }
+    for (int i = 0; i < p->ncode; i++) {
+        int op = getop(p->code[i]);
+        int a;
+        if (op == OP_TBC) {
+            a = getA(p->code[i]);
+        } else if (op == OP_TFORPREP) {
+            /* OP_TFORPREP swaps R[A+2] (control) with R[A+3] (closing) and
+            ** then marks the closing value -- now back in R[A+2] -- as
+            ** to-be-closed, so that is the slot that must stay put. */
+            a = getA(p->code[i]) + 2;
+        } else {
+            continue;
         }
+        if (a >= 0 && a < maxstack && !pinned[a]) { pinned[a] = 1; npinned++; }
     }
 
     C->mode = 0;
@@ -980,18 +1181,16 @@ static void plan_function(FnCtx *C, Proto *p) {
     } else if (g_diversify) {
         /* Fisher-Yates over the movable slots in [fixed, maxstack), i.e. the
         ** locals and temporaries that are not pinned as to-be-closed. */
-        int *mov = (int*)malloc((size_t)maxstack * sizeof(int));
+        int *mov = (int*)xmalloc((size_t)maxstack * sizeof(int));
         int nm = 0;
-        if (mov) {
-            for (int i = fixed; i < maxstack; i++)
-                if (!pinned[i]) mov[nm++] = i;
-            for (int i = nm - 1; i > 0; i--) {
-                int j = (int)rng_below((unsigned)(i + 1));
-                int a = mov[i], b = mov[j];
-                int t = C->perm[a]; C->perm[a] = C->perm[b]; C->perm[b] = t;
-            }
-            free(mov);
+        for (int i = fixed; i < maxstack; i++)
+            if (!pinned[i]) mov[nm++] = i;
+        for (int i = nm - 1; i > 0; i--) {
+            int j = (int)rng_below((unsigned)(i + 1));
+            int a = mov[i], b = mov[j];
+            int t = C->perm[a]; C->perm[a] = C->perm[b]; C->perm[b] = t;
         }
+        free(mov);
     }
     free(pinned);
 
@@ -1030,15 +1229,13 @@ static int pool_intern(Proto *p, int idx) {
     if (idx < 0 || idx >= p->sizek) return -1;
     if (!p->kmap) {
         int n = p->sizek > 0 ? p->sizek : 1;
-        p->kmap = (int*)malloc((size_t)n * sizeof(int));
-        if (!p->kmap) { fprintf(stderr, "out of memory\n"); exit(1); }
+        p->kmap = (int*)xmalloc((size_t)n * sizeof(int));
         for (int i = 0; i < n; i++) p->kmap[i] = -1;
     }
     if (p->kmap[idx] >= 0) return p->kmap[idx];
     if (g_pool_n >= g_pool_cap) {
         g_pool_cap = g_pool_cap ? g_pool_cap * 2 : 64;
-        g_pool_tab = (PoolEnt*)realloc(g_pool_tab, (size_t)g_pool_cap * sizeof(PoolEnt));
-        if (!g_pool_tab) { fprintf(stderr, "out of memory\n"); exit(1); }
+        g_pool_tab = (PoolEnt*)xrealloc(g_pool_tab, (size_t)g_pool_cap, sizeof(PoolEnt));
     }
     Constant *c = &p->k[idx];
     PoolEnt *e = &g_pool_tab[g_pool_n];
@@ -1058,48 +1255,74 @@ static int emit_kstr(Emitter *E, Proto *p, int idx) {
     return 1;
 }
 
-static int proto_id(Proto *root, Proto *target) {
-    if (target == root) return 0;
-    Proto *stack[2048]; int idx[2048]; int top = 0;
-    stack[top] = root; idx[top] = 0; top++;
-    int id = 0;
-    while (top > 0) {
-        Proto *q = stack[top-1]; int i = idx[top-1];
-        if (i >= q->sizep) { top--; continue; }
-        idx[top-1] = i+1;
-        id++;
-        if (q->p[i] == target) return id;
-        if (top < 2040) { stack[top] = q->p[i]; idx[top] = 0; top++; }
+/* -------------------------------------------------------------------------
+** Proto tree traversal
+**
+** The traversal stack grows on demand: the previous fixed 2048/4096 arrays
+** silently dropped anything past their end, which would have produced a C
+** file that simply lacked functions.
+** ------------------------------------------------------------------------- */
+typedef struct {
+    Proto **st;
+    int   *idx;
+    int    top;
+    int    cap;
+} PStack;
+
+static void ps_push(PStack *s, Proto *p) {
+    if (s->top == s->cap) {
+        int cap = s->cap ? s->cap * 2 : 64;
+        s->st  = (Proto**)xrealloc(s->st,  (size_t)cap, sizeof(Proto*));
+        s->idx = (int*)xrealloc(s->idx, (size_t)cap, sizeof(int));
+        s->cap = cap;
     }
-    return -1;
+    s->st[s->top]  = p;
+    s->idx[s->top] = 0;
+    s->top++;
+}
+
+static void ps_free(PStack *s) {
+    free(s->st);
+    free(s->idx);
+    s->st = NULL; s->idx = NULL; s->top = s->cap = 0;
 }
 
 static int count_nested(Proto *root) {
     int n = 0;
-    Proto *stack[2048]; int idx[2048]; int top = 0;
-    stack[top] = root; idx[top] = 0; top++;
-    while (top > 0) {
-        Proto *q = stack[top-1]; int i = idx[top-1];
-        if (i >= q->sizep) { top--; continue; }
-        idx[top-1] = i+1;
+    PStack s = {0};
+    ps_push(&s, root);
+    while (s.top > 0) {
+        Proto *q = s.st[s.top - 1];
+        int i = s.idx[s.top - 1];
+        if (i >= q->sizep) { s.top--; continue; }
+        s.idx[s.top - 1] = i + 1;
         n++;
-        if (top < 2040) { stack[top] = q->p[i]; idx[top] = 0; top++; }
+        ps_push(&s, q->p[i]);
     }
+    ps_free(&s);
     return n;
 }
 
+/* Depth-first pre-order flattening.  out[] must have room for
+** count_nested(root)+1 entries; the slot index doubles as the proto id used
+** by OP_CLOSURE (see proto_id), so the two traversals must agree -- they do,
+** both walk children in order, depth first. */
 static void flatten_protos(Proto *root, Proto **out, int *count) {
     out[0] = root;
+    root->id = 0;
     *count = 1;
-    Proto *stack[2048]; int idx[2048]; int top = 0;
-    stack[top] = root; idx[top] = 0; top++;
-    while (top > 0) {
-        Proto *q = stack[top-1]; int i = idx[top-1];
-        if (i >= q->sizep) { top--; continue; }
-        idx[top-1] = i+1;
-        if (*count < 4096) out[(*count)++] = q->p[i];
-        if (top < 2040) { stack[top] = q->p[i]; idx[top] = 0; top++; }
+    PStack s = {0};
+    ps_push(&s, root);
+    while (s.top > 0) {
+        Proto *q = s.st[s.top - 1];
+        int i = s.idx[s.top - 1];
+        if (i >= q->sizep) { s.top--; continue; }
+        s.idx[s.top - 1] = i + 1;
+        q->p[i]->id = *count;
+        out[(*count)++] = q->p[i];
+        ps_push(&s, q->p[i]);
     }
+    ps_free(&s);
 }
 
 /* Decide, for every upvalue of every proto, whether it is a plain value or a
@@ -1109,17 +1332,19 @@ static void flatten_protos(Proto *root, Proto **out, int *count) {
 ** make one alias a live stack slot -- so any upvalue that must behave like a
 ** Lua upvalue (shared, writable) is represented as a one-element table.
 ** _ENV of the main chunk is handed over by main() as a plain value. */
-static void compute_captures (Proto *p) {
+static void compute_captures (Proto *p, int depth) {
+    if (depth > LUAC2C_MAX_DEPTH)
+        fatal("function nesting too deep (limit %d)", LUAC2C_MAX_DEPTH);
     int mstack = p->maxstack > 0 ? p->maxstack : 1;
     if (p->upbox == NULL)   /* may already be set by the parent */
-        p->upbox = (int*)calloc((size_t)(p->nupvalues > 0 ? p->nupvalues : 1), sizeof(int));
-    p->capreg = (int*)calloc((size_t)mstack, sizeof(int));
+        p->upbox = (int*)xcalloc((size_t)(p->nupvalues > 0 ? p->nupvalues : 1), sizeof(int));
+    p->capreg = (int*)xcalloc((size_t)mstack, sizeof(int));
     p->ncap = 0;
     for (int i = 0; i < p->sizep; i++) {
         Proto *c = p->p[i];
         /* Fill in the child's upvalue kinds *before* recursing: its own
         ** children inherit them for the upvalues it forwards. */
-        c->upbox = (int*)calloc((size_t)(c->nupvalues > 0 ? c->nupvalues : 1), sizeof(int));
+        c->upbox = (int*)xcalloc((size_t)(c->nupvalues > 0 ? c->nupvalues : 1), sizeof(int));
         for (int u = 0; u < c->nupvalues; u++) {
             if (c->upvalues[u].instack) {
                 int r = c->upvalues[u].idx;
@@ -1133,7 +1358,7 @@ static void compute_captures (Proto *p) {
                 c->upbox[u] = (pi >= 0 && pi < p->nupvalues) ? p->upbox[pi] : 0;
             }
         }
-        compute_captures(c);
+        compute_captures(c, depth + 1);
     }
 }
 
@@ -1328,6 +1553,34 @@ static void mark_jump_targets(Proto *p, int *is_target) {
     is_target[0] = 1;
 }
 
+/* The narrower set: instructions that some *emitted* 'goto L_n' actually
+** names.  is_target also contains the entry and every fall-through
+** destination, and a label nobody jumps to is an -Wunused-label warning in
+** the plain (--static) form, so labels are only printed for these.  Keep the
+** two in step with the emitters below: a goto to a label that was never
+** printed is a hard compile error, which is much worse than a warning. */
+static void mark_goto_targets(Proto *p, int *ref) {
+    for (int pc = 0; pc < p->ncode; pc++) ref[pc] = 0;
+    for (int pc = 0; pc < p->ncode; pc++) {
+        Instruction ins = p->code[pc];
+        int tgt = -1;
+        switch (getop(ins)) {
+            case OP_JMP:        tgt = pc + 1 + getsJ(ins);       break;
+            case OP_LFALSESKIP: tgt = pc + 2;                    break;
+            case OP_EQ: case OP_LT: case OP_LE:
+            case OP_EQK: case OP_EQI: case OP_LTI: case OP_LEI:
+            case OP_GTI: case OP_GEI:
+            case OP_TEST: case OP_TESTSET:
+                tgt = pc + 2;                                    break;
+            case OP_FORLOOP:    tgt = pc + 1 - getBx(ins);        break;
+            case OP_FORPREP:    tgt = pc + 2 + getBx(ins);        break;
+            case OP_TFORPREP:   tgt = pc + 1 + getBx(ins);        break;
+            case OP_TFORLOOP:   tgt = pc + 1 - getBx(ins);        break;
+        }
+        if (tgt >= 0 && tgt < p->ncode) ref[tgt] = 1;
+    }
+}
+
 /* Number of consecutive registers starting at R[A] that 'op' overwrites,
 ** or -1 when the count is only known at run time. */
 static int writes_count (int op, Instruction ins) {
@@ -1408,10 +1661,20 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
             break;
         }
         case 2: { /* never taken: a transfer to a real label -> bogus CFG edge */
+            /* 'i' is an instruction index; the label printed for it is
+            ** E->labels[i].  Printing i directly named a label that does not
+            ** exist, which the flattener silently turned into "leave the
+            ** function" -- the bogus edge pointed at the exit instead of at a
+            ** real block. */
             int want = (int)rng_below((unsigned)nt), id = 0;
             for (int i = 0; i < ncode; i++) {
-                if (!is_target[i]) continue;
-                if (want-- == 0) { id = i; break; }
+                if (!is_target[i] || !E->labels[i]) continue;
+                if (want-- == 0) { id = E->labels[i]; break; }
+            }
+            if (!id) {  /* nothing to point at: fall back to plain noise */
+                emit(E, "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                        "l2c_noise ^= (_q & 1u) ? 0u : %uu; }\n", k);
+                break;
             }
             emit(E,
                 "{ unsigned _q = (unsigned)(uintptr_t)L; "
@@ -1426,7 +1689,7 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
     }
 }
 
-static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
+static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     int maxstack = p->maxstack;
     if (maxstack < 1) maxstack = 1;
     int nparams  = p->numparams;
@@ -1439,7 +1702,7 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
 
     /* Registers declared "to be closed" (local x <close> = ...).  OP_TBC
     ** marks them; OP_CLOSE runs their __close in reverse order. */
-    int *istbc = (int*)calloc((size_t)maxstack, sizeof(int));
+    int *istbc = (int*)xcalloc((size_t)maxstack, sizeof(int));
     int ntbc = 0;
     for (int i = 0; i < p->ncode; i++) {
         if (getop(p->code[i]) == OP_TBC) {
@@ -1464,6 +1727,10 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
         for (int r = 0; r < maxstack; r++)
             if (p->capreg[r]) { emit(E, "%s%d", first ? "" : ", ", r); first = 0; }
         emit(E, "};\n");
+        /* The split form leaves this table behind in the dispatcher, which no
+        ** longer runs any instruction; an explicit reference keeps a build
+        ** with -Wextra quiet without changing what is emitted. */
+        emit(E, "  (void)l2c_caps;\n");
     }
 
     /* Diversification macros.  Everything below is written against the short
@@ -1471,7 +1738,7 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
     ** per-function locals, the per-function register permutation, per-proto
     ** helper copies and this function's constant-pool upvalue. */
     if (FX) {
-        emit(E, "  int %s = 0, %s, %s = 0;\n", FX->vb, FX->vt, FX->vn);
+        emit(E, "  int %s = 0, %s = 0, %s = 0;\n", FX->vb, FX->vt, FX->vn);
         emit(E, "#define b   %s\n", FX->vb);
         emit(E, "#define top %s\n", FX->vt);
         emit(E, "#define ne  %s\n", FX->vn);
@@ -1500,15 +1767,18 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
             for (int r = 0; r < fsz; r++)
                 emit(E, "%s%d", r ? "," : "", r < maxstack ? FX->perm[r] : r);
             emit(E, "};\n");
+            /* Same reason as l2c_caps above: the dispatcher keeps the table
+            ** but stops indexing it once the blocks own the body. */
+            emit(E, "  (void)%s;\n", FX->mapname);
         }
     } else {
-        emit(E, "  int b = 0, top, ne = 0;\n");
+        emit(E, "  int b = 0, top = 0, ne = 0;\n");
         emit(E, "#define R(r) (b + (r) + 1)\n");
     }
     /* The constant pool is always the last upvalue, after the ones the
     ** bytecode itself declares, so it can never collide with GETUPVAL. */
     emit(E, "#define KP lua_upvalueindex(%d)\n", p->nupvalues + 1);
-    emit(E, "  (void)ne;\n");
+    emit(E, "  (void)ne; (void)top;\n");
     emit(E, "  luaL_checkstack(L, %d + 24, \"l2c\");\n", fsz);
 
     if (isvahid) {
@@ -1550,8 +1820,10 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
     emit(E, "  lua_settop(L, b + %d);\n", fsz);
     emit(E, "  top = b + %d;\n", nparams + (isvatab ? 2 : 1));
 
-    int *is_target = (int*)calloc((size_t)p->ncode + 2, sizeof(int));
+    int *is_target = (int*)xcalloc((size_t)p->ncode + 2, sizeof(int));
+    int *ref       = (int*)xcalloc((size_t)p->ncode + 2, sizeof(int));
     mark_jump_targets(p, is_target);
+    mark_goto_targets(p, ref);
     /* The state machine needs a state to start in, so the entry instruction
     ** must own a label like any other dispatch target. */
     if (g_flatten) is_target[0] = 1;
@@ -1572,11 +1844,11 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
         int Ax = getAx(ins);
         int sJ = getsJ(ins);
 
-        if (is_target[pc]) {
-            int id = E->labels[pc];
-            if (id) emit(E, "  L_%d: ;  /* pc=%d */\n", id, pc);
-            else    emit(E, "  /* pc=%d (entry) */\n", pc);
-        }
+        /* Only print the label when something can actually reach it: the
+        ** flattening passes rewrite every is_target entry and junk jumps are
+        ** chosen from the same set, so both keep the wide condition. */
+        if (is_target[pc] && (g_flatten || g_opaque || ref[pc]))
+            emit(E, "  L_%d: ;  /* pc=%d */\n", E->labels[pc], pc);
 
         if (g_annotate)
             emit(E, "  /* [%d] %s */ ", pc, OP_NAMES[op]);
@@ -1967,7 +2239,10 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
             }
             case OP_CLOSURE: {
                 Proto *sub = p->p[Bx];
-                int sub_id = proto_id(root, sub);
+                /* O(1): flatten_protos() already stamped every proto with its
+                ** index in the same depth-first order proto_id() used to
+                ** recompute by scanning the whole tree. */
+                int sub_id = sub->id;
                 int nup = sub->nupvalues;
                 for (int ui = 0; ui < nup; ui++) {
                     UpvalDesc *u = &sub->upvalues[ui];
@@ -2078,6 +2353,7 @@ static void emit_body(Emitter *E, Proto *root, Proto *p, FnCtx *FX) {
     }
     emit(E, "  return 0;\n");
     free(is_target);
+    free(ref);
     free(istbc);
 }
 
@@ -2435,10 +2711,19 @@ static void emit_preamble(FILE *out, const char *in_path) {
             "/* No Lua entry point is called by name anywhere below.  Every call\n"
             "** goes through %s_t[..].m<k>; the table is decoded once at start-up\n"
             "** under a key taken from a load-time address, so a static dump of\n"
-            "** .data maps no call site onto a symbol. */\n"
-            "typedef union {\n", t);
+            "** .data maps no call site onto a symbol. */\n", t);
+        for (int i = 0; i < n; i++) {
+            char ptn[64];
+            snprintf(ptn, sizeof ptn, "%s_pt%d", t, i);
+            /* g_api_ptype[i] is one of our own literals; its single %s takes
+            ** the typedef name, randomised like every other emitted name. */
+            fprintf(out, "typedef ");
+            fprintf(out, g_api_ptype[i], ptn);
+            fprintf(out, ";\n");
+        }
+        fprintf(out, "typedef union {\n");
         for (int i = 0; i < n; i++)
-            fprintf(out, "  __typeof__(&(%s)) m%d;\n", g_api_names[i], i);
+            fprintf(out, "  %s_pt%d m%d;\n", t, i, i);
         fprintf(out,
             "} %s_u;\n"
             "static %s_u %s_t[%d];\n"
@@ -2449,19 +2734,19 @@ static void emit_preamble(FILE *out, const char *in_path) {
         for (int i = 0; i < n; i++) {
             unsigned long long kk = g_api_k64[i];
             fprintf(out,
-                "  %s_t[%u].m%d = (__typeof__(&(%s)))((intptr_t)&%s"
+                "  %s_t[%u].m%d = (%s_pt%d)((intptr_t)&%s"
                 " ^ (k ^ (intptr_t)0x%016llXULL));\n",
-                t, g_api_slot[i], i, g_api_names[i], g_api_names[i], kk);
+                t, g_api_slot[i], i, t, i, g_api_names[i], kk);
         }
         fprintf(out, "}\n");
         for (int i = 0; i < n; i++) {
             unsigned long long kk = g_api_k64[i];
             fprintf(out,
                 "#undef %s\n"
-                "#define %s(...)  ((__typeof__(%s_t[%u].m%d))((intptr_t)"
+                "#define %s(...)  ((%s_pt%d)((intptr_t)"
                 "%s_t[%u].m%d ^ ((intptr_t)(uintptr_t)%s_k"
                 " ^ (intptr_t)0x%016llXULL)))(__VA_ARGS__)\n",
-                g_api_names[i], g_api_names[i], t, g_api_slot[i], i,
+                g_api_names[i], g_api_names[i], t, i,
                 t, g_api_slot[i], i, t, kk);
         }
         fprintf(out, "\n");
@@ -2491,7 +2776,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         fprintf(out,
         "/* Shared cells for captured registers; 'boxes' is the table at\n"
         "** stack slot 1 and cells are keyed by reg+1. */\n"
-        "static void %s (lua_State *L, int boxes, int key, int slot) {\n"
+        "static inline void %s (lua_State *L, int boxes, int key, int slot) {\n"
         "  lua_rawgeti(L, boxes, key);\n"
         "  if (lua_isnil(L, -1)) {\n"
         "    lua_pop(L, 1);\n"
@@ -2504,7 +2789,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "}\n\n", C->h_bget);
 
         fprintf(out,
-        "static void %s (lua_State *L, int boxes, int key, int slot) {\n"
+        "static inline void %s (lua_State *L, int boxes, int key, int slot) {\n"
         "  lua_rawgeti(L, boxes, key);\n"
         "  if (!lua_isnil(L, -1)) {\n"
         "    lua_pushvalue(L, slot);\n"
@@ -2516,7 +2801,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         fprintf(out,
         "/* Reverse direction: a nested closure may have written the cell, so\n"
         "** refresh the cached register from it before the value is used. */\n"
-        "static void %s (lua_State *L, int boxes, int key, int slot) {\n"
+        "static inline void %s (lua_State *L, int boxes, int key, int slot) {\n"
         "  lua_rawgeti(L, boxes, key);\n"
         "  if (!lua_isnil(L, -1)) {\n"
         "    lua_rawgeti(L, -1, 1);\n"
@@ -2526,7 +2811,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "}\n\n", C->h_bpull);
 
         fprintf(out,
-        "static void %s (lua_State *L, int boxes, int base, const int *regs,\n"
+        "static inline void %s (lua_State *L, int boxes, int base, const int *regs,\n"
         "                           int n, const unsigned char *map, int xm) {\n"
         "  int i;\n"
         "  for (i = 0; i < n; i++) {\n"
@@ -2542,7 +2827,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "** slot number only if it is an integer, or a float holding an exact\n"
         "** integer value.  A numeric string is NOT accepted (unlike\n"
         "** lua_tointegerx, which would coerce \"2\" to 2). */\n"
-        "static int %s (lua_State *L, int idx, lua_Integer *out) {\n"
+        "static inline int %s (lua_State *L, int idx, lua_Integer *out) {\n"
         "  if (lua_isinteger(L, idx)) { *out = lua_tointeger(L, idx); return 1; }\n"
         "  if (lua_type(L, idx) == LUA_TNUMBER) {\n"
         "    lua_Number n = lua_tonumber(L, idx);\n"
@@ -2561,7 +2846,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         fprintf(out,
         "/* Mirror of the VM's 'forlimit': returns 1 when the loop body must\n"
         "** be skipped, otherwise stores the (integer) limit in *p. */\n"
-        "static int %s (lua_State *L, int idx, lua_Integer init,\n"
+        "static inline int %s (lua_State *L, int idx, lua_Integer init,\n"
         "                         lua_Integer *p, lua_Integer step) {\n"
         "  if (lua_type(L, idx) == LUA_TNUMBER) {\n"
         "    if (lua_isinteger(L, idx)) {\n"
@@ -2585,7 +2870,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "** separately because R() is a per-function permutation, so the\n"
         "** three logical registers are not physically adjacent.\n"
         "** Returns 1 when the loop must be skipped. */\n"
-        "static int %s (lua_State *L, int ri, int rl, int rs) {\n"
+        "static inline int %s (lua_State *L, int ri, int rl, int rs) {\n"
         "  if (lua_isinteger(L, ri) && lua_isinteger(L, rs)) {\n"
         "    lua_Integer init = lua_tointeger(L, ri);\n"
         "    lua_Integer step = lua_tointeger(L, rs);\n"
@@ -2625,7 +2910,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         fprintf(out,
         "/* One step of a numeric 'for'; returns 1 when the loop continues.\n"
         "** After forprep, rc = count/limit, rs = step, ridx = index. */\n"
-        "static int %s (lua_State *L, int rc, int rs, int ridx) {\n"
+        "static inline int %s (lua_State *L, int rc, int rs, int ridx) {\n"
         "  if (lua_isinteger(L, rs)) {\n"
         "    lua_Integer step = lua_tointeger(L, rs);\n"
         "    lua_Integer idx  = lua_tointeger(L, ridx);\n"
@@ -2883,9 +3168,43 @@ static void flat_switch(FILE *body, const char *buf, size_t n,
     fprintf(body, "  default: return 0;\n  }\n  }\n}\n\n");
 }
 
-static int flat_index_of(const unsigned *bid, int nb, unsigned id) {
-    for (int i = 0; i < nb; i++) if (bid[i] == id) return i;
+/* id -> block index.  The split form rewrites one 'goto' per jump, so the
+** old linear scan over bid[] cost O(blocks x jumps); this is a small open
+** addressing table built once per body instead. */
+typedef struct { int cap; unsigned char *used; unsigned *key; int *val; } IdMap;
+
+static unsigned im_hash(unsigned x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16; return x;
+}
+static void im_init(IdMap *m, int n) {
+    int cap = 16;
+    while (cap < n * 4) cap <<= 1;          /* load factor <= 0.25 */
+    m->cap  = cap;
+    m->used = xcalloc((size_t)cap, 1);
+    m->key  = xcalloc((size_t)cap, sizeof *m->key);
+    m->val  = xcalloc((size_t)cap, sizeof *m->val);
+}
+static void im_put(IdMap *m, unsigned k, int v) {
+    unsigned mask = (unsigned)(m->cap - 1), i = im_hash(k) & mask;
+    while (m->used[i]) {
+        if (m->key[i] == k) { m->val[i] = v; return; }
+        i = (i + 1) & mask;
+    }
+    m->used[i] = 1; m->key[i] = k; m->val[i] = v;
+}
+static int im_get(const IdMap *m, unsigned k) {
+    unsigned mask = (unsigned)(m->cap - 1), i = im_hash(k) & mask;
+    while (m->used[i]) {
+        if (m->key[i] == k) return m->val[i];
+        i = (i + 1) & mask;
+    }
     return -1;
+}
+static void im_free(IdMap *m) {
+    free(m->used); free(m->key); free(m->val);
+    m->used = NULL; m->key = NULL; m->val = NULL; m->cap = 0;
 }
 
 /* Rewrite one block for the split form: a jump becomes 'return <state>;', and
@@ -2893,7 +3212,7 @@ static int flat_index_of(const unsigned *bid, int nb, unsigned id) {
 ** "record the result count, then leave the machine too".  The two are told
 ** apart because generated state values always carry a 'u' suffix. */
 static void flat_split_block(FILE *dst, const char *seg, size_t n,
-                             const unsigned *bid, int nb, unsigned exit_st) {
+                             const IdMap *bmap, int nb, unsigned exit_st) {
     size_t i = 0;
     while (i < n) {
         size_t j = i;
@@ -2922,7 +3241,7 @@ static void flat_split_block(FILE *dst, const char *seg, size_t n,
                 i = j + 7;
                 continue;
             }
-            int idx = flat_index_of(bid, nb, id);
+            int idx = im_get(bmap, id);
             fprintf(dst, "return %uu;", st_enc(idx < 0 ? nb : idx));
             i = (size_t)(q - seg) + 1;
         } else {
@@ -3013,6 +3332,10 @@ static void flat_split(FILE *body, FILE *pre, const char *buf, size_t n,
     unsigned exit_st = st_enc(nb);
     unsigned ainv    = modinv32(g_st_a);
 
+    IdMap bmap;
+    im_init(&bmap, nb);
+    for (int i = 0; i < nb; i++) im_put(&bmap, bid[i], i);
+
     fprintf(pre, "/* One static function per basic block, reached through %s_d. */\n"
                  "#undef b\n#define b   (*rb)\n"
                  "#undef top\n#define top (*rt)\n"
@@ -3037,11 +3360,16 @@ static void flat_split(FILE *body, FILE *pre, const char *buf, size_t n,
         const char *se = (i + 1 < nb) ? lp[i + 1] : limit;
         fprintf(pre, "static unsigned %s_%d (lua_State *L, int *rb, int *rt, "
                      "int *rn, int *ro) {\n", fn, i);
+        /* The signature is fixed by the dispatcher, but only some blocks use
+        ** every out-parameter; silence -Wunused-parameter for whoever builds
+        ** the generated file with -Wextra. */
+        fprintf(pre, "  (void)L; (void)rb; (void)rt; (void)rn; (void)ro;\n");
         for (int c = 0; c < nc; c++) fwrite(cl[c], 1, clen[c], pre);
-        flat_split_block(pre, s, (size_t)(se - s), bid, nb, exit_st);
+        flat_split_block(pre, s, (size_t)(se - s), &bmap, nb, exit_st);
         fprintf(pre, "  return %uu;\n}\n\n",
                 (i + 1 < nb) ? st_enc(i + 1) : exit_st);
     }
+    im_free(&bmap);
 
     fprintf(pre, "typedef unsigned (*%s_fp)(lua_State *, int *, int *, int *, int *);\n"
                  "static %s_fp const %s_d[%d] = {", fn, fn, fn, nb);
@@ -3094,8 +3422,7 @@ static void flatten_emit(FILE *body, FILE *pre, FILE *src, const char *kw,
     if (fseek(src, 0, SEEK_END) != 0) return;
     long n = ftell(src);
     if (n <= 0 || fseek(src, 0, SEEK_SET) != 0) return;
-    char *buf = (char*)malloc((size_t)n + 1);
-    if (!buf) return;
+    char *buf = (char*)xmalloc((size_t)n + 1);
     if (fread(buf, 1, (size_t)n, src) != (size_t)n) { free(buf); return; }
     buf[n] = 0;
 
@@ -3136,9 +3463,11 @@ static unsigned char *l2c_read_file(const char *path, size_t *n) {
     if (!f) return NULL;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long sz = ftell(f);
-    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
-    unsigned char *b = (unsigned char *)malloc((size_t)sz + 1);
-    if (!b) { fclose(f); return NULL; }
+    /* Refuse absurd sizes outright: sz+1 must not overflow and a signed
+    ** image is never anywhere near 512 MiB. */
+    if (sz < 0 || sz > (long)512 * 1024 * 1024 ||
+        fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    unsigned char *b = (unsigned char *)xmalloc((size_t)sz + 1);
     if (fread(b, 1, (size_t)sz, f) != (size_t)sz) { free(b); fclose(f); return NULL; }
     fclose(f);
     *n = (size_t)sz;
@@ -3399,27 +3728,32 @@ int main(int argc, char **argv) {
     if (R.err) { fprintf(stderr, "%s\n", R.errmsg); fclose(R.fp); return 1; }
 
     Proto *root = proto_new();
-    loadFunction(&R, root);
+    g_nprotos = 1;
+    loadFunction(&R, root, 0);
     fclose(R.fp);
     for (int i = 0; i < R.nstr; i++) free(R.strs[i]);
     free(R.strs);
     if (R.err) { fprintf(stderr, "%s\n", R.errmsg); proto_free(root); return 1; }
 
-    compute_captures(root);
+    compute_captures(root, 0);
     validate_proto(root);   /* abort on anything the emitter cannot index safely */
 
-    FILE *out = fopen(out_path, "w");
+    /* Binary mode: the emitter always writes '\n', and translating it on
+    ** Windows would make the same seed produce different bytes (and hence a
+    ** different fingerprint) than the same build on Linux. */
+    FILE *out = fopen(out_path, "wb");
     if (!out) { perror(out_path); proto_free(root); return 1; }
 
     int total = count_nested(root) + 1;
-    Proto **list = (Proto**)calloc((size_t)total, sizeof(Proto*));
+    Proto **list = (Proto**)xcalloc((size_t)total, sizeof(Proto*));
     int lcount = 0;
     flatten_protos(root, list, &lcount);
+    if (lcount != total) fatal("internal: flattened %d of %d functions", lcount, total);
 
     /* Plan every function first: names, register layout and helper copies are
     ** drawn from the seed before anything is emitted. */
-    FnCtx *ctx = (FnCtx*)calloc((size_t)lcount, sizeof(FnCtx));
-    g_fnames   = (char**)calloc((size_t)lcount, sizeof(char*));
+    FnCtx *ctx = (FnCtx*)xcalloc((size_t)lcount, sizeof(FnCtx));
+    g_fnames   = (char**)xcalloc((size_t)lcount, sizeof(char*));
     for (int i = 0; i < lcount; i++) {
         plan_function(&ctx[i], list[i]);
         if (g_diversify) g_fnames[i] = ctx[i].fn;
@@ -3469,18 +3803,28 @@ int main(int argc, char **argv) {
             ** handed on.  The block functions have to precede the function
             ** that dispatches to them, hence the second scratch file. */
             E.out = scr;
-            emit_body(&E, root, list[i], &ctx[i]);
+            emit_body(&E, list[i], &ctx[i]);
             E.out = out;
             flatten_emit(bod, blk, scr, kw, g_fnames[i]);
             copy_stream(out, blk);
             copy_stream(out, bod);
             fclose(scr); fclose(blk); fclose(bod);
         } else {
+            /* No scratch files (MinGW's tmpfile() can refuse when the process
+            ** may not write to the drive root and TMP is unset).  Dropping the
+            ** flattening keeps the output correct but much easier to read, so
+            ** say so instead of silently shipping a weaker file. */
+            static int warned = 0;
+            if (g_flatten && !warned) {
+                warned = 1;
+                fprintf(stderr, "luac2c: tmpfile() failed (%s); emitting "
+                        "unflattened bodies\n", strerror(errno));
+            }
             if (scr) fclose(scr);
             if (blk) fclose(blk);
             if (bod) fclose(bod);
             emit(&E, "%sint %s(lua_State *L) {\n", kw, g_fnames[i]);
-            emit_body(&E, root, list[i], &ctx[i]);
+            emit_body(&E, list[i], &ctx[i]);
             emit(&E, "}\n\n");
         }
     }
