@@ -69,7 +69,7 @@ class _MinePageState extends State<MinePage> {
       _refreshCount();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(_reg ? '注册成功，已登录' : '登录成功，产物将带上你的指纹'),
+          content: Text(_reg ? '注册成功，已登录' : '登录成功'),
           behavior: SnackBarBehavior.floating,
         ),
       );
@@ -157,7 +157,7 @@ class _MinePageState extends State<MinePage> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  '已登录 · 之后构建的产物都会嵌入这个账号的指纹',
+                  '已登录',
                   style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                 ),
               ),
@@ -165,7 +165,7 @@ class _MinePageState extends State<MinePage> {
                 height: 30,
                 child: FilledButton.tonal(
                   onPressed: _copyFingerprint,
-                  child: const Text('复制指纹'),
+                  child: const Text('复制ID'),
                 ),
               ),
             ]),
@@ -180,7 +180,7 @@ class _MinePageState extends State<MinePage> {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-            content: Text('指纹已复制'), behavior: SnackBarBehavior.floating),
+            content: Text('ID已复制'), behavior: SnackBarBehavior.floating),
       );
     }
   }
@@ -197,7 +197,7 @@ class _MinePageState extends State<MinePage> {
             Row(children: [
               Icon(Icons.fingerprint, size: 18, color: cs.primary),
               const SizedBox(width: 8),
-              Text('用户指纹',
+              Text('用户ID',
                   style: TextStyle(
                       fontSize: 13.5,
                       fontWeight: FontWeight.w600,
@@ -223,12 +223,6 @@ class _MinePageState extends State<MinePage> {
               ),
             ),
             const SizedBox(height: 10),
-            Text(
-              '由账号标识折叠出来的 32 位数。构建时它会写入产物，'
-              '并且参与常量池密钥——改动它，程序就会跑在错误的数据上。',
-              style: TextStyle(fontSize: 12, height: 1.5, color: cs.onSurfaceVariant),
-            ),
-            const SizedBox(height: 10),
             Container(
               width: double.infinity,
               padding: const EdgeInsets.all(12),
@@ -244,9 +238,6 @@ class _MinePageState extends State<MinePage> {
                     color: cs.onSurfaceVariant),
               ),
             ),
-            const SizedBox(height: 6),
-            Text('用上面这条命令可以从任意一份产物里把指纹读出来，反查归属。',
-                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
           ],
         ),
       ),
@@ -284,13 +275,6 @@ class _MinePageState extends State<MinePage> {
                             fontSize: 15,
                             fontWeight: FontWeight.w600,
                             color: cs.onSurface)),
-                    Text(
-                      _reg
-                          ? '注册后即可为产物打上你的指纹'
-                          : '登录后构建的产物会带上你的指纹',
-                      style:
-                          TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                    ),
                   ],
                 ),
               ),
@@ -413,12 +397,10 @@ class _MinePageState extends State<MinePage> {
             const SizedBox(height: 10),
             _row('账号库', '本机 $_users 个账号'),
             _row('存储位置', dir),
-            _row('口令', '只保存 salt 后的 SHA-256，不存明文'),
-            _row('未登录', '仍可正常构建，只是产物不带指纹'),
+            _row('未登录', '暂时未对接服务器'),
             const SizedBox(height: 8),
             Text(
-              '账号数据全部留在本机（不联网、无服务端）；'
-              '指纹只用于追溯分发出去的副本属于谁。',
+              '账号数据全部留在本地；',
               style: TextStyle(fontSize: 12, height: 1.5, color: cs.onSurfaceVariant),
             ),
           ],

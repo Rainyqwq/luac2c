@@ -163,7 +163,7 @@ class Luac2cApp extends StatelessWidget {
     return AnimatedBuilder(
       animation: ThemeCtl.I,
       builder: (context, _) => MaterialApp(
-        title: 'luac2c 客户端',
+        title: 'luac2c For Windows',
         debugShowCheckedModeBanner: false,
         theme: AppTheme.build(Brightness.light, ThemeCtl.I.seed),
         darkTheme: AppTheme.build(Brightness.dark, ThemeCtl.I.seed),
@@ -212,7 +212,7 @@ class _AppShellState extends State<AppShell> {
         actions: [
           IconButton(
             icon: const Icon(Icons.palette_outlined),
-            tooltip: '切换配色（Material You 种子色）',
+            tooltip: '切换配色',
             onPressed: () => ThemeCtl.I.cycleSeed(),
           ),
           IconButton(
@@ -266,29 +266,29 @@ void _showAbout(BuildContext context) {
     context: context,
     builder: (ctx) => AlertDialog(
       icon: const Icon(Icons.code),
-      title: const Text('luac2c 客户端'),
+      title: const Text('luac2c For Windows'),
       content: SizedBox(
         width: 460,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('把 Lua 5.5 字节码翻译成调用 Lua C API 的 C 源码，'
-                '并一键编译、运行、与 lua.exe 逐字节比对。'),
+            const Text('把 Lua 5.5 字节码翻译成等效 C 源码，'
+                '2026 Rainy_qwq 荣誉出品'),
             const SizedBox(height: 12),
             const Divider(),
             const SizedBox(height: 8),
             _aboutRow(context, '根目录', t.root),
-            _aboutRow(context, '字节码编译器', t.luac),
-            _aboutRow(context, '转译器', t.l2c),
-            _aboutRow(context, '脚本引擎', t.lua),
-            _aboutRow(context, 'C 编译器', t.gcc),
+            _aboutRow(context, 'luac地址', t.luac),
+            _aboutRow(context, '主程序地址', t.l2c),
+            _aboutRow(context, 'lua地址', t.lua),
+            _aboutRow(context, 'C编译器地址', t.gcc),
             const SizedBox(height: 8),
             const Divider(),
             const SizedBox(height: 8),
             _aboutRow(context, '账号', AccountCtl.I.loggedIn
-                ? '${AccountCtl.I.name}（指纹 ${AccountCtl.I.fingerprint}）'
-                : '未登录，产物不带指纹'),
+                ? '${AccountCtl.I.name}（ID ${AccountCtl.I.fingerprint}）'
+                : '当前未登录'),
           ],
         ),
       ),
@@ -336,10 +336,10 @@ class Tools {
   /// 缺失的工具名列表（用于一次性提示，而不是跑到一半才报错）
   /// 给的是"干什么用的 + 可执行文件名"，而不是裸的 luac / luac2c
   List<String> missing({required bool full}) => <String>[
-        if (!luacOk) '字节码编译器 luac.exe',
-        if (!l2cOk) '转译器 luac2c.exe',
+        if (!luacOk) 'luac luac.exe',
+        if (!l2cOk) '主程序 luac2c.exe',
         if (full && !gccOk) 'C 编译器 gcc.exe',
-        if (full && !luaOk) '脚本引擎 lua.exe',
+        if (full && !luaOk) 'lua lua.exe',
       ];
 }
 
@@ -642,7 +642,7 @@ class LogStore extends ChangeNotifier {
     _buf.clear();
     if (lines.length > maxLines) {
       lines.removeRange(0, lines.length - maxLines);
-      lines.insert(0, '… （更早的日志已自动丢弃，仅保留最近 $maxLines 行）');
+      lines.insert(0, '… （更早的日志已自动销毁，仅保留最近 $maxLines 行）');
     }
     notifyListeners();
   }
@@ -719,7 +719,7 @@ class _HomePageState extends State<HomePage> {
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       setState(() => _tools = findTools());
-      log('工具链探测完成。选择 .lua 文件，或直接把文件拖进窗口。');
+      log('配置文件遍历完成。选择 .lua 文件，或直接把文件拖进窗口。');
     });
   }
 
@@ -975,7 +975,7 @@ class _HomePageState extends State<HomePage> {
       if (!File(pC).existsSync()) throw 'luac2c 未生成 $pC';
       p('      → $pC  (${r.ms}ms)');
       if (AccountCtl.I.loggedIn) {
-        p('      指纹 ${AccountCtl.I.fingerprint}（账号 ${AccountCtl.I.name}）');
+        p('      ID ${AccountCtl.I.fingerprint}（账号 ${AccountCtl.I.name}）');
       }
       if (!full) {
         p('✓ C 源码已生成 → $pC');
@@ -1015,7 +1015,7 @@ class _HomePageState extends State<HomePage> {
       if (_cancel) throw '已取消';
       final gen = await runCapture(pExe, [], dir,
           timeout: const Duration(seconds: 30), isCancelled: () => _cancel);
-      if (gen.timeout) throw '生成物运行超时，已终止';
+      if (gen.timeout) throw '产物运行超时，已终止';
 
       p('[5/5] 与 lua.exe 输出比对');
       if (_cancel) throw '已取消';
@@ -1167,8 +1167,8 @@ class _HomePageState extends State<HomePage> {
             Expanded(
               child: Text(
                 on
-                    ? '已登录 ${AccountCtl.I.name} · 产物指纹 ${AccountCtl.I.fingerprint}'
-                    : '未登录 · 产物不含指纹，可在「我的」里登录',
+                    ? '已登录 ${AccountCtl.I.name} · ID ${AccountCtl.I.fingerprint}'
+                    : '未登录',
                 style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w500,
@@ -1322,7 +1322,7 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const SectionTitle('代码布局与防护', icon: Icons.tune),
+            const SectionTitle('代码防护', icon: Icons.tune),
             const SizedBox(height: 10),
             Row(children: [
               Expanded(
@@ -1375,8 +1375,8 @@ class _HomePageState extends State<HomePage> {
               icon: Icons.security_outlined,
               title: '运行时防护',
               subtitle: _mode == 2
-                  ? '「不混淆」布局下 luac2c 不会注入防护（--static 一并关闭）'
-                  : '注入反调试与完整性自校验，被改动时结果自动跑偏（关闭 = --no-guard）',
+                  ? '「不混淆」模式下 luac2c 不会启动防护'
+                  : '注入反调试与完整性自校验，局部修改会产生静默错误',
               value: _guard && _mode != 2,
               enabled: _mode != 2,
               onChanged: (v) => _guard = v,
@@ -1385,7 +1385,7 @@ class _HomePageState extends State<HomePage> {
             _switchRow(
               icon: Icons.inventory_2_outlined,
               title: '关闭常量池',
-              subtitle: '字面量直接写进 C 源码（--no-pool）：好读，但常量不再运行时解码',
+              subtitle: '常量和字符将直接写进 C 源码',
               value: _nopool,
               onChanged: (v) => _nopool = v,
             ),
@@ -1393,7 +1393,7 @@ class _HomePageState extends State<HomePage> {
             _switchRow(
               icon: Icons.comment_outlined,
               title: '保留指令注释',
-              subtitle: '在生成的 C 源码里逐条标注字节码指令（--annotate）',
+              subtitle: '在生成的 C 源码里逐条标注字节码指令',
               value: _annot,
               onChanged: (v) => _annot = v,
             ),
@@ -1407,11 +1407,11 @@ class _HomePageState extends State<HomePage> {
   String get _modeHint {
     switch (_mode) {
       case 1:
-        return '固定种子：按种子值打乱布局，同种子产物完全一致，便于复现与对比。';
+        return '默认：静态Seed不变';
       case 2:
-        return '不混淆：原样直译，不做布局变换，也不注入运行时防护（--static，最好读）。';
+        return '不混淆：不注入静态&动态防护功能';
       default:
-        return '随机：每次转译都换一套布局与命名，产物每次都不同（默认，防护最强）。';
+        return '随机：每次转译更换随机Seed';
     }
   }
 
@@ -1464,7 +1464,7 @@ class _HomePageState extends State<HomePage> {
               '工具链',
               icon: Icons.build_outlined,
               trailing: _tools.allOk
-                  ? const StatusDot(ok: true, label: '就绪', path: '全部工具已找到')
+                  ? const StatusDot(ok: true, label: '就绪', path: '所有工具已找到')
                   : const StatusDot(
                       ok: false, label: '有缺失', path: '见下方指示灯'),
             ),
@@ -1474,8 +1474,8 @@ class _HomePageState extends State<HomePage> {
                   ok: _tools.luacOk,
                   label: '字节码编译器',
                   path: _tools.luac),
-              StatusDot(ok: _tools.l2cOk, label: '转译器', path: _tools.l2c),
-              StatusDot(ok: _tools.luaOk, label: '脚本引擎', path: _tools.lua),
+              StatusDot(ok: _tools.l2cOk, label: '主程序', path: _tools.l2c),
+              StatusDot(ok: _tools.luaOk, label: 'lua', path: _tools.lua),
               StatusDot(ok: _tools.gccOk, label: 'C 编译器', path: _tools.gcc),
             ]),
             const SizedBox(height: 10),
@@ -1498,7 +1498,7 @@ class _HomePageState extends State<HomePage> {
       Row(children: [
         Expanded(
           child: Tooltip(
-            message: '完整流程：编译字节码 → 转译为 C → gcc 编译 → 运行生成物 → 与 lua.exe 输出比对',
+            message: '编译字节码 → 转译为 C → gcc 编译 → 运行生成物',
             child: FilledButton.icon(
               onPressed: _busy ? null : () => runPipeline(full: true),
               icon: _busy
@@ -1510,7 +1510,7 @@ class _HomePageState extends State<HomePage> {
                   : const Icon(Icons.play_arrow, size: 20),
               label: const Padding(
                 padding: EdgeInsets.symmetric(vertical: 12),
-                child: Text('一键构建并比对', style: TextStyle(fontSize: 15)),
+                child: Text('一键构建', style: TextStyle(fontSize: 15)),
               ),
             ),
           ),
@@ -1542,7 +1542,7 @@ class _HomePageState extends State<HomePage> {
         Expanded(
             child: _minorButton(Icons.description_outlined, '仅生成 C 源码',
                 () => runPipeline(full: false),
-                tip: '只跑字节码编译 + 转译，不编译、不运行、不比对')),
+                tip: '仅生成 C 源码，不运行')),
         const SizedBox(width: 10),
         Expanded(
             child: _minorButton(
@@ -1552,7 +1552,7 @@ class _HomePageState extends State<HomePage> {
         Expanded(
             child: _minorButton(Icons.folder_open_outlined, '打开输出目录',
                 openOutDir,
-                tip: '在资源管理器中打开源文件所在目录（产物也在这里）')),
+                tip: '在资源管理器中打开源文件所在目录')),
       ]),
     ]);
   }
