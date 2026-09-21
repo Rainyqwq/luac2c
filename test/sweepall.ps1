@@ -3,9 +3,12 @@
 param([int]$MaxSeed = 9)
 
 $ErrorActionPreference = 'Continue'
-$root = 'C:\Users\Rainy\Desktop\Project\Luac2c'
-$here = "$root\test"
-$gcc  = 'C:\environments\GCC-16.2.0\bin\gcc.exe'
+$root = Split-Path -Parent $PSScriptRoot
+if ($env:LUAC2C_ROOT) { $root = $env:LUAC2C_ROOT }
+$here = $PSScriptRoot
+$gcc  = 'gcc'
+if ($env:GCC) { $gcc = $env:GCC }
+else { $gc = Get-Command gcc -ErrorAction SilentlyContinue; if ($gc) { $gcc = $gc.Source } }
 $lib  = "$root\lua-5.5.1\build\liblua.a"
 $inc  = @('-I', "$root\lua-5.5.1\src", '-I', "$root\lua5.5-include")
 $cfl  = @('-std=c99', '-w', '-O0')

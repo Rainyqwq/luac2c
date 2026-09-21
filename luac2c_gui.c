@@ -5,7 +5,7 @@
 **   gcc luac2c_gui.c -mwindows -O2 -o luac2c_gui.exe -lcomdlg32 -lshell32
 **
 ** 工具与库路径默认取本程序所在目录（luac.exe / luac2c.exe / lua.exe / lua-5.5.1/...），
-** gcc 依次尝试  本目录 -> C:\environments\GCC-16.2.0\bin\gcc.exe -> PATH；
+** gcc 依次尝试  环境变量 GCC -> 本目录 -> 系统 PATH（不写死任何本机路径）；
 ** 都可以在同目录的 luac2c_gui.ini 里按 [paths] 覆盖。
 */
 #define UNICODE
@@ -190,24 +190,26 @@ static wchar_t *qarg(const wchar_t *p) {          /* 给路径加引号 */
 /* ------------------------------------------------------------------ tools */
 static void find_tools(void) {
     wchar_t def[MAX_PATH];
+    wchar_t *envgcc;
 
-    /* gcc: 本目录 -> 固定位置 -> PATH */
-    joinpath(def, MAX_PATH, g_root, L"gcc.exe");
-    if (file_exists(def)) wcscpy(g_gcc, def);
+    /* gcc: 环境变量 GCC -> 本目录 -> PATH */
+    envgcc = _wgetenv(L"GCC");
+    if (envgcc && *envgcc) wcscpy(g_gcc, envgcc);
     else {
-        wcscpy(g_gcc, L"C:\\environments\\GCC-16.2.0\\bin\\gcc.exe");
-        if (!file_exists(g_gcc)) {
-            wchar_t *pathdup = _wcsdup(_wgetenv(L"PATH") ? _wgetenv(L"PATH") : L"");
-            if (pathdup) {
-                wchar_t *ctx = NULL;
-                wchar_t *tok = wcstok(pathdup, L";", &ctx);
-                while (tok && !file_exists(g_gcc)) {
-                    joinpath(def, MAX_PATH, tok, L"gcc.exe");
-                    if (file_exists(def)) wcscpy(g_gcc, def);
-                    tok = wcstok(NULL, L";", &ctx);
-                }
-                free(pathdup);
+        joinpath(def, MAX_PATH, g_root, L"gcc.exe");
+        wcscpy(g_gcc, def);
+    }
+    if (!file_exists(g_gcc)) {
+        wchar_t *pathdup = _wcsdup(_wgetenv(L"PATH") ? _wgetenv(L"PATH") : L"");
+        if (pathdup) {
+            wchar_t *ctx = NULL;
+            wchar_t *tok = wcstok(pathdup, L";", &ctx);
+            while (tok && !file_exists(g_gcc)) {
+                joinpath(def, MAX_PATH, tok, L"gcc.exe");
+                if (file_exists(def)) wcscpy(g_gcc, def);
+                tok = wcstok(NULL, L";", &ctx);
             }
+            free(pathdup);
         }
     }
 

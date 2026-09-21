@@ -1,7 +1,10 @@
 # hashes.ps1 -- digest of the generated C per (test, mode), to show that
 # diversification really varies the translation.
-$root = 'C:\Users\Rainy\Desktop\Project\Luac2c'
-$gcc  = 'C:\environments\GCC-16.2.0\bin\gcc.exe'
+$root = $PSScriptRoot
+if ($env:LUAC2C_ROOT) { $root = $env:LUAC2C_ROOT }
+$gcc  = 'gcc'
+if ($env:GCC) { $gcc = $env:GCC }
+else { $gc = Get-Command gcc -ErrorAction SilentlyContinue; if ($gc) { $gcc = $gc.Source } }
 Set-Location $root
 
 # its own binary so an interactive rebuild cannot interfere
