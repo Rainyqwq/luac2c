@@ -48,15 +48,29 @@ class PipelineCtl extends ChangeNotifier {
   void Function(String message)? onNotice;
 
   bool _disposed = false;
+  Timer? _notifyTimer;
 
   /// 通知监听者（dispose 之后一律不再通知，避免 assertion）
-  void _touch() {
-    if (!_disposed) notifyListeners();
+  ///
+  /// 批量处理时每完成一个文件就会刷新一次进度，直接重建界面的话 UI 线程
+  /// 会被密集重建占住（同一时刻还有多个 gcc 在抢 CPU）。因此 busy 期间把
+  /// 通知合并成最多 150ms 一次；busy 的进入/退出与收尾状态立即通知，
+  /// 保证按钮、进度条、状态条的最终值都准确。
+  void _touch({bool force = false}) {
+    if (_disposed) return;
+    if (!force && busy) {
+      _notifyTimer ??= Timer(const Duration(milliseconds: 150), () {
+        _notifyTimer = null;
+        if (!_disposed) notifyListeners();
+      });
+      return;
+    }
+    notifyListeners();
   }
 
-  void _setStatus(String s) {
+  void _setStatus(String s, {bool force = false}) {
     status = s;
-    _touch();
+    _touch(force: force);
   }
 
   // ---------------------------------------------------------------- 生命周期
@@ -79,6 +93,8 @@ class PipelineCtl extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _notifyTimer?.cancel();
+    _notifyTimer = null;
     _toolsTimer?.cancel();
     log.flush();
     log.close();
@@ -254,7 +270,7 @@ class PipelineCtl extends ChangeNotifier {
     results.clear();
     totalCount = files.length;
     doneCount = 0;
-    _touch();
+    _touch(force: true); // 按钮与进度条要立刻进入忙碌态
 
     final sw = Stopwatch()..start();
     var pass = 0;
@@ -321,7 +337,7 @@ class PipelineCtl extends ChangeNotifier {
     if (!busy) return;
     cancel = true;
     killActiveProcesses(); // 立刻终止正在跑的子进程，不等它们自然结束
-    _setStatus('正在停止…');
+    _setStatus('正在停止…', force: true);
     log.add('! 收到停止请求，已终止子进程');
     log.flush();
   }
@@ -460,7 +476,7 @@ class PipelineCtl extends ChangeNotifier {
   Future<void> rebuild() async {
     if (busy) return;
     busy = true;
-    _touch();
+    _touch(force: true);
     log.add('');
     log.add('[重新编译] gcc luac2c.c -O2 -o luac2c.exe');
     try {

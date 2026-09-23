@@ -1,5 +1,5 @@
 #
-# Generated file. Do not edit.
+# Generated file, do not edit.
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
@@ -8,7 +8,7 @@ list(APPEND FLUTTER_PLUGIN_LIST
 list(APPEND FLUTTER_FFI_PLUGIN_LIST
 )
 
-# Regenerate this file any time a plugin is added or removed.
+set(PLUGIN_BUNDLED_LIBRARIES)
 
 foreach(plugin ${FLUTTER_PLUGIN_LIST})
   add_subdirectory(flutter/ephemeral/.plugin_symlinks/${plugin}/windows plugins/${plugin})

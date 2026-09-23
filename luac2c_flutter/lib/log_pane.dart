@@ -3,6 +3,7 @@
 // 自己持有滚动控制器与"是否跟随底部"状态，只订阅 [LogStore]，
 // 因此日志刷新不会重建主页的其它部分。
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
 
 import 'widgets.dart';
@@ -41,9 +42,29 @@ class _LogPaneState extends State<LogPane> {
     widget.onCopied?.call();
   }
 
+  /// 滚到底部。变高 item 的滚动范围是估算值，一次性追加一大批行之后
+  /// 再校正一帧，否则会停在"上次"的底部。
+  void _toBottom() {
+    if (!_scroll.hasClients) return;
+    if (_scroll.position.maxScrollExtent <= 0) return;
+    _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final style = TextStyle(
+      fontFamily: 'Consolas',
+      fontFamilyFallback: const ['Microsoft YaHei UI'],
+      fontSize: 12,
+      height: 1.45,
+      color: cs.onSurface,
+    );
     return Card(
       clipBehavior: Clip.antiAlias,
       child: Column(
@@ -86,30 +107,28 @@ class _LogPaneState extends State<LogPane> {
               builder: (context, _) {
                 // 新日志到达后跟随到底部（用户上翻时由 _stickBottom 暂停）
                 if (_stickBottom) {
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (_scroll.hasClients) {
-                      _scroll.jumpTo(_scroll.position.maxScrollExtent);
-                    }
-                  });
+                  WidgetsBinding.instance.addPostFrameCallback((_) => _toBottom());
                 }
+                final lines = widget.log.lines;
+                if (lines.isEmpty) {
+                  return Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Text('（暂无输出）', style: style),
+                  );
+                }
+                // 逐行虚拟化：只布局视口内的行。原来是一整个 SelectableText，
+                // 每刷新一次都要把上千行重新排版一遍，批量处理时会明显发顿。
                 return Scrollbar(
                   controller: _scroll,
                   thumbVisibility: true,
-                  child: SingleChildScrollView(
-                    controller: _scroll,
-                    padding: const EdgeInsets.all(12),
-                    child: RepaintBoundary(
-                      child: SelectableText(
-                        widget.log.lines.isEmpty
-                            ? '（暂无输出）'
-                            : widget.log.lines.join('\n'),
-                        style: TextStyle(
-                            fontFamily: 'Consolas',
-                            fontFamilyFallback: const ['Microsoft YaHei UI'],
-                            fontSize: 12,
-                            height: 1.45,
-                            color: cs.onSurface),
-                      ),
+                  child: SelectionArea(
+                    child: ListView.builder(
+                      controller: _scroll,
+                      padding: const EdgeInsets.all(12),
+                      itemCount: lines.length,
+                      // 多缓存一些，跟随底部时向上翻动不会现白
+                      scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
+                      itemBuilder: (context, i) => Text(lines[i], style: style),
                     ),
                   ),
                 );

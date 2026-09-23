@@ -57,20 +57,23 @@ class _HomePageState extends State<HomePage> {
     // 左右双栏：左栏操作区可滚动，右栏是整屏高度的运行日志。
     // 原先所有卡片排在一列里，固定高度的部分把窗口占满之后，日志那个
     // Expanded 只剩 0 高度 —— 这就是"终端显示不出来"的原因。
-    return AnimatedBuilder(
-      animation: _ctl,
-      builder: (context, _) => SafeArea(
-        child: LayoutBuilder(
-          builder: (context, box) {
-            final left = (box.maxWidth * 0.42).clamp(320.0, 460.0);
-            return Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  SizedBox(
-                    width: left,
-                    child: SingleChildScrollView(
+    // 只有左栏订阅流水线状态。日志面板只依赖 LogStore —— 若把它也包进
+    // 同一个监听器，每完成一个文件都要把上千行日志重新排版一遍，
+    // 这就是批量处理时界面发顿的主因。
+    return SafeArea(
+      child: LayoutBuilder(
+        builder: (context, box) {
+          final left = (box.maxWidth * 0.42).clamp(320.0, 460.0);
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                SizedBox(
+                  width: left,
+                  child: ListenableBuilder(
+                    listenable: _ctl,
+                    builder: (context, _) => SingleChildScrollView(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
@@ -89,18 +92,18 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: LogPane(
-                      log: _ctl.log,
-                      onCopied: _ctl.noteLogCopied,
-                    ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: LogPane(
+                    log: _ctl.log,
+                    onCopied: _ctl.noteLogCopied,
                   ),
-                ],
-              ),
-            );
-          },
-        ),
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }

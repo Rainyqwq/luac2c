@@ -9,16 +9,16 @@ class Tools {
   String inc1 = '', inc2 = '', lib = '';
   String root = '';
 
-  bool get luacOk => File(luac).existsSync();
-  bool get l2cOk => File(l2c).existsSync();
-  bool get luaOk => File(lua).existsSync();
-  bool get gccOk => File(gcc).existsSync();
+  /// 存在性在 [findTools] 里一次性算好。
+  /// 用 getter 现算的话，界面每重建一次就要打 4 次磁盘 —— 批量处理时
+  /// 每完成一个文件都重建一次，磁盘 IO 会明显拖慢 UI。
+  bool luacOk = false, l2cOk = false, luaOk = false, gccOk = false;
   bool get allOk => luacOk && l2cOk && luaOk && gccOk;
 
-  /// 状态签名：轮询时用它判断工具链是否真的变了，避免无谓的 setState
+  /// 状态签名：轮询时用它判断工具链是否真的变了，避免无谓的重建
   String get signature {
-    String e(String p) => File(p).existsSync() ? '1' : '0';
-    return '$root|$luac${e(luac)}|$l2c${e(l2c)}|$lua${e(lua)}|$gcc${e(gcc)}';
+    String e(bool ok) => ok ? '1' : '0';
+    return '$root|$luac${e(luacOk)}|$l2c${e(l2cOk)}|$lua${e(luaOk)}|$gcc${e(gccOk)}';
   }
 
   /// 缺失的工具名列表（用于一次性提示，而不是跑到一半才报错）
@@ -218,6 +218,11 @@ Tools findTools() {
   t.l2c = resolve('luac2c', ['LUAC2C', 'L2C']);
   t.lua = resolve('lua', ['LUA']);
   t.gcc = resolve('gcc', ['GCC', 'CC']);
+  // 存在性只在这里探测一次，之后纯内存读取
+  t.luacOk = File(t.luac).existsSync();
+  t.l2cOk = File(t.l2c).existsSync();
+  t.luaOk = File(t.lua).existsSync();
+  t.gccOk = File(t.gcc).existsSync();
   t.inc1 = ini['inc1'] ?? '${t.root}\\lua-5.5.1\\src';
   t.inc2 = ini['inc2'] ?? '${t.root}\\lua5.5-include';
   t.lib = ini['lib'] ?? '${t.root}\\lua-5.5.1\\build\\liblua.a';
