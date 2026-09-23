@@ -8,15 +8,13 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
-import 'account.dart';
+import 'log_store.dart';
 import 'runner.dart';
+import 'steps.dart';
 import 'tools.dart';
-import 'widgets.dart';
 
-/// 代码布局：0 随机（每次不同） 1 固定种子（可复现） 2 不混淆（原始直译）
-const int layoutRandom = 0;
-const int layoutSeed = 1;
-const int layoutPlain = 2;
+// 布局常量（layoutRandom / layoutSeed / layoutPlain）与单文件构建步骤都在
+// steps.dart 里，这里直接复用，不再各自定义一份。
 
 class PipelineCtl extends ChangeNotifier {
   PipelineCtl();
@@ -216,24 +214,14 @@ class PipelineCtl extends ChangeNotifier {
     }
   }
 
-  /// 组装 luac2c 的参数
-  List<String> l2cArgs(String luacPath, String outC) {
-    final args = <String>[luacPath];
-    if (mode == layoutSeed) {
-      args.addAll(
-          ['--seed', seed.text.trim().isEmpty ? '0' : seed.text.trim()]);
-    }
-    if (mode == layoutPlain) args.add('--static');
-    args.addAll(['-o', outC]);
-    if (noPool) args.add('--no-pool');
-    if (annotate) args.add('--annotate');
-    if (!guard) args.add('--no-guard');
-    // 登录后把账号标识交给 luac2c：产物里会嵌入这个账号的指纹，
-    // 之后拿 luac2c --who 就能从任意一份副本反查归属。
-    final uid = AccountCtl.I.uid;
-    if (uid != null && uid.isNotEmpty) args.addAll(['--fingerprint', uid]);
-    return args;
-  }
+  /// 当前选项的快照：传给 [FileBuild]，让它不必依赖界面状态
+  BuildOptions get options => BuildOptions(
+        mode: mode,
+        seed: seed.text,
+        noPool: noPool,
+        annotate: annotate,
+        guard: guard,
+      );
 
   // ---------------------------------------------------------------- 批量流水线
   Future<void> run({required bool full}) async {
@@ -342,135 +330,15 @@ class PipelineCtl extends ChangeNotifier {
     log.flush();
   }
 
-  /// 处理单个文件。日志先进局部缓冲，返回后由调用方统一入库。
-  Future<FileOutcome> _processOne(String srcPath, bool full) async {
-    final out = <String>[];
-    void p(String s) => out.add(s);
-    void pOut(StepResult r) {
-      if (r.output.trim().isNotEmpty) {
-        p('      ${r.output.trim().replaceAll('\n', '\n      ')}');
-      }
-    }
-
-    final now = DateTime.now();
-    String two(int v) => v.toString().padLeft(2, '0');
-    p('');
-    p('──── ${now.year}-${two(now.month)}-${two(now.day)} '
-        '${two(now.hour)}:${two(now.minute)}:${two(now.second)}  $srcPath');
-    final sep = Platform.isWindows ? r'\' : '/';
-    final dir = srcPath.contains(sep)
-        ? srcPath.substring(0, srcPath.lastIndexOf(sep))
-        : Directory.current.path;
-    final base = srcPath.split(sep).last;
-    final dot = base.lastIndexOf('.');
-    final stem = dot > 0 ? base.substring(0, dot) : base;
-    final pLuac = '$dir$sep$stem.luac';
-    final pC = '$dir$sep${stem}_out.c';
-    final pExe = '$dir$sep${stem}_out.exe';
-
-    // 清理上一轮的中间产物：避免用陈旧结果"假通过"
-    for (final path in <String>[pLuac, pC, if (full) pExe]) {
-      try {
-        final f = File(path);
-        if (f.existsSync()) f.deleteSync();
-      } catch (_) {/* 删不掉不影响后续，写入会覆盖 */}
-    }
-
-    final sw = Stopwatch()..start();
-    var ok = false;
-    try {
-      p('[1/5] luac  编译字节码');
-      if (cancel) throw '已取消';
-      var r = await runCapture(tools.luac, ['-o', pLuac, srcPath], dir,
-          timeout: const Duration(seconds: 30), isCancelled: () => cancel);
-      pOut(r);
-      if (r.exitCode != 0) throw 'luac 退出码 ${r.exitCode}';
-      if (!File(pLuac).existsSync()) throw 'luac 未生成 $pLuac';
-      p('      → $pLuac  (${r.ms}ms)');
-
-      p('[2/5] luac2c  翻译为 C');
-      if (cancel) throw '已取消';
-      r = await runCapture(tools.l2c, l2cArgs(pLuac, pC), dir,
-          timeout: const Duration(seconds: 60), isCancelled: () => cancel);
-      pOut(r);
-      if (r.exitCode != 0) throw 'luac2c 退出码 ${r.exitCode}';
-      if (!File(pC).existsSync()) throw 'luac2c 未生成 $pC';
-      p('      → $pC  (${r.ms}ms)');
-      if (AccountCtl.I.loggedIn) {
-        p('      ID ${AccountCtl.I.fingerprint}（账号 ${AccountCtl.I.name}）');
-      }
-      if (!full) {
-        p('✓ C 源码已生成 → $pC');
-        ok = true;
-        return FileOutcome(srcPath, true, out, ms: sw.elapsedMilliseconds);
-      }
-
-      p('[3/5] gcc  编译链接');
-      if (cancel) throw '已取消';
-      r = await runCapture(
-          tools.gcc,
-          [
-            pC,
-            '-I',
-            tools.inc1,
-            '-I',
-            tools.inc2,
-            '-std=c99',
-            '-w',
-            '-O0',
-            // -pipe：用管道代替临时文件，减少磁盘 IO
-            if (Platform.isWindows) '-pipe',
-            '-o',
-            pExe,
-            tools.lib,
-            '-lm'
-          ],
-          dir,
-          timeout: const Duration(seconds: 180),
-          isCancelled: () => cancel);
-      pOut(r);
-      if (r.exitCode != 0) throw 'gcc 退出码 ${r.exitCode}';
-      if (!File(pExe).existsSync()) throw 'gcc 未生成 $pExe';
-      p('      → $pExe  (${r.ms}ms)');
-
-      p('[4/5] 运行生成物');
-      if (cancel) throw '已取消';
-      final gen = await runCapture(pExe, [], dir,
-          timeout: const Duration(seconds: 30), isCancelled: () => cancel);
-      if (gen.timeout) throw '产物运行超时，已终止';
-
-      p('[5/5] 与 lua.exe 输出比对');
-      if (cancel) throw '已取消';
-      final ref = await runCapture(tools.lua, [srcPath], dir,
-          timeout: const Duration(seconds: 30), isCancelled: () => cancel);
-      if (ref.timeout) throw 'lua.exe 运行超时，已终止';
-      // 规范化换行：Windows 下 CRLF/LF 差异不应判为失败
-      final genOut = normalizeNewlines(gen.output);
-      final refOut = normalizeNewlines(ref.output);
-      if (genOut.isNotEmpty) {
-        p('      生成物> ${genOut.replaceAll('\n', '\n      ')}');
-      }
-      if (refOut.isNotEmpty) {
-        p('      lua.exe> ${refOut.replaceAll('\n', '\n      ')}');
-      }
-      final same = genOut == refOut && gen.exitCode == ref.exitCode;
-      ok = same;
-      if (same) {
-        p('      ✓ 输出一致，退出码一致 (${gen.exitCode})');
-        p('✓ 通过：$srcPath');
-      } else {
-        p('      ✗ 不一致（exit ${gen.exitCode} vs ${ref.exitCode}）');
-        p('✗ 失败：$srcPath');
-      }
-    } catch (e) {
-      p('      ✗ $e');
-      p('✗ 失败：$srcPath');
-      ok = false;
-    }
-    sw.stop();
-    p('      [${(sw.elapsedMilliseconds / 1000).toStringAsFixed(2)}s]');
-    return FileOutcome(srcPath, ok, out, ms: sw.elapsedMilliseconds);
-  }
+  /// 处理单个文件。具体五步在 steps.dart 的 [FileBuild] 里，
+  /// 这里只负责把当前的工具链与选项交给它，并把结果原样返回。
+  Future<FileOutcome> _processOne(String srcPath, bool full) => FileBuild(
+        tools: tools,
+        srcPath: srcPath,
+        full: full,
+        cancelled: () => cancel,
+        opts: options,
+      ).run();
 
   /// 用 gcc 重新编译 luac2c.c，生成新的 luac2c.exe
   Future<void> rebuild() async {

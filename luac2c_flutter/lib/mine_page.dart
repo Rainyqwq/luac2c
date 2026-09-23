@@ -1,5 +1,6 @@
-// 「我的」页面：本地账号登录 + 用户指纹
+// 「我的」页面：账号资料 + 用户ID + 说明。
 //
+// 登录/注册表单在 mine/login_form.dart，账号逻辑在 account.dart。
 // 登录后客户端把 uid 传给 luac2c（--fingerprint），产物里就带上这个账号的
 // 指纹。拿到一份分发出去的副本，跑
 //     luac2c --who prog.exe
@@ -9,6 +10,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'account.dart';
+import 'mine/login_form.dart';
+import 'widgets.dart';
 
 class MinePage extends StatefulWidget {
   const MinePage({super.key});
@@ -18,12 +21,6 @@ class MinePage extends StatefulWidget {
 }
 
 class _MinePageState extends State<MinePage> {
-  final _user = TextEditingController();
-  final _pwd = TextEditingController();
-  bool _reg = false; // false = 登录，true = 注册
-  bool _obscure = true;
-  bool _busy = false;
-  String? _err;
   int _users = 0;
 
   @override
@@ -38,45 +35,6 @@ class _MinePageState extends State<MinePage> {
   }
 
   @override
-  void dispose() {
-    _user.dispose();
-    _pwd.dispose();
-    super.dispose();
-  }
-
-  Future<void> _submit() async {
-    if (_busy) return;
-    setState(() {
-      _busy = true;
-      _err = null;
-    });
-    String? err;
-    try {
-      err = _reg
-          ? await AccountCtl.I.register(_user.text, _pwd.text)
-          : await AccountCtl.I.login(_user.text, _pwd.text);
-    } catch (e) {
-      // 任何落盘/解析异常都要落到界面上，绝不能让按钮永远转圈
-      err = '操作失败：$e';
-    }
-    if (!mounted) return;
-    setState(() {
-      _busy = false;
-      _err = err;
-    });
-    if (err == null) {
-      _pwd.clear();
-      _refreshCount();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(_reg ? '注册成功，已登录' : '登录成功'),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    }
-  }
-
-  @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: AccountCtl.I,
@@ -88,7 +46,7 @@ class _MinePageState extends State<MinePage> {
             const SizedBox(height: 12),
             _fingerprintCard(),
           ] else ...[
-            _loginCard(),
+            LoginForm(onDone: _refreshCount),
           ],
           const SizedBox(height: 12),
           _hintCard(),
@@ -101,77 +59,67 @@ class _MinePageState extends State<MinePage> {
   Widget _profileCard() {
     final cs = Theme.of(context).colorScheme;
     final a = AccountCtl.I;
-    final initial = (a.name != null && a.name!.isNotEmpty)
-        ? a.name![0].toUpperCase()
-        : '?';
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              CircleAvatar(
-                radius: 26,
-                backgroundColor: cs.primaryContainer,
-                child: Text(initial,
+    final initial =
+        (a.name != null && a.name!.isNotEmpty) ? a.name![0].toUpperCase() : '?';
+    return AppCard(
+      children: [
+        Row(children: [
+          CircleAvatar(
+            radius: 26,
+            backgroundColor: cs.primaryContainer,
+            child: Text(initial,
+                style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                    color: cs.onPrimaryContainer)),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(a.name ?? '',
                     style: TextStyle(
-                        fontSize: 20,
+                        fontSize: 16,
                         fontWeight: FontWeight.w600,
-                        color: cs.onPrimaryContainer)),
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(a.name ?? '',
-                        style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                            color: cs.onSurface)),
-                    const SizedBox(height: 3),
-                    Text('账号标识 ${a.uid}',
-                        style: TextStyle(
-                            fontSize: 12,
-                            fontFamily: 'Consolas',
-                            color: cs.onSurfaceVariant)),
-                  ],
-                ),
-              ),
-              IconButton.filledTonal(
-                tooltip: '退出登录',
-                icon: const Icon(Icons.logout, size: 18),
-                onPressed: () async {
-                  await AccountCtl.I.logout();
-                  if (mounted) setState(() => _reg = false);
-                },
-              ),
-            ]),
-            const SizedBox(height: 12),
-            const Divider(height: 1),
-            const SizedBox(height: 10),
-            Row(children: [
-              Icon(Icons.verified_user_outlined,
-                  size: 15, color: cs.primary),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  '已登录',
-                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                ),
-              ),
-              SizedBox(
-                height: 30,
-                child: FilledButton.tonal(
-                  onPressed: _copyFingerprint,
-                  child: const Text('复制ID'),
-                ),
-              ),
-            ]),
-          ],
-        ),
-      ),
+                        color: cs.onSurface)),
+                const SizedBox(height: 3),
+                Text('账号标识 ${a.uid}',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontFamily: 'Consolas',
+                        color: cs.onSurfaceVariant)),
+              ],
+            ),
+          ),
+          IconButton.filledTonal(
+            tooltip: '退出登录',
+            icon: const Icon(Icons.logout, size: 18),
+            onPressed: () async {
+              await AccountCtl.I.logout();
+              if (mounted) setState(() {});
+            },
+          ),
+        ]),
+        const SizedBox(height: 12),
+        const Divider(height: 1),
+        const SizedBox(height: 10),
+        Row(children: [
+          Icon(Icons.verified_user_outlined, size: 15, color: cs.primary),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('已登录',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+          ),
+          SizedBox(
+            height: 30,
+            child: FilledButton.tonal(
+              onPressed: _copyFingerprint,
+              child: const Text('复制ID'),
+            ),
+          ),
+        ]),
+      ],
     );
   }
 
@@ -187,187 +135,20 @@ class _MinePageState extends State<MinePage> {
 
   Widget _fingerprintCard() {
     final cs = Theme.of(context).colorScheme;
-    final fp = AccountCtl.I.fingerprint;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              Icon(Icons.fingerprint, size: 18, color: cs.primary),
-              const SizedBox(width: 8),
-              Text('用户ID',
-                  style: TextStyle(
-                      fontSize: 13.5,
-                      fontWeight: FontWeight.w600,
-                      color: cs.onSurface)),
-            ]),
-            const SizedBox(height: 12),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-              decoration: BoxDecoration(
-                color: cs.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: SelectableText(
-                fp,
-                style: TextStyle(
-                  fontFamily: 'Consolas',
-                  fontSize: 20,
-                  letterSpacing: 2,
-                  fontWeight: FontWeight.w600,
-                  color: cs.primary,
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: cs.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: SelectableText(
-                'luac2c --who prog.exe',
-                style: TextStyle(
-                    fontFamily: 'Consolas',
-                    fontSize: 12,
-                    color: cs.onSurfaceVariant),
-              ),
-            ),
-          ],
+    return AppCard(
+      children: [
+        const CardHeading(Icons.fingerprint, '用户ID'),
+        const SizedBox(height: 12),
+        MonoBlock(
+          AccountCtl.I.fingerprint,
+          size: 20,
+          letterSpacing: 2,
+          weight: FontWeight.w600,
+          color: cs.primary,
         ),
-      ),
-    );
-  }
-
-  // ------------------------------------------------------------ 登录 / 注册
-  Widget _loginCard() {
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(children: [
-              Container(
-                width: 34,
-                height: 34,
-                decoration: BoxDecoration(
-                  color: cs.primaryContainer,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                alignment: Alignment.center,
-                child: Icon(Icons.lock_open_outlined,
-                    size: 18, color: cs.onPrimaryContainer),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(_reg ? '创建账号' : '登录',
-                        style: TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w600,
-                            color: cs.onSurface)),
-                  ],
-                ),
-              ),
-            ]),
-            const SizedBox(height: 14),
-            SegmentedButton<bool>(
-              segments: const [
-                ButtonSegment(value: false, label: Text('登录')),
-                ButtonSegment(value: true, label: Text('注册')),
-              ],
-              selected: {_reg},
-              onSelectionChanged: (s) => setState(() {
-                _reg = s.first;
-                _err = null;
-              }),
-            ),
-            const SizedBox(height: 14),
-            TextField(
-              controller: _user,
-              enabled: !_busy,
-              textInputAction: TextInputAction.next,
-              decoration: const InputDecoration(
-                labelText: '账号',
-                hintText: '用户名',
-                prefixIcon: Icon(Icons.person_outline, size: 18),
-                isDense: true,
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _pwd,
-              enabled: !_busy,
-              obscureText: _obscure,
-              onSubmitted: (_) => _submit(),
-              decoration: InputDecoration(
-                labelText: '密码',
-                hintText: _reg ? '至少 6 位' : '',
-                prefixIcon: const Icon(Icons.lock_outline, size: 18),
-                isDense: true,
-                suffixIcon: IconButton(
-                  tooltip: _obscure ? '显示密码' : '隐藏密码',
-                  icon: Icon(
-                      _obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined,
-                      size: 18),
-                  onPressed: () => setState(() => _obscure = !_obscure),
-                ),
-              ),
-            ),
-            const SizedBox(height: 6),
-            Row(children: [
-              SizedBox(
-                height: 32,
-                width: 32,
-                child: Checkbox(
-                  value: AccountCtl.I.remember,
-                  onChanged: (v) => AccountCtl.I.setRemember(v ?? true),
-                ),
-              ),
-              const Text('记住我', style: TextStyle(fontSize: 12.5)),
-              const Spacer(),
-              TextButton(
-                onPressed: () => setState(() {
-                  _reg = true;
-                  _err = null;
-                }),
-                child: const Text('还没有账号？注册'),
-              ),
-            ]),
-            if (_err != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Row(children: [
-                  Icon(Icons.error_outline, size: 15, color: cs.error),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(_err!,
-                        style: TextStyle(fontSize: 12.5, color: cs.error)),
-                  ),
-                ]),
-              ),
-            const SizedBox(height: 12),
-            FilledButton(
-              onPressed: _busy ? null : _submit,
-              child: _busy
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2))
-                  : Text(_reg ? '注册并登录' : '登录'),
-            ),
-          ],
-        ),
-      ),
+        const SizedBox(height: 10),
+        const MonoBlock('luac2c --who prog.exe'),
+      ],
     );
   }
 
@@ -379,49 +160,18 @@ class _MinePageState extends State<MinePage> {
     } catch (_) {
       dir = '';
     }
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              Icon(Icons.info_outline, size: 16, color: cs.onSurfaceVariant),
-              const SizedBox(width: 8),
-              Text('关于账号与指纹',
-                  style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: cs.onSurface)),
-            ]),
-            const SizedBox(height: 10),
-            _row('账号库', '本机 $_users 个账号'),
-            _row('存储位置', dir),
-            _row('未登录', '暂时未对接服务器'),
-            const SizedBox(height: 8),
-            Text(
-              '账号数据全部留在本地；',
-              style: TextStyle(fontSize: 12, height: 1.5, color: cs.onSurfaceVariant),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _row(String k, String v) {
-    final cs = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        SizedBox(
-            width: 72,
-            child: Text(k, style: TextStyle(fontSize: 12, color: cs.primary))),
-        Expanded(
-          child: Text(v,
-              style: const TextStyle(fontSize: 11.5, fontFamily: 'Consolas')),
-        ),
-      ]),
+    return AppCard(
+      title: '关于账号与指纹',
+      icon: Icons.info_outlined,
+      children: [
+        InfoRow('账号库', '本机 $_users 个账号'),
+        InfoRow('存储位置', dir),
+        InfoRow('未登录', '暂时未对接服务器', mono: false),
+        const SizedBox(height: 8),
+        Text('账号数据全部留在本地；',
+            style:
+                TextStyle(fontSize: 12, height: 1.5, color: cs.onSurfaceVariant)),
+      ],
     );
   }
 }

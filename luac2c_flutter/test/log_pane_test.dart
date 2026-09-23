@@ -2,7 +2,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:luac2c_client/log_pane.dart';
-import 'package:luac2c_client/widgets.dart';
+import 'package:luac2c_client/log_store.dart';
 
 void main() {
   testWidgets('log pane renders many lines', (tester) async {

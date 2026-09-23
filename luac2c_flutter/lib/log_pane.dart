@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
 
-import 'widgets.dart';
+import 'log_store.dart';
 
 class LogPane extends StatefulWidget {
   final LogStore log;
