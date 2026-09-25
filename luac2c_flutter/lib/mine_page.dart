@@ -1,11 +1,6 @@
 // 「我的」页面：账号资料 + 用户ID + 说明。
 //
-// 登录/注册表单在 mine/login_form.dart，账号逻辑在 account.dart。
-// 登录后客户端把 uid 传给 luac2c（--fingerprint），产物里就带上这个账号的
-// 指纹。拿到一份分发出去的副本，跑
-//     luac2c --who prog.exe
-// 就能查到它是谁的。指纹只是 uid 折出来的一个 32 位数，
-// 二进制里没有明文账号，也没有可识别的水印串。
+// 表单在 mine/login_form.dart，账号与指纹的来龙去脉见 account.dart。
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
