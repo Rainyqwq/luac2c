@@ -2533,11 +2533,34 @@ static void emit_guard_runtime(FILE *out) {
         "#  include <mach-o/dyld.h>\n"
         "#endif\n\n");
 
+    /* Everything the program *writes* at run time must sit outside
+    ** [l2c_grd_a, l2c_grd_b): that span is hashed while running, so a guard
+    ** variable changing inside it would read exactly like a patch. */
     fprintf(out,
         "/* Guard state.  The noise counter is also the sink of the junk code,\n"
         "** scattered through the bodies: they form a dependency chain on it, so\n"
         "** deleting them is observable rather than free. */\n"
-        "static unsigned l2c_gflags = 0;\n\n"
+        "static unsigned l2c_gflags = 0;\n"
+        "static unsigned l2c_gsig0 = 0, l2c_grdsig0 = 0;\n"
+        /* One expected hash per 1 KiB window of the generated code, filled at
+        ** start-up.  A poll verifies a single window and moves to the next, so
+        ** the whole region is covered after one lap instead of leaving most of
+        ** it unchecked: the old fixed-stride sampler only looked at 1/97 of the
+        ** bytes, so a one-byte patch slipped past ~99% of the time. */
+        "static unsigned l2c_win[64];\n"
+        "static unsigned l2c_winn = 0;\n"
+        "static unsigned long l2c_gctr = 0;\n\n"
+        "static void l2c_grd_a (void);\n"
+        "static void l2c_grd_b (void);\n\n");
+    emit_wm_slot(out);
+
+    fprintf(out,
+        "/* Start of the guard's own protected span.  The checker is measured\n"
+        "** too: patching l2c_guard_poll (or anything else in here) to return a\n"
+        "** clean verdict now changes l2c_grdsig(), which is the move that used\n"
+        "** to defeat the whole scheme -- the guard code sat outside the span it\n"
+        "** measured, so rewriting it was invisible. */\n"
+        "static void l2c_grd_a (void) { volatile int z = 3; (void)z; }\n\n"
         "static unsigned l2c_fnv (const unsigned char *p, size_t n, unsigned h) {\n"
         "  size_t i;\n"
         "  for (i = 0; i < n; i++) { h ^= (unsigned)p[i]; h *= 16777619u; }\n"
@@ -2555,16 +2578,50 @@ static void emit_guard_runtime(FILE *out) {
         "  if (n > ((size_t)1 << 24)) n = (size_t)1 << 24;\n"
         "  return l2c_fnv(a, n, 2166136261u);\n"
         "}\n"
-        "/* Sampled variant: cheap enough to run on every function entry. */\n"
-        "static unsigned l2c_codesig_q (void) {\n"
+        "/* Hash of the guard's own span.  Sampled once and re-checked, so a\n"
+        "** late patch to the checker is caught like any other tamper. */\n"
+        "static unsigned l2c_grdsig (void) {\n"
+        "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_grd_a;\n"
+        "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_grd_b;\n"
+        "  size_t n;\n"
+        "  if (b <= a) return 0x85EBCA6Bu;\n"
+        "  n = (size_t)(b - a);\n"
+        "  if (n > ((size_t)1 << 20)) n = (size_t)1 << 20;\n"
+        "  return l2c_fnv(a, n, 0x1B873593u);\n"
+        "}\n"
+        /* Windowed code check.  l2c_win_init() hashes the protected span once
+        ** in 1 KiB slices; l2c_codechk(w) re-hashes slice w and reports whether
+        ** it drifted.  Polling verifies one slice per entry and advances, so a
+        ** patch anywhere in the region is seen within one lap -- and the cost
+        ** per entry is one slice, not the whole span.
+        ** The seed mixes the slice index in, so two identical slices do not
+        ** produce the same digest and a patch cannot be moved to a "free" one. */
+        "static void l2c_win_init (void) {\n"
         "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_sig_a;\n"
         "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_sig_b;\n"
-        "  size_t n, i; unsigned h = 2166136261u ^ 0x5Au;\n"
-        "  if (b <= a) return h;\n"
+        "  size_t n; unsigned w = 0;\n"
+        "  if (b <= a) return;\n"
         "  n = (size_t)(b - a);\n"
-        "  if (n > (size_t)65536) n = 65536;\n"
-        "  for (i = 0; i < n; i += 97) { h ^= (unsigned)a[i]; h *= 16777619u; }\n"
-        "  return h;\n"
+        "  if (n > (size_t)65536) n = (size_t)65536;\n"
+        "  while (w < 64u && n > 0u) {\n"
+        "    size_t m = (n < (size_t)1024) ? n : (size_t)1024;\n"
+        "    l2c_win[w] = l2c_fnv(a, m, 2166136261u ^ (unsigned)w);\n"
+        "    a += m; n -= m; w++;\n"
+        "  }\n"
+        "  l2c_winn = w;\n"
+        "}\n"
+        "static int l2c_codechk (unsigned w) {\n"
+        "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_sig_a;\n"
+        "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_sig_b;\n"
+        "  size_t n, off, m;\n"
+        "  if (l2c_winn == 0u || w >= l2c_winn) return 0;\n"
+        "  if (b <= a) return 0;\n"
+        "  n = (size_t)(b - a);\n"
+        "  if (n > (size_t)65536) n = (size_t)65536;\n"
+        "  off = (size_t)w * (size_t)1024;\n"
+        "  if (off >= n) return 0;\n"
+        "  m = (n - off < (size_t)1024) ? (n - off) : (size_t)1024;\n"
+        "  return l2c_fnv(a + off, m, 2166136261u ^ w) != l2c_win[w];\n"
         "}\n\n");
 
     fprintf(out,
@@ -2750,7 +2807,9 @@ static void emit_guard_runtime(FILE *out) {
     ** The magic pair is what lets the signer locate the slot in a file that
     ** has no symbols.  Verifying against the *file* rather than against
     ** memory keeps it independent of relocations. */
-    emit_wm_slot(out);
+    /* (the slot itself is emitted before l2c_grd_a, together with the other
+    ** writable guard state: it is patched by 'luac2c --sign' and must not sit
+    ** inside a span the program hashes at run time) */
     fprintf(out,
         "static int l2c_selfpath (char *buf, int n) {\n"
         "#if defined(_WIN32)\n"
@@ -2848,7 +2907,8 @@ static void emit_hookscan(FILE *out) {
 ** every generated function. */
 static void emit_guard_init(FILE *out) {
     fprintf(out,
-        "static unsigned l2c_gsig0 = 0, l2c_gsigq0 = 0;\n\n"
+        /* l2c_gsig0 / gsigq0 / grdsig0 / qstep / gctr are declared ahead of
+        ** l2c_grd_a, with the rest of the writable state. */
         "static void l2c_guard_init (void) {\n"
         "  l2c_gflags = (unsigned)l2c_scan_env();\n"
         "  if (l2c_timed()) l2c_gflags |= 512u;\n");
@@ -2856,15 +2916,17 @@ static void emit_guard_init(FILE *out) {
         fprintf(out, "  if (%s_hooks() != 0) l2c_gflags |= 32u;\n", g_api_tag);
     fprintf(out,
         "  l2c_gsig0 = l2c_codesig();\n"
-        "  l2c_gsigq0 = l2c_codesig_q();\n"
+        "  l2c_win_init();\n"
+        "  l2c_grdsig0 = l2c_grdsig();\n"
         "}\n\n"
-        "/* Cheap re-check: the sampled code signature must still match, and\n"
-        "** every 256th call re-runs the (much slower) environment scan so a\n"
-        "** Frida attach that happens after start-up is still caught. */\n"
+        "/* Cheap re-check: both code signatures must still match (the guard's\n"
+        "** own span included, so a patched checker is caught), and every 256th\n"
+        "** call re-runs the (much slower) environment scan so a Frida attach\n"
+        "** that happens after start-up is still caught. */\n"
         "static int l2c_guard_poll (void) {\n"
-        "  static unsigned long ctr = 0;\n"
-        "  if (l2c_gsigq0 != 0 && l2c_codesig_q() != l2c_gsigq0) return 1;\n"
-        "  if ((++ctr & 255u) == 0) {\n"
+        "  if (l2c_codechk((unsigned)(l2c_gctr %% (unsigned long)l2c_winn))) return 1;\n"
+        "  if ((++l2c_gctr & 255u) == 0) {\n"
+        "    if (l2c_grdsig0 != 0 && l2c_grdsig() != l2c_grdsig0) return 1;\n"
         "    if (l2c_scan_pages() != 0) return 1;\n"
         "    return (l2c_scan_env() != 0) ? 1 : 0;\n"
         "  }\n"
@@ -2874,9 +2936,20 @@ static void emit_guard_init(FILE *out) {
         "static void l2c_guard_report (void) {\n"
         "  const char *r = getenv(\"L2C_GUARD_REPORT\");\n"
         "  if (r == NULL || (r[0] != '1' && r[0] != 'y' && r[0] != 'Y')) return;\n"
-        "  fprintf(stderr, \"code=%%08X base=%%08X flags=%%u noise=%%lu\\n\",\n"
-        "          l2c_gsig0, l2c_gsigq0, l2c_gflags, l2c_noise);\n"
+        "  fprintf(stderr, \"code=%%08X guard=%%08X windows=%%u \"\n"
+        "                  \"flags=%%u noise=%%lu\\n\",\n"
+        "          l2c_gsig0, l2c_grdsig0, l2c_winn,\n"
+        "          l2c_gflags, l2c_noise);\n"
         "}\n\n");
+}
+
+/* End marker of the guard's protected span; emitted by emit_preamble after
+** every guard function (hook scan, init, poll, report) has been written. */
+static void emit_guard_end(FILE *out) {
+    fprintf(out,
+        "/* Different body from l2c_grd_a on purpose: identical marker bodies\n"
+        "** get folded together by -O2's ICF and the span collapses to zero. */\n"
+        "static void l2c_grd_b (void) { volatile int z = 4; (void)z; }\n\n");
 }
 
 static void emit_preamble(FILE *out, const char *in_path) {
@@ -2960,6 +3033,7 @@ static void emit_preamble(FILE *out, const char *in_path) {
         emit_guard_runtime(out);
         if (g_indirect) emit_hookscan(out);
         emit_guard_init(out);
+        emit_guard_end(out);   /* closes the span opened by l2c_grd_a */
     }
 
     fprintf(out,
@@ -4196,10 +4270,13 @@ static void usage(const char *prog) {
         "\n"
         "Hardening notes:\n"
         "  The generated program measures itself: a signature over the machine\n"
-        "  code of every translated function, a signature over the constant-pool\n"
-        "  blob (fixed at generation time), and forensics for a debugger, a\n"
-        "  frida/gum module, Frida's threads, LD_PRELOAD, ptrace and inline\n"
-        "  hooks on the Lua entry points.  A hit perturbs the pool key and the\n"
+        "  code of every translated function, re-checked one 1 KiB window at a\n"
+        "  time so a patch anywhere is seen within a lap; a signature over the\n"
+        "  guard code itself, so patching the checker no longer defeats it; a\n"
+        "  signature over the constant-pool blob (fixed at generation time);\n"
+        "  and forensics for a debugger, a frida/gum module, Frida's threads,\n"
+        "  LD_PRELOAD, ptrace and inline hooks on the Lua entry points.\n"
+        "  A hit perturbs the pool key and the\n"
         "  frame base, so the build keeps running on wrong data instead of\n"
         "  reporting -- there is no branch to patch out.\n"
         "  Measuring the code needs an expected value that only exists after\n"
@@ -4495,6 +4572,16 @@ int main(int argc, char **argv) {
             "  ** --l2c-sig, then rebuild with -DL2C_SIG=0x<code> to pin it. */\n"
             "#if defined(L2C_SIG) && (L2C_SIG) != 0\n"
             "  if (l2c_codesig() != (unsigned)(L2C_SIG)) l2c_gflags |= 128u;\n"
+            "#endif\n"
+            /* Only compiled with -DL2C_SELFTEST: flip one byte inside the
+            ** protected span after the baseline was taken, so the windowed
+            ** check has to notice it.  Normal builds contain none of this. */
+            "#if defined(L2C_SELFTEST) && defined(_WIN32)\n"
+            "  { unsigned char *q = (unsigned char *)(uintptr_t)&l2c_sig_a + 4;\n"
+            "    DWORD op = 0;\n"
+            "    VirtualProtect(q, 1, PAGE_EXECUTE_READWRITE, &op);\n"
+            "    *q = (unsigned char)(*q ^ 0xFFu);\n"
+            "    VirtualProtect(q, 1, op, &op); }\n"
             "#endif\n"
             "  l2c_guard_report();\n"
             "  if (argc > 1 && strcmp(argv[1], \"--l2c-sig\") == 0) {\n"
