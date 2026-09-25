@@ -835,6 +835,7 @@ static unsigned fnv32(const unsigned char *p, size_t n, unsigned h) {
 }
 
 static char *g_kblob = NULL, *g_kbuild = NULL, *g_kxor = NULL;
+static char *g_kpush = NULL, *g_koff = NULL, *g_kscrub = NULL;
 
 /* Static-hardening switches.  Both default on in diversify mode and are
 ** forced off by --static, so the reproducible baseline stays readable. */
@@ -843,6 +844,8 @@ static int  g_split    = 1;    /* 1 = one pointer-reached function per block  */
 static int  g_indirect = 1;    /* 1 = route Lua API calls through pointers   */
 static int  g_guard    = 1;    /* 1 = runtime anti-debug / anti-tamper guards */
 static int  g_opaque   = 1;    /* 1 = opaque predicates + junk + anti-disasm  */
+static int  g_mba      = 1;    /* 1 = index arithmetic as MBA identities       */
+static int  g_wipe     = 1;    /* 1 = string constants decoded on demand+wiped */
 static int  g_requiresig = 0;  /* 1 = an unsigned image counts as tampered    */
 static unsigned g_pool_sig = 0;   /* FNV of the emitted constant-pool blob    */
 static unsigned g_st_a = 1u;   /* affine state encoding: st -> (id*a + b)    */
@@ -1014,6 +1017,24 @@ static int pool_intern(Proto *p, int idx);
 ** in a signed long long, so '-9223372036854775808LL' is really an unsigned
 ** constant that is then negated and draws "integer constant is so large that
 ** it is unsigned".  Spell the boundary value as a subtraction instead. */
+/* Fetch pool entry i.  Strings go through the on-demand decoder (decode,
+** push, wipe) whenever --wipe is in force; everything else still comes out
+** of the table built at start-up. */
+static void emit_kpool(Emitter *E, int i) {
+    if (g_wipe) emit(E, "l2c_%s(L, %d)", g_kpush, i);
+    else        emit(E, "lua_rawgeti(L, KP, %d)", i + 1);
+}
+
+/* "pop one", written either as lua_pop or as the settop form that spells out
+** the same thing.  Both are the same call -- lua_pop(L,1) *is*
+** lua_settop(L, -2) -- but the long form breaks the pattern-match a reader
+** uses to spot "pop the temporary" at a glance. */
+static const char *pop1_text(void) {
+    return (g_opaque && rng_below(3) == 0)
+        ? "lua_settop(L, lua_gettop(L) - 1);"
+        : "lua_pop(L, 1);";
+}
+
 static void emit_iconst(Emitter *E, long long v) {
     if (v == LLONG_MIN) emit(E, "(-9223372036854775807LL - 1)");
     else                emit(E, "%lldLL", v);
@@ -1037,7 +1058,7 @@ static void emit_pushk(Emitter *E, Proto *p, int idx) {
             else             emit(E, "lua_pushnumber(L, (lua_Number)%.17g)", c->n);
             break;
         default:
-            if (g_pool >= 1) emit(E, "lua_rawgeti(L, KP, %d)", pool_intern(p, idx) + 1);
+            if (g_pool >= 1) emit_kpool(E, pool_intern(p, idx));
             else {
                 emit(E, "lua_pushlstring(L, ");
                 cemit_str(E->out, c->s);
@@ -1060,7 +1081,7 @@ static int emit_kkey(Emitter *E, Proto *p, int idx) {
     if (idx < 0 || idx >= p->sizek || !is_kstr(p->k[idx].tag))
         fatal("%s: constant %d is not a string key",
               p->source ? p->source : "?", idx);
-    if (g_pool >= 1) { emit(E, "lua_rawgeti(L, KP, %d)", pool_intern(p, idx) + 1); return 1; }
+    if (g_pool >= 1) { emit_kpool(E, pool_intern(p, idx)); return 1; }
     emit(E, "lua_pushlstring(L, ");
     cemit_str(E->out, p->k[idx].s);
     fprintf(E->out, ", %d)", (int)strlen(p->k[idx].s));
@@ -1658,10 +1679,14 @@ static int writes_count (int op, Instruction ins) {
 ** linear-sweep disassembler. */
 static void emit_junk(Emitter *E, const int *is_target, int ncode) {
     if (!g_opaque) return;
-    if (rng_below(100) >= 30) return;          /* keep the bloat in check */
+    /* Junk is the thing that makes a body hard to read straight through, so
+    ** it is worth more than a token sprinkle: roll again for a second helping
+    ** about a third of the time.  Cost is compile time only -- every variant
+    ** is a never-taken branch on an opaque predicate. */
+    if (rng_below(100) >= 45) return;
     int nt = 0;
     for (int i = 0; i < ncode; i++) if (is_target[i]) nt++;
-    int pick = (int)rng_below(4);
+    int pick = (int)rng_below(6);
     if (pick == 2 && nt == 0) pick = 0;
     unsigned k = rng_u32();
     switch (pick) {
@@ -1708,11 +1733,45 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
                 "if ((_q ^ (_q + 1u)) == 0u) { goto L_%d; } }\n", id);
             break;
         }
+        case 4:   /* taken: real API calls whose result only feeds the sink --
+                   ** harmless, but they force a reader to keep track of them.
+                   ** Only names that are routed through the table may appear
+                   ** here: a direct call to something outside it (lua_checkstack
+                   ** is not in the table) would show up as a plain import. */
+            emit(E,
+                "{ l2c_noise += (unsigned)lua_gettop(L); "
+                "l2c_noise += ((unsigned)lua_gettop(L) & 7u) * 3u + %uu; }\n", k);
+            break;
+        case 5:   /* never taken: push/pop pair written as its settop twin */
+            emit(E,
+                "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                "if (((_q ^ (_q + 2u)) & 3u) == 3u) { "
+                "lua_pushboolean(L, (int)(_q & 1u)); "
+                "lua_settop(L, lua_gettop(L) - 1); } }\n");
+            break;
         default:  /* never taken: an API call that would be harmless anyway */
             emit(E,
                 "{ unsigned _q = (unsigned)(uintptr_t)L; "
                 "if (((_q * 2u) & 1u) == 1u) { lua_pushnil(L); lua_pop(L, 1); } }\n");
             break;
+    }
+    if (rng_below(3) == 0) {   /* occasionally a second, different helping */
+        unsigned k2 = rng_u32();
+        switch (rng_below(3)) {
+            case 0:
+                emit(E, "{ l2c_noise ^= %uu ^ (unsigned)(uintptr_t)&l2c_noise; }\n", k2);
+                break;
+            case 1:
+                emit(E,
+                    "{ if ((l2c_noise & 0x80000000u) != 0u) l2c_noise += (unsigned)lua_gettop(L); }\n");
+                break;
+            default:
+                emit(E,
+                    "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                    "if (((_q | (_q + 1u)) & 1u) == 1u) "
+                    "{ l2c_noise = l2c_noise * 33u + %uu; } }\n", k2);
+                break;
+        }
     }
 }
 
@@ -1774,12 +1833,45 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
         ** window can address registers the compiler never counted -- so those
         ** fall back to the identity layout, which keeps R() total and
         ** consistent for the open region. */
-        if (FX->mode == 1)
-            emit(E, "#define R(r) (b + (((r) < %d) ? ((r) ^ %d) : (r)) + 1)\n",
-                 fsz, FX->xmask);
-        else
-            emit(E, "#define R(r) (b + (((r) < %d) ? %s[r] : (r)) + 1)\n",
-                 fsz, FX->mapname);
+        /* MBA (mixed boolean-arithmetic): b + idx is one addition in the
+        ** source but a xor/and/or tangle in the binary, so a decompiler does
+        ** not read it back as "base plus index".  Three provably equivalent
+        ** identities, one picked per function:
+        **   x + y == (x ^ y) + 2 * (x & y)
+        **   x + y == (x | y) + (x & y)
+        **   x + y == x - ~y - 1
+        ** idx is a literal for every real call site, so this costs nothing
+        ** at run time -- the compiler folds it back to the same addition.
+        ** Declare it as its own macro so the expression is written once:
+        ** R(r) is emitted hundreds of times per file. */
+        int mba = g_mba ? (int)rng_below(3) : -1;
+        if (mba >= 0) {
+            if (FX->mode == 1)
+                emit(E, "#define IDX(r) (((r) < %d) ? ((r) ^ %d) : (r))\n",
+                     fsz, FX->xmask);
+            else
+                emit(E, "#define IDX(r) (((r) < %d) ? %s[r] : (r))\n",
+                     fsz, FX->mapname);
+            switch (mba) {
+                case 0:
+                    emit(E, "#define R(r) (((b) ^ (IDX(r) + 1)) + 2 * ((b) & (IDX(r) + 1)))\n");
+                    break;
+                case 1:
+                    emit(E, "#define R(r) (((b) | (IDX(r) + 1)) + ((b) & (IDX(r) + 1)))\n");
+                    break;
+                default:
+                    emit(E, "#define R(r) ((b) - ~(IDX(r) + 1) - 1)\n");
+                    break;
+            }
+        } else {
+            if (FX->mode == 1)
+                emit(E, "#define R(r) (b + (((r) < %d) ? ((r) ^ %d) : (r)) + 1)\n",
+                     fsz, FX->xmask);
+            else
+                emit(E, "#define R(r) (b + (((r) < %d) ? %s[r] : (r)) + 1)\n",
+                     fsz, FX->mapname);
+        }
+
         if (FX->need_loop)
             emit(E, "#define l2c_forprep %s\n#define l2c_forloop %s\n",
                  FX->h_prep, FX->h_loop);
@@ -1969,7 +2061,7 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 if (!emit_kkey(E, p, B)) { emit(E, "/* SETTABUP: bad key */"); break; }
                 emit(E, "; ");
                 emit_pushrk(E, p, C, k);
-                if (boxed) emit(E, "; lua_settable(L, -3); lua_pop(L, 1);");
+                if (boxed) emit(E, "; lua_settable(L, -3); %s", pop1_text());
                 else       emit(E, "; lua_settable(L, lua_upvalueindex(%d));", A + 1);
                 break;
             }
@@ -2099,8 +2191,14 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
             }
             case OP_EQK: {      /* raw equality against K[B] */
                 emit_pushk(E, p, B);
-                emit(E, "; if (lua_rawequal(L, R(%d), -1) != %d) { lua_pop(L, 1); goto L_%d; } "
-                        "lua_pop(L, 1);", A, k, E_LABEL(E, pc + 2));
+                {   /* evaluated in a fixed order: pop1_text() draws from the
+                    ** RNG, so leaving it as an inline argument would make the
+                    ** output depend on the compiler's argument order */
+                    const char *p1 = pop1_text();
+                    int lbl = E_LABEL(E, pc + 2);
+                    emit(E, "; if (lua_rawequal(L, R(%d), -1) != %d) { %s goto L_%d; } %s",
+                         A, k, p1, lbl, p1);
+                }
                 break;
             }
             /* Comparison against a signed immediate sB (stored as B-OFFSET_sC).
@@ -2115,8 +2213,11 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                                 : (op == OP_LTI) ? "LUA_OPLT" : "LUA_OPLE";
                 emit(E, (C ? "lua_pushnumber(L, (lua_Number)%d); "
                            : "lua_pushinteger(L, %dLL); "), sB);
-                emit(E, "if (lua_compare(L, R(%d), -1, %s) != %d) { lua_pop(L, 1); goto L_%d; } "
-                        "lua_pop(L, 1);", A, cop, k, E_LABEL(E, pc + 2));
+                {   const char *p1 = pop1_text();
+                    int lbl = E_LABEL(E, pc + 2);
+                    emit(E, "if (lua_compare(L, R(%d), -1, %s) != %d) { %s goto L_%d; } %s",
+                         A, cop, k, p1, lbl, p1);
+                }
                 break;
             }
             case OP_GTI: case OP_GEI: {   /* immediate is the left operand */
@@ -2124,8 +2225,11 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 const char *cop = (op == OP_GTI) ? "LUA_OPLT" : "LUA_OPLE";
                 emit(E, (C ? "lua_pushnumber(L, (lua_Number)%d); "
                            : "lua_pushinteger(L, %dLL); "), sB);
-                emit(E, "if (lua_compare(L, -1, R(%d), %s) != %d) { lua_pop(L, 1); goto L_%d; } "
-                        "lua_pop(L, 1);", A, cop, k, E_LABEL(E, pc + 2));
+                {   const char *p1 = pop1_text();
+                    int lbl = E_LABEL(E, pc + 2);
+                    emit(E, "if (lua_compare(L, -1, R(%d), %s) != %d) { %s goto L_%d; } %s",
+                         A, cop, k, p1, lbl, p1);
+                }
                 break;
             }
             case OP_TEST:
@@ -2370,7 +2474,7 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     }
     /* Tear the diversification macros down again: the next function defines
     ** its own (different) ones. */
-    emit(E, "#undef b\n#undef top\n#undef ne\n#undef R\n#undef KP\n");
+    emit(E, "#undef b\n#undef top\n#undef ne\n#undef R\n#undef KP\n#undef IDX\n");
     if (FX) {
         if (FX->need_loop)
             emit(E, "#undef l2c_forprep\n#undef l2c_forloop\n");
@@ -2415,6 +2519,7 @@ static void emit_guard_runtime(FILE *out) {
         "#if defined(_WIN32)\n"
         "#  include <windows.h>\n"
         "#  include <tlhelp32.h>\n"
+        "#  include <intrin.h>\n"
         "#elif defined(__linux__)\n"
         "#  include <unistd.h>\n"
         "#  include <dirent.h>\n"
@@ -2465,7 +2570,9 @@ static void emit_guard_runtime(FILE *out) {
     fprintf(out,
         "/* Debugger / injection forensics.  Bit layout:\n"
         "**   1 = debugger attached   2 = process traced   4 = frida module mapped\n"
-        "**   8 = frida thread        16 = forced preload  32 = API prologue hooked */\n"
+        "**   8 = frida thread        16 = forced preload  32 = API prologue hooked\n"
+        "**   64 = pool signature     128 = PEB BeingDebugged\n"
+        "**   256 = PEB NtGlobalFlag  512 = single-step timing */\n"
         "static int l2c_scan_env (void) {\n"
         "  int f = 0;\n"
         "#if defined(_WIN32)\n"
@@ -2493,9 +2600,35 @@ static void emit_guard_runtime(FILE *out) {
         "        nm[i] = 0;\n"
         "        if (strstr(nm, \"frida\") || strstr(nm, \"gadget\") ||\n"
         "            strstr(nm, \"gum\")   || strstr(nm, \"jshook\") ||\n"
-        "            strstr(nm, \"substrate\") || strstr(nm, \"cycript\")) { f |= 8; break; }\n"
+        "            strstr(nm, \"substrate\") || strstr(nm, \"cycript\") ||\n"
+        /* inline-hook frameworks: their own modules are the give-away, since
+        ** a hook they plant leaves no trace in the loaded-module list */
+        "            strstr(nm, \"dobby\")   || strstr(nm, \"minhook\") ||\n"
+        "            strstr(nm, \"detours\") || strstr(nm, \"injector\")) { f |= 8; break; }\n"
         "      } while (Module32Next(h, &me));\n"
         "      CloseHandle(h);\n"
+        "    } }\n"
+        /* Read the PEB directly.  IsDebuggerPresent is the one API every
+        ** anti-anti-debug plugin hooks first; the PEB fields it reads are
+        ** still there, so this catches a debugger that only patched the API. */
+        "  { unsigned char *peb;\n"
+        "    size_t off = 0x60;\n"
+        "    if (sizeof(void *) == 4u) off = 0x30;\n"
+        "    peb = (unsigned char *)(uintptr_t)\n"
+        "#if defined(_WIN64)\n"
+        "        __readgsqword((unsigned long)off);\n"
+        "#elif defined(_M_IX86) || defined(__i386__)\n"
+        "        __readfsdword((unsigned long)off);\n"
+        "#else\n"
+        "        0;\n"
+        "#endif\n"
+        "    if (peb != NULL) {\n"
+        "      if (peb[2] != 0) f |= 128;               /* BeingDebugged */\n"
+        "      { unsigned nf;\n"
+        "        memcpy(&nf, peb + (sizeof(void *) == 8u ? 0xBC : 0x68),\n"
+        "               sizeof nf);\n"
+        /* FLG_HEAP_ENABLE_TAIL_CHECK | ENABLE_FREE | VALIDATE_PARAMETERS */
+        "        if ((nf & 0x70u) != 0u) f |= 256; }    /* NtGlobalFlag */\n"
         "    } }\n"
         "#elif defined(__linux__)\n"
         "  { FILE *fp = fopen(\"/proc/self/maps\", \"r\");\n"
@@ -2546,6 +2679,30 @@ static void emit_guard_runtime(FILE *out) {
         "}\n\n");
 
     fprintf(out,
+        "/* Timing.  A trivial loop takes microseconds on any real machine but\n"
+        "** minutes under a single-stepping tracer, so the threshold is set far\n"
+        "** above normal jitter (half a second) -- this is meant to catch a\n"
+        "** tracer, not a slow CPU.  A false positive would silently corrupt\n"
+        "** the build, so the bar is deliberately generous. */\n"
+        "static int l2c_timed (void) {\n"
+        "#if defined(_WIN32)\n"
+        "  LARGE_INTEGER a, b, f;\n"
+        "  volatile unsigned long long s = 0;\n"
+        "  long i;\n"
+        "  if (QueryPerformanceFrequency(&f) == 0 || f.QuadPart == 0) return 0;\n"
+        "  QueryPerformanceCounter(&a);\n"
+        "  for (i = 0; i < 2000000; i++) s += (unsigned long long)i;\n"
+        "  QueryPerformanceCounter(&b);\n"
+        "  (void)s;\n"
+        "  return (b.QuadPart - a.QuadPart) > (f.QuadPart / 2);\n"
+        "#else\n"
+        "  clock_t a; volatile unsigned long long s = 0; long i;\n"
+        "  a = clock();\n"
+        "  for (i = 0; i < 2000000; i++) s += (unsigned long long)i;\n"
+        "  (void)s;\n"
+        "  return (clock() - a) > (clock_t)(CLOCKS_PER_SEC / 2);\n"
+        "#endif\n"
+        "}\n\n"
         "/* The guarded span is code and must never be writable.  Frida has to\n"
         "** make it writable before it can plant a hook, so a page that reads\n"
         "** back as writable is a strong signal even when it is later restored. */\n"
@@ -2693,7 +2850,8 @@ static void emit_guard_init(FILE *out) {
     fprintf(out,
         "static unsigned l2c_gsig0 = 0, l2c_gsigq0 = 0;\n\n"
         "static void l2c_guard_init (void) {\n"
-        "  l2c_gflags = (unsigned)l2c_scan_env();\n");
+        "  l2c_gflags = (unsigned)l2c_scan_env();\n"
+        "  if (l2c_timed()) l2c_gflags |= 512u;\n");
     if (g_indirect)
         fprintf(out, "  if (%s_hooks() != 0) l2c_gflags |= 32u;\n", g_api_tag);
     fprintf(out,
@@ -2737,6 +2895,7 @@ static void emit_preamble(FILE *out, const char *in_path) {
         "#include <string.h>\n"
         "#include <math.h>\n"
         "#include <stdint.h>\n"
+        "#include <time.h>\n"
         "#include <lua.h>\n"
         "#include <lualib.h>\n"
         "#include <lauxlib.h>\n\n");
@@ -2790,10 +2949,12 @@ static void emit_preamble(FILE *out, const char *in_path) {
         fprintf(out, "\n");
     }
 
-    if (g_opaque)
-        fprintf(out,
-            "/* Sink for the junk instructions in the generated bodies. */\n"
-            "static unsigned long l2c_noise = 0;\n\n");
+    /* Declared unconditionally: the guard report below prints it, so tying the
+    ** declaration to --no-opaque left that combination failing to compile.
+    ** main() ends with (void)l2c_noise, which keeps it "used" either way. */
+    fprintf(out,
+        "/* Sink for the junk instructions in the generated bodies. */\n"
+        "static unsigned long l2c_noise = 0;\n\n");
 
     if (g_guard) {
         emit_guard_runtime(out);
@@ -2982,11 +3143,16 @@ static void emit_pool(FILE *out) {
                 g_kbuild);
         return;
     }
+    /* Byte offset of every entry in the blob, so a single constant can be
+    ** decoded on demand without walking the whole stream. */
+    unsigned *offs = (unsigned*)xcalloc((size_t)g_pool_n, sizeof(unsigned));
     fprintf(out, "static const unsigned char l2c_%s[] = {\n", g_kblob);
     /* The pool signature is taken over the encoded bytes exactly as they land
     ** in .rodata, so the generated program can re-derive and compare it. */
     unsigned sig = 0x1B873593u;
+    unsigned off = 0;
     for (int i = 0; i < g_pool_n; i++) {
+        offs[i] = off;
         PoolEnt *e = &g_pool_tab[i];
         unsigned char raw[16];
         int len = 0, tag = 0;
@@ -3011,8 +3177,16 @@ static void emit_pool(FILE *out) {
             fprintf(out, " %u,", (unsigned)enc);
         }
         fprintf(out, "\n");
+        off += (unsigned)(3 + len);
     }
     fprintf(out, "};\n\n");
+    if (g_wipe) {
+        fprintf(out, "static const unsigned l2c_%s[] = {", g_koff);
+        for (int i = 0; i < g_pool_n; i++)
+            fprintf(out, "%s%uu", i ? "," : "", offs[i]);
+        fprintf(out, "};\n\n");
+    }
+    free(offs);
     g_pool_sig = sig;
     fprintf(out, "#define L2C_POOL_SIG 0x%08Xu\n\n", g_pool_sig);
     if (g_guard)
@@ -3035,6 +3209,42 @@ static void emit_pool(FILE *out) {
         "}\n\n",
         g_kxor, g_pk1, g_pk2);
 
+    if (g_wipe) {
+        /* l2c_gflags only exists when the guard runtime is emitted; without
+        ** it the tamper word is simply zero. */
+        const char *rk = g_guard ? "l2c_gflags" : "0u";
+        fprintf(out,
+            "/* Scratch wipe.  volatile so the store survives: the buffer is\n"
+            "** dead right after, which is exactly what an optimiser deletes. */\n"
+            "static void l2c_%s (void *p, size_t n) {\n"
+            "  volatile unsigned char *q = (volatile unsigned char *)p;\n"
+            "  while (n--) *q++ = 0;\n"
+            "}\n\n"
+            "/* Decode one string constant, push it, wipe the scratch.  The pool\n"
+            "** is never expanded into a table of plaintext, so a dump taken at\n"
+            "** any moment holds only what the program is using right then -- not\n"
+            "** every string in the file. */\n"
+            "static void l2c_%s (lua_State *L, int i) {\n"
+            "  const unsigned char *p;\n"
+            "  int len, j;\n"
+            "  char small[512];\n"
+            "  char *buf;\n"
+            "  if (i < 0 || i >= %d) { lua_pushnil(L); return; }\n"
+            "  p = l2c_%s + l2c_%s[i];\n"
+            "  len = p[1] | (p[2] << 8);\n"
+            "  p += 3;\n"
+            "  buf = (len <= (int)sizeof small) ? small\n"
+            "                                   : (char *)malloc((size_t)len + 1u);\n"
+            "  if (buf == NULL) { lua_pushnil(L); return; }\n"
+            "  for (j = 0; j < len; j++)\n"
+            "    buf[j] = (char)((unsigned char)p[j] ^ l2c_%s(i, j, %s));\n"
+            "  lua_pushlstring(L, buf, (size_t)len);\n"
+            "  l2c_%s(buf, (size_t)len);\n"
+            "  if (buf != small) free(buf);\n"
+            "}\n\n",
+            g_kscrub, g_kpush, g_pool_n, g_kblob, g_koff, g_kxor, rk, g_kscrub);
+    }
+
     fprintf(out,
         "/* Decode the blob above into a Lua table (indexed from 1).  rk is the\n"
         "** guard word: on an untampered build it is 0 and the pool decodes to\n"
@@ -3050,11 +3260,16 @@ static void emit_pool(FILE *out) {
         "    int j;\n"
         "    p += 2;\n"
         "    if (tag == 3) {\n"
+        /* With --wipe the strings are decoded on demand instead: the table
+        ** keeps a nil at that index so every other entry keeps its number. */
+        "      if (%d) { lua_pushnil(L); }\n"
+        "      else {\n"
         "      luaL_Buffer b;\n"
         "      luaL_buffinit(L, &b);\n"
         "      for (j = 0; j < len; j++)\n"
         "        luaL_addchar(&b, (char)((unsigned char)p[j] ^ l2c_%s(i, j, rk)));\n"
         "      luaL_pushresult(&b);\n"
+        "      }\n"
         "    } else {\n"
         "      unsigned char raw[8];\n"
         "      for (j = 0; j < 8; j++) raw[j] = (unsigned char)(p[j] ^ l2c_%s(i, j, rk));\n"
@@ -3064,7 +3279,7 @@ static void emit_pool(FILE *out) {
         "    p += len;\n"
         "    lua_rawseti(L, -2, i + 1);\n"
         "  }\n"
-        "}\n\n", g_kbuild, g_kblob, g_pool_n, g_kxor, g_kxor);
+        "}\n\n", g_kbuild, g_kblob, g_pool_n, g_wipe ? 1 : 0, g_kxor, g_kxor);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3420,17 +3635,26 @@ static void flat_split(FILE *body, FILE *pre, const char *buf, size_t n,
 
     fprintf(body, "%sint %s(lua_State *L) {\n", kw, fn);
     fwrite(buf, 1, (size_t)(start - buf), body);
+    /* (s - b) * ainv recovers the block index.  With MBA the subtraction is
+    ** written as (x ^ y) - 2 * (~x & y), which is the same value mod 2^32 but
+    ** reads as bit twiddling rather than "state minus base". */
+    char kexp[256];
+    if (g_mba)
+        snprintf(kexp, sizeof kexp, "(((%s_s ^ %uu) - 2u * (~%s_s & %uu)) * %uu)",
+                 fn, g_st_b, fn, g_st_b, ainv);
+    else
+        snprintf(kexp, sizeof kexp, "((%s_s - %uu) * %uu)", fn, g_st_b, ainv);
     fprintf(body,
         "  { unsigned %s_s = %uu; int %s_k, %s_o = 0;\n"
         "    for (;;) {\n"
-        "      %s_k = (int)(unsigned)((%s_s - %uu) * %uu);\n"
+        "      %s_k = (int)(unsigned)(%s);\n"
         "      if (%s_k < 0 || %s_k >= %d) break;\n"
         "      %s_s = %s_d[%s_k](L, &%s, &%s, &%s, &%s_o);\n"
         "    }\n"
         "    return %s_o; }\n"
         "}\n\n",
         fn, st_enc(0), fn, fn,
-        fn, fn, g_st_b, ainv,
+        fn, kexp,
         fn, fn, nb,
         fn, fn, fn, rn[0], rn[1], rn[2], fn,
         fn);
@@ -3959,6 +4183,8 @@ static void usage(const char *prog) {
         "  --annotate      keep the /* [pc] OPCODE */ markers\n"
         "  --no-guard      no anti-debug / anti-tamper runtime (default: on)\n"
         "  --no-opaque     no opaque predicates / junk / anti-disasm (default: on)\n"
+        "  --no-mba        plain a+b instead of MBA identities (default: on)\n"
+        "  --no-wipe       decode every constant up front (default: on-demand)\n"
         "  --require-sig   treat an unsigned image as tampered (default: off)\n"
         "  --fingerprint ID\n"
         "                  stamp the build with ID so a copy can be traced\n"
@@ -4028,6 +4254,10 @@ int main(int argc, char **argv) {
             g_guard = 0;      /* no anti-debug / integrity runtime */
         } else if (strcmp(argv[i], "--no-opaque") == 0) {
             g_opaque = 0;     /* no opaque predicates / junk / anti-disasm */
+        } else if (strcmp(argv[i], "--no-mba") == 0) {
+            g_mba = 0;        /* plain a+b instead of MBA identities */
+        } else if (strcmp(argv[i], "--no-wipe") == 0) {
+            g_wipe = 0;       /* decode every constant up front (old behaviour) */
         } else if (strcmp(argv[i], "--require-sig") == 0) {
             g_requiresig = 1; /* treat an unsigned image as tampered */
         } else if (strcmp(argv[i], "--fingerprint") == 0 && i + 1 < argc) {
@@ -4055,6 +4285,7 @@ int main(int argc, char **argv) {
     ** static-hardening transform back off; diversify mode turns them on. */
     if (!g_diversify) {
         g_flatten = 0; g_split = 0; g_indirect = 0; g_guard = 0; g_opaque = 0;
+        g_mba = 0; g_wipe = 0;
     }
     if (g_diversify) {
         g_pk1  = rng_u32();                 /* two shares of the pool key */
@@ -4132,6 +4363,9 @@ int main(int argc, char **argv) {
     g_kblob  = g_diversify ? mkname("kd") : xstrdup("kdata");
     g_kbuild = g_diversify ? mkname("kb") : xstrdup("kbuild");
     g_kxor   = g_diversify ? mkname("kx") : xstrdup("kxor");
+    g_kpush  = g_diversify ? mkname("kp") : xstrdup("kpush");
+    g_koff   = g_diversify ? mkname("ko") : xstrdup("koff");
+    g_kscrub = g_diversify ? mkname("kw") : xstrdup("kwipe");
     if (g_indirect) g_api_tag = mkname("ax");
 
     /* The header needs the API tag, so it is written only once every name is
@@ -4153,6 +4387,8 @@ int main(int argc, char **argv) {
     if (g_fp_uid) emit_wm_check(out);
 
     fprintf(out, "static void l2c_%s (lua_State *L, unsigned rk);\n\n", g_kbuild);
+    if (g_wipe)
+        fprintf(out, "static void l2c_%s (lua_State *L, int i);\n\n", g_kpush);
 
     for (int i = 0; i < lcount; i++)
         fprintf(out, "%sint %s(lua_State *L);\n", (i == 0) ? "" : "static ", g_fnames[i]);
@@ -4290,8 +4526,9 @@ int main(int argc, char **argv) {
         "  status = lua_pcall(L, 0, 0, 1);\n"
         "  if (status != LUA_OK) { lua_close(L); return 1; }\n",
         g_kbuild, rkbuf, g_fnames[0]);
-    if (g_opaque)
-        fprintf(out, "  (void)l2c_noise;\n");   /* keeps the junk chain alive */
+    /* Unconditional: the variable is declared unconditionally too, and without
+    ** this reference a build with --no-opaque would warn about it. */
+    fprintf(out, "  (void)l2c_noise;\n");   /* keeps the junk chain alive */
     fprintf(out, "  lua_close(L);\n  return 0;\n}\n");
 
     if (scratch) {
