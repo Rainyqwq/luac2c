@@ -1273,6 +1273,57 @@ static void plan_function(FnCtx *C, Proto *p) {
 }
 
 /* Intern constant K[idx] of 'p' in the run-time pool; returns its index. */
+/* Hash index over the pool so the same constant is stored once.
+** Without it every proto interned its own copy, so a chunk with 200 functions
+** that all say "print" carried 200 copies: a bigger blob, a bigger run-time
+** table and more work at start-up for no benefit. */
+static int *g_pool_idx = NULL;      /* open addressing: slot -> pool index */
+static unsigned g_pool_hn = 0;      /* table size, a power of two */
+
+static unsigned pool_hash(const PoolEnt *e) {
+    unsigned char raw[8];
+    const unsigned char *p;
+    size_t n;
+    unsigned h = fnv32((const unsigned char *)&e->tag, sizeof e->tag, 2166136261u);
+    if (e->tag == KINT)      { memcpy(raw, &e->i, 8); p = raw; n = 8; }
+    else if (e->tag == KFLT) { memcpy(raw, &e->n, 8); p = raw; n = 8; }
+    else                     { p = (const unsigned char *)e->s; n = strlen(e->s); }
+    return fnv32(p, n, h);
+}
+
+static int pool_eq(const PoolEnt *a, const PoolEnt *b) {
+    if (a->tag != b->tag) return 0;
+    if (a->tag == KINT) return a->i == b->i;
+    if (a->tag == KFLT) return memcmp(&a->n, &b->n, 8) == 0;
+    return strcmp(a->s, b->s) == 0;
+}
+
+static void pool_hash_rebuild(void) {
+    unsigned want = 16;
+    while (want < (unsigned)(g_pool_n * 2 + 16)) want <<= 1;
+    free(g_pool_idx);                    /* free(NULL) is fine */
+    g_pool_idx = (int *)xmalloc((size_t)want * sizeof(int));
+    for (unsigned i = 0; i < want; i++) g_pool_idx[i] = -1;
+    g_pool_hn = want;
+    for (int i = 0; i < g_pool_n; i++) {
+        unsigned s = pool_hash(&g_pool_tab[i]) & (want - 1);
+        while (g_pool_idx[s] >= 0) s = (s + 1) & (want - 1);
+        g_pool_idx[s] = i;
+    }
+}
+
+static int pool_find(const PoolEnt *key) {
+    if (g_pool_n == 0) return -1;
+    unsigned s = pool_hash(key) & (g_pool_hn - 1);
+    for (unsigned probe = 0; probe < g_pool_hn; probe++) {
+        int idx = g_pool_idx[s];
+        if (idx < 0) return -1;
+        if (pool_eq(&g_pool_tab[idx], key)) return idx;
+        s = (s + 1) & (g_pool_hn - 1);
+    }
+    return -1;
+}
+
 static int pool_intern(Proto *p, int idx) {
     if (idx < 0 || idx >= p->sizek) return -1;
     if (!p->kmap) {
@@ -1281,16 +1332,38 @@ static int pool_intern(Proto *p, int idx) {
         for (int i = 0; i < n; i++) p->kmap[i] = -1;
     }
     if (p->kmap[idx] >= 0) return p->kmap[idx];
+
+    Constant *c = &p->k[idx];
+    PoolEnt key;
+    key.tag = c->tag; key.i = 0; key.n = 0.0; key.s = NULL;
+    if (c->tag == KINT)      key.i = (long long)c->i;
+    else if (c->tag == KFLT) key.n = c->n;
+    else                     key.s = (char *)c->s;   /* borrowed for lookup */
+
+    /* -DL2C_NO_POOL_DEDUP builds the old way (one entry per reference), which
+    ** is only useful for measuring what the dedup saves. */
+#ifndef L2C_NO_POOL_DEDUP
+    int hit = pool_find(&key);
+    if (hit >= 0) { p->kmap[idx] = hit; return hit; }
+#endif
+
     if (g_pool_n >= g_pool_cap) {
         g_pool_cap = g_pool_cap ? g_pool_cap * 2 : 64;
         g_pool_tab = (PoolEnt*)xrealloc(g_pool_tab, (size_t)g_pool_cap, sizeof(PoolEnt));
+        pool_hash_rebuild();
     }
-    Constant *c = &p->k[idx];
     PoolEnt *e = &g_pool_tab[g_pool_n];
-    e->tag = c->tag; e->i = 0; e->n = 0.0; e->s = NULL;
-    if (c->tag == KINT)      e->i = (long long)c->i;
-    else if (c->tag == KFLT) e->n = c->n;
-    else                     e->s = xstrdup(c->s);
+    e->tag = key.tag; e->i = key.i; e->n = key.n;
+    e->s = (key.tag == KINT || key.tag == KFLT) ? NULL : xstrdup(key.s);
+    /* Keep the table at half load at most.  Linear probing needs an empty
+    ** slot to stop on: a full table turns both insert and lookup into an
+    ** infinite loop. */
+    if ((unsigned)(g_pool_n + 1) * 2u > g_pool_hn) pool_hash_rebuild();
+    {
+        unsigned s = pool_hash(e) & (g_pool_hn - 1);
+        while (g_pool_idx[s] >= 0) s = (s + 1) & (g_pool_hn - 1);
+        g_pool_idx[s] = g_pool_n;
+    }
     p->kmap[idx] = g_pool_n;
     return g_pool_n++;
 }
@@ -1513,6 +1586,27 @@ static void validate_proto(Proto *p) {
                     validate_req(A + 2 + C < p->maxstack, "generic-for frame A+2+C",
                                  pc, p, A + 2 + C);
                 break;
+            /* The three Bx transfers.  Their targets were never checked, so a
+            ** crafted Bx made the emitter allocate a label for a pc that no
+            ** scan ever marks -- the generated C then says 'goto L_7' with no
+            ** L_7 and fails to compile.  A malformed chunk has to be rejected
+            ** here, with a message, not turned into a broken file. */
+            case OP_FORPREP: case OP_FORLOOP: case OP_TFORLOOP: {
+                int tgt = (op == OP_FORPREP) ? pc + 2 + Bx : pc + 1 - Bx;
+                validate_req(tgt >= 0 && tgt <= p->ncode, "loop jump target",
+                             pc, p, tgt);
+                /* R[A]..R[A+3] hold index/limit/step/control (TFORLOOP only
+                ** needs R[A] and R[A+1]). */
+                int hi = (op == OP_TFORLOOP) ? A + 1 : A + 3;
+                validate_req(hi < p->maxstack,
+                             (op == OP_TFORLOOP) ? "generic-for control A+1"
+                                                 : "loop frame A+3", pc, p, hi);
+                break;
+            }
+            /* R[A] := vararg[R[C]]: C is a register, not a constant. */
+            case OP_GETVARG:
+                validate_req(C < p->maxstack, "vararg index C", pc, p, C);
+                break;
             case OP_LOADNIL:
                 validate_req(A + B < p->maxstack, "null range A+B", pc, p, A + B);
                 break;
@@ -1733,20 +1827,22 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
                 "if ((_q ^ (_q + 1u)) == 0u) { goto L_%d; } }\n", id);
             break;
         }
-        case 4:   /* taken: real API calls whose result only feeds the sink --
-                   ** harmless, but they force a reader to keep track of them.
-                   ** Only names that are routed through the table may appear
-                   ** here: a direct call to something outside it (lua_checkstack
-                   ** is not in the table) would show up as a plain import. */
+        case 4:   /* taken: cheap arithmetic, and the only *executed* junk --
+                   ** an API call here would be paid a million times in a hot
+                   ** loop, so the call form lives in the never-taken variants
+                   ** below instead */
             emit(E,
-                "{ l2c_noise += (unsigned)lua_gettop(L); "
-                "l2c_noise += ((unsigned)lua_gettop(L) & 7u) * 3u + %uu; }\n", k);
+                "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                "l2c_noise += (_q & 0xFFFFu) + %uu; }\n", k);
             break;
-        case 5:   /* never taken: push/pop pair written as its settop twin */
+        case 5:   /* never taken: push/pop pair written as its settop twin, plus
+                   ** an API reference that costs nothing because the branch is
+                   ** provably dead -- what a reader sees, never what runs */
             emit(E,
                 "{ unsigned _q = (unsigned)(uintptr_t)L; "
                 "if (((_q ^ (_q + 2u)) & 3u) == 3u) { "
                 "lua_pushboolean(L, (int)(_q & 1u)); "
+                "l2c_noise += (unsigned)lua_gettop(L); "
                 "lua_settop(L, lua_gettop(L) - 1); } }\n");
             break;
         default:  /* never taken: an API call that would be harmless anyway */
@@ -1763,7 +1859,8 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
                 break;
             case 1:
                 emit(E,
-                    "{ if ((l2c_noise & 0x80000000u) != 0u) l2c_noise += (unsigned)lua_gettop(L); }\n");
+                    "{ if ((l2c_noise & 0x80000000u) != 0u) "
+                    "{ l2c_noise += (unsigned)((uintptr_t)L & 0xFFFFu); } }\n");
                 break;
             default:
                 emit(E,
@@ -2549,7 +2646,8 @@ static void emit_guard_runtime(FILE *out) {
         ** bytes, so a one-byte patch slipped past ~99% of the time. */
         "static unsigned l2c_win[64];\n"
         "static unsigned l2c_winn = 0;\n"
-        "static unsigned long l2c_gctr = 0;\n\n"
+        "static unsigned long l2c_gctr = 0;\n"
+        "static unsigned l2c_scan_at = 0;\n\n"
         "static void l2c_grd_a (void);\n"
         "static void l2c_grd_b (void);\n\n");
     emit_wm_slot(out);
@@ -2564,6 +2662,23 @@ static void emit_guard_runtime(FILE *out) {
         "static unsigned l2c_fnv (const unsigned char *p, size_t n, unsigned h) {\n"
         "  size_t i;\n"
         "  for (i = 0; i < n; i++) { h ^= (unsigned)p[i]; h *= 16777619u; }\n"
+        "  return h;\n"
+        "}\n\n"
+        /* The window check runs on every entry to a generated function, so a
+        ** byte-at-a-time loop was the single most expensive thing in the
+        ** program: 2000000 calls x 1024 bytes is two billion iterations, which
+        ** made an obfuscated build ~15x slower than an unobfuscated one.  Folding
+        ** machine words instead costs 1/8th of that for the same coverage. */
+        "static unsigned l2c_whash (const unsigned char *p, size_t n, unsigned h) {\n"
+        "  size_t i = 0;\n"
+        "  for (; i + sizeof(unsigned long long) <= n; i += sizeof(unsigned long long)) {\n"
+        "    unsigned long long w;\n"
+        "    memcpy(&w, p + i, sizeof w);\n"
+        "    h ^= (unsigned)w ^ (unsigned)(w >> 32);\n"
+        "    h *= 16777619u;\n"
+        "    h = (h << 13) | (h >> 19);\n"
+        "  }\n"
+        "  for (; i < n; i++) { h ^= (unsigned)p[i]; h *= 16777619u; }\n"
         "  return h;\n"
         "}\n\n"
         "static void l2c_sig_a (void);\n"
@@ -2587,7 +2702,7 @@ static void emit_guard_runtime(FILE *out) {
         "  if (b <= a) return 0x85EBCA6Bu;\n"
         "  n = (size_t)(b - a);\n"
         "  if (n > ((size_t)1 << 20)) n = (size_t)1 << 20;\n"
-        "  return l2c_fnv(a, n, 0x1B873593u);\n"
+        "  return l2c_whash(a, n, 0x1B873593u);\n"
         "}\n"
         /* Windowed code check.  l2c_win_init() hashes the protected span once
         ** in 1 KiB slices; l2c_codechk(w) re-hashes slice w and reports whether
@@ -2605,7 +2720,7 @@ static void emit_guard_runtime(FILE *out) {
         "  if (n > (size_t)65536) n = (size_t)65536;\n"
         "  while (w < 64u && n > 0u) {\n"
         "    size_t m = (n < (size_t)1024) ? n : (size_t)1024;\n"
-        "    l2c_win[w] = l2c_fnv(a, m, 2166136261u ^ (unsigned)w);\n"
+        "    l2c_win[w] = l2c_whash(a, m, 2166136261u ^ (unsigned)w);\n"
         "    a += m; n -= m; w++;\n"
         "  }\n"
         "  l2c_winn = w;\n"
@@ -2621,7 +2736,19 @@ static void emit_guard_runtime(FILE *out) {
         "  off = (size_t)w * (size_t)1024;\n"
         "  if (off >= n) return 0;\n"
         "  m = (n - off < (size_t)1024) ? (n - off) : (size_t)1024;\n"
-        "  return l2c_fnv(a + off, m, 2166136261u ^ w) != l2c_win[w];\n"
+        "  return l2c_whash(a + off, m, 2166136261u ^ w) != l2c_win[w];\n"
+        "}\n\n"
+        /* Milliseconds, for pacing the expensive scans.  A call-counted
+        ** cadence is wrong in both directions: a hot loop hits the counter
+        ** thousands of times a second and pays for a process-wide snapshot
+        ** every time (that alone was 3/4 of the run time), while a program
+        ** that calls few functions would go unscanned for minutes. */
+        "static unsigned l2c_ms (void) {\n"
+        "#if defined(_WIN32)\n"
+        "  return (unsigned)GetTickCount64();\n"
+        "#else\n"
+        "  return (unsigned)((unsigned long long)clock() * 1000ull / CLOCKS_PER_SEC);\n"
+        "#endif\n"
         "}\n\n");
 
     fprintf(out,
@@ -2924,12 +3051,24 @@ static void emit_guard_init(FILE *out) {
         "** call re-runs the (much slower) environment scan so a Frida attach\n"
         "** that happens after start-up is still caught. */\n"
         "static int l2c_guard_poll (void) {\n"
-        "  if (l2c_codechk((unsigned)(l2c_gctr %% (unsigned long)l2c_winn))) return 1;\n"
-        "  if ((++l2c_gctr & 255u) == 0) {\n"
-        "    if (l2c_grdsig0 != 0 && l2c_grdsig() != l2c_grdsig0) return 1;\n"
-        "    if (l2c_scan_pages() != 0) return 1;\n"
-        "    return (l2c_scan_env() != 0) ? 1 : 0;\n"
+        /* One window every fourth entry.  Checking on every entry is what made
+        ** obfuscated builds 15x slower; a quarter of that still walks the whole
+        ** region long before anything a patch could achieve. */
+        "  if ((l2c_gctr & 3ul) == 0ul) {\n"
+        "    unsigned long lap = l2c_gctr >> 2;\n"
+        "    if (l2c_codechk((unsigned)(lap %% (unsigned long)l2c_winn))) return 1;\n"
         "  }\n"
+        "  if ((l2c_gctr & 255ul) == 0ul) {\n"
+        "    if (l2c_grdsig0 != 0 && l2c_grdsig() != l2c_grdsig0) return 1;\n"
+        /* The two scans below walk the module list / the address space.  Run
+        ** them at most every 200 ms, whatever the call rate. */
+        "    if (l2c_ms() - l2c_scan_at >= 200u) {\n"
+        "      l2c_scan_at = l2c_ms();\n"
+        "      if (l2c_scan_pages() != 0) return 1;\n"
+        "      return (l2c_scan_env() != 0) ? 1 : 0;\n"
+        "    }\n"
+        "  }\n"
+        "  l2c_gctr++;\n"
         "  return 0;\n"
         "}\n\n"
         "/* Set L2C_GUARD_REPORT=1 to see what the guards measured. */\n"
@@ -2957,10 +3096,18 @@ static void emit_preamble(FILE *out, const char *in_path) {
     ** anyone who opened the file (and made the same seed hash differently
     ** depending on how the input was named on the command line).  --annotate
     ** is the only mode that puts the origin back. */
-    if (g_annotate && in_path && in_path[0])
-        fprintf(out, "/* Generated file from %s.  Do not edit by hand. */\n",
-                in_path);
-    else
+    if (g_annotate && in_path && in_path[0]) {
+        /* The path comes from the command line and is not ours to trust: a
+        ** name containing a comment terminator would close this comment and
+        ** put arbitrary C into the generated file.  Print it neutralised. */
+        fputs("/* Generated file from ", out);
+        for (const unsigned char *p = (const unsigned char *)in_path; *p; p++) {
+            if (*p == '*' && p[1] == '/') { fputs("*_", out); p++; }
+            else if (*p < 0x20) fputc(' ', out);
+            else fputc((int)*p, out);
+        }
+        fputs(".  Do not edit by hand. */\n", out);
+    } else
         fprintf(out, "/* Generated file.  Do not edit by hand. */\n");
     fprintf(out,
         "#include <stdio.h>\n"
