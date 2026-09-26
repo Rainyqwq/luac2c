@@ -815,17 +815,48 @@ static int  g_pool      = 1;   /* build constants at run time            */
 static unsigned long long g_rng  = 0x243F6A8885A308D3ULL;
 static unsigned long long g_nctr = 0;
 
+static void rng_warmup(void);   /* defined below, next to rng_u32 */
+
 static void rng_seed(unsigned long long s) {
     g_rng = s ? s : 0x9E3779B97F4A7C15ULL;
+    rng_warmup();
 }
 static unsigned rng_u32(void) {
     g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
     return (unsigned)(g_rng >> 32);
 }
+
+static void rng_warmup(void) {
+    /* Warm up: rng_u32() returns the high half, so a small seed (--seed 3) would
+    ** hand out zero after zero to the first callers -- the pool key came out as
+    ** 0x00000000 for small seeds, which quietly weakened every mixer that used
+    ** it.  Discarding the first rounds spreads the seed through the whole word. */
+    for (int i = 0; i < 8; i++) (void)rng_u32();
+}
 static unsigned rng_below(unsigned n) {
     return n ? (unsigned)(((unsigned long long)rng_u32() * (unsigned long long)n) >> 32) : 0;
 }
-/* FNV-1a, the exact algorithm the emitted l2c_fnv() uses.  The generator
+/* The generator's copy of the emitted l2c_h(): the file signature is computed
+** here (--sign) and re-computed in the program, so the two implementations
+** have to agree exactly.  Deliberately not FNV: 16777619 and 2166136261 are
+** two bytes each and put a marker on every checker in the binary. */
+#define L2C_H_INIT 0x3C6EF35Fu
+#define L2C_H_MUL  0x7A2D1B95u
+#define L2C_H_ADD  0x000000A7u
+
+static unsigned l2c_h_bytes(const unsigned char *p, size_t n, unsigned h) {
+    for (size_t i = 0; i < n; i++) {
+        h += (unsigned)p[i] + L2C_H_ADD;
+        h ^= h >> 13;
+        h *= L2C_H_MUL;
+        h = (h << 17) | (h >> 15);
+    }
+    return h;
+}
+
+/* FNV-1a, kept for the watermark fold only (see wm_fold): the attribution
+** path is older than this file and the client folds ids the same way.  The
+** legacy name is here so the history is obvious.  The generator
 ** needs it to pre-compute the constant-pool signature that the generated
 ** program re-derives at run time. */
 static unsigned fnv32(const unsigned char *p, size_t n, unsigned h) {
@@ -853,6 +884,20 @@ static unsigned g_pool_sig = 0;   /* FNV of the emitted constant-pool blob    */
 static unsigned g_st_a = 1u;   /* affine state encoding: st -> (id*a + b)    */
 static unsigned g_st_b = 0u;
 static unsigned g_pk1 = 0u, g_pk2 = 0u;   /* constant-pool key, two shares    */
+/* Mixer multipliers and hash seeds, all per build.  The old versions were
+** 0x9E3779B9 / 0x85EBCA6B / 0x2545F491 / 0x1B873593: recognisable constants
+** that let a reader find every mixer in the file with one search. */
+static unsigned g_mx1 = 0u, g_mx2 = 0u, g_mx3 = 0u;
+static unsigned g_hmul = 0u, g_hseed = 0u;
+
+/* One step of the emitted l2c_fnv(): the encoder walks the same bytes the
+** decoder will, so this has to match the generated code exactly. */
+static unsigned l2c_h_step(unsigned h, unsigned char b) {
+    h += (unsigned)b + 0xA7u;
+    h ^= h >> 13;
+    h *= 0x7A2D1B95u;
+    return (h << 17) | (h >> 15);
+}
 
 /* ---------------------------------------------------------------------------
 ** User watermark (--fingerprint)
@@ -985,9 +1030,9 @@ static void plan_api_table(void) {
 ** compute from the file -- see l2c_seed in the emitted code. */
 static unsigned pool_xor(int i, int j) {
     unsigned x = (g_pk1 ^ g_pk2)
-               ^ (unsigned)i * 0x9E3779B9u
-               ^ (unsigned)j * 0x85EBCA6Bu;
-    x ^= x >> 15; x *= 0x2545F491u; x ^= x >> 13;
+               ^ (unsigned)i * g_mx1
+               ^ (unsigned)j * g_mx2;
+    x ^= x >> 15; x *= g_mx3; x ^= x >> 13;
     return x & 0xffu;
 }
 
@@ -1796,8 +1841,8 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
     switch (pick) {
         case 0:   /* taken: a dependency chain on the noise sink */
             emit(E,
-                "{ unsigned _q = (unsigned)(uintptr_t)L; "
-                "if ((((_q | (_q + 1u)) & 1u) == 1u)) "
+                "{ unsigned _q = ((unsigned)(uintptr_t)L ^ (unsigned)l2c_noise); "
+                "if ((_q & 0x3FFFu) == 0x2A5u) "
                 "{ l2c_noise = l2c_noise * 33u + %uu; } }\n", k);
             break;
         case 1: { /* never taken: junk bytes that break linear disassembly */
@@ -1805,7 +1850,7 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
             unsigned b2 = rng_u32() & 0xffu, b3 = rng_u32() & 0xffu;
             emit(E,
                 "{ unsigned _q = (unsigned)(uintptr_t)L;\n"
-                "  if (((_q | (_q + 1u)) & 1u) == 0u) {\n"
+                "  if ((_q & 0x1FFFu) == 0x71Du) {\n"
                 "#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))\n"
                 "    __asm__ __volatile__(\"jmp 1f\\n\\t\"\n"
                 "      \".byte 0xE8,0x%02X,0x%02X,0x%02X,0x%02X\\n\\t\"\n"
@@ -1828,13 +1873,19 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
                 if (want-- == 0) { id = E->labels[i]; break; }
             }
             if (!id) {  /* nothing to point at: fall back to plain noise */
-                emit(E, "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                emit(E, "{ unsigned _q = ((unsigned)(uintptr_t)L ^ (unsigned)l2c_noise); "
                         "l2c_noise ^= (_q & 1u) ? 0u : %uu; }\n", k);
                 break;
             }
+            /* This body is a real jump into another block, so unlike the
+            ** others it must never be taken: an entangled predicate is
+            ** sometimes true, and "sometimes" here means a control-flow
+            ** transfer nobody wrote.  The branch is provably dead, which the
+            ** optimiser is welcome to delete; the *text* still shows a bogus
+            ** edge to anyone reading it. */
             emit(E,
-                "{ unsigned _q = (unsigned)(uintptr_t)L; "
-                "if ((_q ^ (_q + 1u)) == 0u) { goto L_%d; } }\n", id);
+                "{ unsigned _q = ((unsigned)(uintptr_t)L ^ (unsigned)l2c_noise); "
+                "if ((_q & 0u) != 0u) { goto L_%d; } }\n", id);
             break;
         }
         case 4:   /* taken: cheap arithmetic, and the only *executed* junk --
@@ -1842,22 +1893,22 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
                    ** loop, so the call form lives in the never-taken variants
                    ** below instead */
             emit(E,
-                "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                "{ unsigned _q = ((unsigned)(uintptr_t)L ^ (unsigned)l2c_noise); "
                 "l2c_noise += (_q & 0xFFFFu) + %uu; }\n", k);
             break;
         case 5:   /* never taken: push/pop pair written as its settop twin, plus
                    ** an API reference that costs nothing because the branch is
                    ** provably dead -- what a reader sees, never what runs */
             emit(E,
-                "{ unsigned _q = (unsigned)(uintptr_t)L; "
-                "if (((_q ^ (_q + 2u)) & 3u) == 3u) { "
+                "{ unsigned _q = ((unsigned)(uintptr_t)L ^ (unsigned)l2c_noise); "
+                "if ((_q & 0xFFFFu) == 0x5E37u) { "
                 "lua_pushboolean(L, (int)(_q & 1u)); "
                 "l2c_noise += (unsigned)lua_gettop(L); "
                 "lua_settop(L, lua_gettop(L) - 1); } }\n");
             break;
         default:  /* never taken: an API call that would be harmless anyway */
             emit(E,
-                "{ unsigned _q = (unsigned)(uintptr_t)L; "
+                "{ unsigned _q = ((unsigned)(uintptr_t)L ^ (unsigned)l2c_noise); "
                 "if (((_q * 2u) & 1u) == 1u) { lua_pushnil(L); lua_pop(L, 1); } }\n");
             break;
     }
@@ -1869,13 +1920,13 @@ static void emit_junk(Emitter *E, const int *is_target, int ncode) {
                 break;
             case 1:
                 emit(E,
-                    "{ if ((l2c_noise & 0x80000000u) != 0u) "
+                    "{ if (((l2c_noise ^ l2c_key) & 0x80000000u) != 0u) "
                     "{ l2c_noise += (unsigned)((uintptr_t)L & 0xFFFFu); } }\n");
                 break;
             default:
                 emit(E,
-                    "{ unsigned _q = (unsigned)(uintptr_t)L; "
-                    "if (((_q | (_q + 1u)) & 1u) == 1u) "
+                    "{ unsigned _q = ((unsigned)(uintptr_t)L ^ (unsigned)l2c_noise); "
+                    "if ((_q & 0x3FFFu) == 0x2A5u) "
                     "{ l2c_noise = l2c_noise * 33u + %uu; } }\n", k2);
                 break;
         }
@@ -2050,7 +2101,7 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     if (g_guard)
         /* The bias follows the *key*, not a flag: if the key was corrupted the
     ** registers shift, and there is no flag to clear that would undo it. */
-    emit(E, "  b = b + (int)(l2c_key != l2c_key0);\n");
+    emit(E, "  b = b + (int)((l2c_key ^ l2c_key2) != l2c_key0);\n");
     emit(E, "  lua_settop(L, b + %d);\n", fsz);
     emit(E, "  top = b + %d;\n", nparams + (isvatab ? 2 : 1));
 
@@ -2692,7 +2743,14 @@ static void emit_guard_runtime(FILE *out) {
         "static void l2c_grd_a (void) { volatile int z = 3; (void)z; }\n\n"
         "static unsigned l2c_fnv (const unsigned char *p, size_t n, unsigned h) {\n"
         "  size_t i;\n"
-        "  for (i = 0; i < n; i++) { h ^= (unsigned)p[i]; h *= 16777619u; }\n"
+        "  /* ARX, deliberately not FNV: its prime and offset basis are two\n"
+        "  ** bytes each and used to mark every checker in the file. */\n"
+        "  for (i = 0; i < n; i++) {\n"
+        "    h += (unsigned)p[i] + 0x000000A7u;\n"
+        "    h ^= h >> 13;\n"
+        "    h *= 0x7A2D1B95u;\n"
+        "    h = (h << 17) | (h >> 15);\n"
+        "  }\n"
         "  return h;\n"
         "}\n\n"
         /* The only way tamper bits are ever set: keeps l2c_flagx in step, so a
@@ -2708,14 +2766,21 @@ static void emit_guard_runtime(FILE *out) {
         ** machine words instead costs 1/8th of that for the same coverage. */
         "static unsigned l2c_whash (const unsigned char *p, size_t n, unsigned h) {\n"
         "  size_t i = 0;\n"
+        "  unsigned k = 0x3B9ACB93u;\n"
         "  for (; i + sizeof(unsigned long long) <= n; i += sizeof(unsigned long long)) {\n"
         "    unsigned long long w;\n"
         "    memcpy(&w, p + i, sizeof w);\n"
-        "    h ^= (unsigned)w ^ (unsigned)(w >> 32);\n"
-        "    h *= 16777619u;\n"
-        "    h = (h << 13) | (h >> 19);\n"
+        "    h += (unsigned)w ^ (unsigned)(w >> 32);\n"
+        "    h ^= h >> 15;\n"
+        "    h *= k;\n"
+        "    h = (h << 11) | (h >> 21);\n"
         "  }\n"
-        "  for (; i < n; i++) { h ^= (unsigned)p[i]; h *= 16777619u; }\n"
+        "  for (; i < n; i++) {\n"
+        "    h += (unsigned)p[i] + 0x000000A7u;\n"
+        "    h ^= h >> 13;\n"
+        "    h *= 0x7A2D1B95u;\n"
+        "    h = (h << 17) | (h >> 15);\n"
+        "  }\n"
         "  return h;\n"
         "}\n\n"
         "static void l2c_sig_a (void);\n"
@@ -2725,10 +2790,10 @@ static void emit_guard_runtime(FILE *out) {
         "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_sig_a;\n"
         "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_sig_b;\n"
         "  size_t n;\n"
-        "  if (b <= a) return 0x9E3779B9u;\n"
+        "  if (b <= a) return 0x3B9ACB93u;\n"
         "  n = (size_t)(b - a);\n"
         "  if (n > ((size_t)1 << 24)) n = (size_t)1 << 24;\n"
-        "  return l2c_fnv(a, n, 2166136261u);\n"
+        "  return l2c_fnv(a, n, 0x3C6EF35Fu);\n"
         "}\n"
         "/* Hash of the guard's own span.  Sampled once and re-checked, so a\n"
         "** late patch to the checker is caught like any other tamper. */\n"
@@ -2736,10 +2801,10 @@ static void emit_guard_runtime(FILE *out) {
         "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_grd_a;\n"
         "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_grd_b;\n"
         "  size_t n;\n"
-        "  if (b <= a) return 0x85EBCA6Bu;\n"
+        "  if (b <= a) return 0x7E5A1F3Du;\n"
         "  n = (size_t)(b - a);\n"
         "  if (n > ((size_t)1 << 20)) n = (size_t)1 << 20;\n"
-        "  return l2c_whash(a, n, 0x1B873593u);\n"
+        "  return l2c_whash(a, n, 0x3C6EF35Fu);\n"
         "}\n"
         /* Windowed code check.  l2c_win_init() hashes the protected span once
         ** in 1 KiB slices; l2c_codechk(w) re-hashes slice w and reports whether
@@ -2757,7 +2822,7 @@ static void emit_guard_runtime(FILE *out) {
         "  if (n > (size_t)65536) n = (size_t)65536;\n"
         "  while (w < 64u && n > 0u) {\n"
         "    size_t m = (n < (size_t)1024) ? n : (size_t)1024;\n"
-        "    l2c_win[w] = l2c_whash(a, m, 2166136261u ^ (unsigned)w);\n"
+        "    l2c_win[w] = l2c_whash(a, m, 0x3C6EF35Fu ^ (unsigned)w);\n"
         "    a += m; n -= m; w++;\n"
         "  }\n"
         "  l2c_winn = w;\n"
@@ -2773,7 +2838,7 @@ static void emit_guard_runtime(FILE *out) {
         "  off = (size_t)w * (size_t)1024;\n"
         "  if (off >= n) return 0;\n"
         "  m = (n - off < (size_t)1024) ? (n - off) : (size_t)1024;\n"
-        "  return l2c_whash(a + off, m, 2166136261u ^ w) != l2c_win[w];\n"
+        "  return l2c_whash(a + off, m, 0x3C6EF35Fu ^ w) != l2c_win[w];\n"
         "}\n\n"
         /* Milliseconds, for pacing the expensive scans.  A call-counted
         ** cadence is wrong in both directions: a hot loop hits the counter
@@ -2795,6 +2860,34 @@ static void emit_guard_runtime(FILE *out) {
         "**   64 = pool signature     128 = PEB BeingDebugged\n"
         "**   256 = PEB NtGlobalFlag  512 = single-step timing\n"
         "**   1024 = hardware breakpoint  2048 = breakpoint byte at a function entry */\n"
+        /* Names of the usual instrumentation loaders, stored as masked hashes:
+        ** as literal strings they made the checker announce itself. */
+        "static unsigned l2c_nhash (const char *p, int n) {\n"
+        "  unsigned h = 0x3C6EF35Fu;\n"
+        "  int i;\n"
+        "  for (i = 0; i < n; i++) {\n"
+        "    unsigned c = (unsigned char)p[i];\n"
+        "    if (c >= 'A' && c <= 'Z') c += 32u;\n"
+        "    h += c + 0x000000A7u;\n"
+        "    h ^= h >> 13;\n"
+        "    h *= 0x7A2D1B95u;\n"
+        "    h = (h << 17) | (h >> 15);\n"
+        "  }\n"
+        "  return h;\n"
+        "}\n"
+        "static int l2c_namehit (const char *nm) {\n"
+        "  static const unsigned bad[15] = { 0x16B50C12u, 0x9B721511u, 0xB696E214u, 0x6AB5B011u, 0x1772651Eu, 0x96BF1E10u, 0x5B20A712u, 0x7C655010u, 0x8BDE0610u, 0xD8B6941Fu, 0x03285A11u, 0x406E041Eu, 0xF3A5BC1Cu, 0xC3838012u, 0xFED3FC12u };\n"
+        "  int pos, i;\n"
+        "  for (pos = 0; nm[pos] != 0; pos++) {\n"
+        "    for (i = 0; i < 12; i++) {\n"
+        "      unsigned e = bad[i] ^ 0x5B2ED417u;\n"
+        "      int len = (int)(e & 0xFFu), k;\n"
+        "      for (k = 0; k < len && nm[pos + k] != 0; k++) ;\n"
+        "      if (k == len && l2c_nhash(nm + pos, len) == (e >> 8)) return 1;\n"
+        "    }\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n\n"
         "static int l2c_scan_env (void) {\n"
         "  int f = 0;\n"
         "#if defined(_WIN32)\n"
@@ -2802,8 +2895,19 @@ static void emit_guard_runtime(FILE *out) {
         "  { BOOL rem = FALSE;\n"
         "    CheckRemoteDebuggerPresent(GetCurrentProcess(), &rem);\n"
         "    if (rem) f |= 2; }\n"
-        "  if (GetModuleHandleA(\"frida-agent.dll\") != NULL ||\n"
-        "      GetModuleHandleA(\"frida-gadget.dll\") != NULL) f |= 4;\n"
+        /* The loader is asked about two names; keeping them as text is the
+        ** same as printing the answer beside the binary.  Masked, assembled
+        ** on the stack for the call. */
+        "  { static const unsigned char na[] = { 0x3Cu, 0x28u, 0x33u, 0x3Eu, 0x3Bu, 0x77u, 0x3Bu, 0x3Du, 0x3Fu, 0x34u, 0x2Eu, 0x74u, 0x3Eu, 0x36u, 0x36u };\n"
+        "    static const unsigned char nb[] = { 0x3Cu, 0x28u, 0x33u, 0x3Eu, 0x3Bu, 0x77u, 0x3Du, 0x3Bu, 0x3Eu, 0x3Du, 0x3Fu, 0x2Eu, 0x74u, 0x3Eu, 0x36u, 0x36u };\n"
+        "    char a[32], b[32];\n"
+        "    int i;\n"
+        "    for (i = 0; i < 15; i++) a[i] = (char)(na[i] ^ 0x5Au);\n"
+        "    a[15] = 0;\n"
+        "    for (i = 0; i < 16; i++) b[i] = (char)(nb[i] ^ 0x5Au);\n"
+        "    b[16] = 0;\n"
+        "    if (GetModuleHandleA(a) != NULL || GetModuleHandleA(b) != NULL)\n"
+        "      f |= 4; }\n"
         "  { HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE,\n"
         "                                        GetCurrentProcessId());\n"
         "    if (h != INVALID_HANDLE_VALUE) {\n"
@@ -2820,13 +2924,11 @@ static void emit_guard_runtime(FILE *out) {
         "          nm[i] = (char)c;\n"
         "        }\n"
         "        nm[i] = 0;\n"
-        "        if (strstr(nm, \"frida\") || strstr(nm, \"gadget\") ||\n"
-        "            strstr(nm, \"gum\")   || strstr(nm, \"jshook\") ||\n"
-        "            strstr(nm, \"substrate\") || strstr(nm, \"cycript\") ||\n"
+        "        if (l2c_namehit(nm) != 0) { f |= 8; break; }\n"
+
         /* inline-hook frameworks: their own modules are the give-away, since
         ** a hook they plant leaves no trace in the loaded-module list */
-        "            strstr(nm, \"dobby\")   || strstr(nm, \"minhook\") ||\n"
-        "            strstr(nm, \"detours\") || strstr(nm, \"injector\")) { f |= 8; break; }\n"
+
         "      } while (Module32Next(h, &me));\n"
         "      CloseHandle(h);\n"
         "    } }\n"
@@ -2856,8 +2958,8 @@ static void emit_guard_runtime(FILE *out) {
         "  { FILE *fp = fopen(\"/proc/self/maps\", \"r\");\n"
         "    if (fp != NULL) { char ln[1024];\n"
         "      while (fgets(ln, (int)sizeof ln, fp) != NULL) {\n"
-        "        if (strstr(ln, \"frida\") || strstr(ln, \"gadget\") ||\n"
-        "            strstr(ln, \"libgum\") || strstr(ln, \"linjector\")) { f |= 4; break; }\n"
+        "        if (l2c_namehit(ln) != 0) { f |= 4; break; }\n"
+
         "      }\n"
         "      fclose(fp); } }\n"
         "  { FILE *fp = fopen(\"/proc/self/status\", \"r\");\n"
@@ -2876,8 +2978,7 @@ static void emit_guard_runtime(FILE *out) {
         "        snprintf(pb, sizeof pb, \"/proc/self/task/%%s/comm\", e->d_name);\n"
         "        fp = fopen(pb, \"r\"); if (fp == NULL) continue;\n"
         "        if (fgets(nm, (int)sizeof nm, fp) != NULL) {\n"
-        "          if (strstr(nm, \"frida\") || strstr(nm, \"gum-js-loop\") ||\n"
-        "              strstr(nm, \"gmain\") || strstr(nm, \"gdbus\")) f |= 8;\n"
+        "          if (l2c_namehit(nm) != 0) f |= 8;\n"
         "        }\n"
         "        fclose(fp);\n"
         "      }\n"
@@ -2893,8 +2994,7 @@ static void emit_guard_runtime(FILE *out) {
         "  { uint32_t n = _dyld_image_count(), i;\n"
         "    for (i = 0; i < n; i++) { const char *nm = _dyld_get_image_name(i);\n"
         "      if (nm == NULL) continue;\n"
-        "      if (strstr(nm, \"frida\") || strstr(nm, \"gadget\") ||\n"
-        "          strstr(nm, \"libgum\")) { f |= 4; break; } } }\n"
+        "      if (l2c_namehit(nm) != 0) { f |= 4; break; } } }\n"
         "  if (getenv(\"DYLD_INSERT_LIBRARIES\") != NULL) f |= 16;\n"
         "#endif\n"
         "  return f;\n"
@@ -2906,24 +3006,40 @@ static void emit_guard_runtime(FILE *out) {
         "** above normal jitter (half a second) -- this is meant to catch a\n"
         "** tracer, not a slow CPU.  A false positive would silently corrupt\n"
         "** the build, so the bar is deliberately generous. */\n"
-        "static int l2c_timed (void) {\n"
+        /* Single-stepping slows a trivial loop by orders of magnitude, but a
+        ** fixed threshold has to guess at the machine: half a second is slow on
+        ** a 1998 laptop and generous on a 2026 desktop, and a threshold written
+        ** in the source is a threshold a tracer can be tuned against.  So the
+        ** baseline is measured in this process and the test is a ratio. */
+        "static unsigned long long l2c_cal = 0;\n"
+        /* l2c_calk is defined in the preamble (it is a per-build constant). */
+        "static unsigned long long l2c_probe (void) {\n"
         "#if defined(_WIN32)\n"
-        "  LARGE_INTEGER a, b, f;\n"
+        "  LARGE_INTEGER a, b;\n"
         "  volatile unsigned long long s = 0;\n"
         "  long i;\n"
-        "  if (QueryPerformanceFrequency(&f) == 0 || f.QuadPart == 0) return 0;\n"
+        "  if (QueryPerformanceFrequency(&a) == 0 || a.QuadPart == 0) return 0;\n"
         "  QueryPerformanceCounter(&a);\n"
-        "  for (i = 0; i < 2000000; i++) s += (unsigned long long)i;\n"
+        "  for (i = 0; i < 200000; i++) s += (unsigned long long)i;\n"
         "  QueryPerformanceCounter(&b);\n"
         "  (void)s;\n"
-        "  return (b.QuadPart - a.QuadPart) > (f.QuadPart / 2);\n"
+        "  return (unsigned long long)(b.QuadPart - a.QuadPart);\n"
         "#else\n"
         "  clock_t a; volatile unsigned long long s = 0; long i;\n"
         "  a = clock();\n"
-        "  for (i = 0; i < 2000000; i++) s += (unsigned long long)i;\n"
+        "  for (i = 0; i < 200000; i++) s += (unsigned long long)i;\n"
         "  (void)s;\n"
-        "  return (clock() - a) > (clock_t)(CLOCKS_PER_SEC / 2);\n"
+        "  return (unsigned long long)(clock() - a);\n"
         "#endif\n"
+        "}\n"
+        "static void l2c_cal_init (void) {\n"
+        "  l2c_cal = l2c_probe();\n"
+        "}\n"
+        "static int l2c_timed (void) {\n"
+        "  unsigned long long now;\n"
+        "  if (l2c_cal == 0) return 0;\n"
+        "  now = l2c_probe();\n"
+        "  return now > l2c_cal * (unsigned long long)l2c_calk;\n"
         "}\n\n"
         "/* Hardware breakpoints.  A debugger can watch our code with DR0..DR3\n"
         "** without writing a single byte, so every memory comparison in here\n"
@@ -3048,7 +3164,7 @@ static void emit_guard_runtime(FILE *out) {
         "** deleted or moved image reads as a mismatch rather than as 'clean'. */\n"
         "static unsigned l2c_img_hash (unsigned *psize) {\n"
         "  char path[1024]; FILE *fp; unsigned char tmp[4096];\n"
-        "  unsigned fa, fb, left, h = 2166136261u;\n"
+        "  unsigned fa, fb, left, h = 0x3C6EF35Fu;\n"
         "  if (psize != NULL) *psize = 0;\n"
         "  fa = l2c_sigslot[1]; fb = l2c_sigslot[2];\n"
         "  if (fa == 0u || fb <= fa) return 0;\n"
@@ -3132,8 +3248,9 @@ static void emit_guard_init(FILE *out) {
         ** clock.  Used to make the damage of a detection unpredictable rather
         ** than to gate decryption (a value that changes every run cannot be
         ** known when the blob is written). */
+        "  l2c_cal_init();\n"
         "  l2c_entropy = (unsigned)(uintptr_t)&l2c_entropy\n"
-        "               ^ (unsigned)l2c_ms() * 0x9E3779B9u;\n"
+        "               ^ (unsigned)l2c_ms() * 0x2C1B3C6Du;\n"
         "  l2c_mark((unsigned)l2c_scan_env());\n"
         "  if (l2c_timed()) l2c_mark(512u);\n");
     if (g_indirect)
@@ -3153,7 +3270,7 @@ static void emit_guard_init(FILE *out) {
         ** site compares the token across the call, so a checker that bails out
         ** early would otherwise look like a checker that never ran. */
         "  unsigned long c = l2c_gctr++;\n"
-        "  l2c_tok = (unsigned)(c * 2654435761ul + 0x9E3779B9ul);\n"
+        "  l2c_tok = (unsigned)(c * 0x9E6C63D1u + 0x3B9ACB93u);\n"
         /* A mirror that came out of step means someone wrote one of the two
         ** variables: the usual 'find the flag and clear it' move. */
         "  if (l2c_flagx != ~l2c_gflags) return 1;\n"
@@ -3172,7 +3289,9 @@ static void emit_guard_init(FILE *out) {
         /* Hardware breakpoints first: they leave no byte behind, so nothing
         ** else here can see them.  A register read for this thread; walking
         ** every thread needs a snapshot and shares the 200 ms budget below. */
-        "    if (l2c_scan_dr(0)) return 1;\n"
+        /* Register reads are cheap but not free, and a hardware breakpoint
+        ** stays armed: checking it on the same 200 ms budget as the scans
+        ** keeps the hot path from paying for it 7800 times a second. */
         "    if (l2c_ms() - l2c_scan_at >= 200u) {\n"
         "      l2c_scan_at = l2c_ms();\n"
         "      if (l2c_scan_dr(1)) return 1;\n"
@@ -3334,16 +3453,28 @@ static void emit_preamble(FILE *out, const char *in_path) {
     fprintf(out,
         "/* Sink for the junk instructions in the generated bodies. */\n"
         "static unsigned long l2c_noise = 0;\n\n");
+
+    /* Ratio for the timing check: a slowdown of 16..79 over this machine's own
+    ** measured baseline, chosen per build.  Only the guard runtime reads it. */
+    if (g_guard)
+        fprintf(out, "static const unsigned l2c_calk = %uu;\n\n",
+                16u + rng_below(64));
+
     /* Declared unconditionally: the pool decoder is emitted in every build, and
     ** a release/--static build has no guard runtime to declare them in. */
     fprintf(out,
-        "/* Run key and its saved copy.  The key is derived at run time (see\n"
+        "/* Run key and its two shares.  The key is derived at run time (see\n"
         "** l2c_seed) and every constant decodes through it, so there is no\n"
         "** clean value an attacker can restore: a wrong key means wrong\n"
         "** constants, which means the program computes the wrong thing. */\n"
-        "static unsigned l2c_key = 0u, l2c_entropy = 0u%s;\n"
-        "static void l2c_poison (void);\n\n",
-        g_guard ? ", l2c_key0 = 0u" : "");
+        "static unsigned l2c_key = 0u, l2c_key2 = 0u, l2c_entropy = 0u%s;\n"
+        "static void l2c_poison (void);\n\n%s",
+        g_guard ? ", l2c_key0 = 0u" : "",
+        /* Predicate source for the junk.  It mixes the run key, the junk chain
+        ** and an address, so neither a reader nor the optimiser can settle a
+        ** branch that uses it: the (uintptr_t)L low bits it used to read were
+        ** provably constant, and the compiler deleted the whole branch. */
+        "");
 
     if (g_guard) {
         emit_guard_runtime(out);
@@ -3538,13 +3669,21 @@ static void emit_pool(FILE *out) {
     ** only exists inside the process. */
     if (g_guard)
         fprintf(out,
-            "static void l2c_poison (void) "
-            "{ l2c_key = (l2c_key ^ l2c_entropy ^ 0x5A5A5A5Au) | 1u; "
-            "l2c_mark(0x80000000u); }\n\n");
+            "/* Both shares move, and one window digest is flipped as well: putting\n"
+            "** the key back the way it was no longer restores a clean state, the\n"
+            "** window check keeps reporting from then on. */\n"
+            "static void l2c_poison (void) {\n"
+            "  l2c_key ^= l2c_entropy | 1u;\n"
+            "  l2c_key2 ^= (l2c_entropy >> 3) | 1u;\n"
+            "  l2c_win[0] ^= 0x5A5A5A5Au;\n"
+            "  l2c_mark(0x80000000u);\n"
+            "}\n\n");
     else
         fprintf(out,
-            "static void l2c_poison (void) "
-            "{ l2c_key = (l2c_key ^ l2c_entropy ^ 0x5A5A5A5Au) | 1u; }\n\n");
+            "static void l2c_poison (void) {\n"
+            "  l2c_key ^= l2c_entropy | 1u;\n"
+            "  l2c_key2 ^= (l2c_entropy >> 3) | 1u;\n"
+            "}\n\n");
 
     if (g_pool_n == 0) {                 /* nothing to hide; keep it minimal */
         /* Same signature as the real builder: the forward declaration above
@@ -3576,11 +3715,11 @@ static void emit_pool(FILE *out) {
     fprintf(out, "static const unsigned char l2c_%s[] = {\n", g_kblob);
     /* The pool signature is taken over the encoded bytes exactly as they land
     ** in .rodata, so the generated program can re-derive and compare it. */
-    unsigned sig = 0x1B873593u;
+    unsigned sig = L2C_H_INIT;
     unsigned off = 0;
     /* The mirror of the decoder's chain: a running hash over the *ciphertext*,
     ** which both sides can compute (it does not involve the run key). */
-    unsigned chain = 0x85EBCA6Bu;
+    unsigned chain = 0x3B9ACB93u;
     for (int i = 0; i < g_pool_n; i++) {
         offs[i] = off;
         PoolEnt *e = &g_pool_tab[i];
@@ -3601,8 +3740,8 @@ static void emit_pool(FILE *out) {
             hb[0] = (unsigned char)tag; hb[1] = (unsigned char)(len & 0xff);
             hb[2] = (unsigned char)((len >> 8) & 0xff);
             for (int z = 0; z < 3; z++) {
-                sig ^= (unsigned)hb[z]; sig *= 16777619u;
-                chain ^= (unsigned)hb[z]; chain *= 0x01000193u;
+                sig = l2c_h_step(sig, hb[z]);
+                chain = l2c_h_step(chain, hb[z]);
             }
         }
         fprintf(out, "  %d,%d,%d,", tag, len & 0xff, (len >> 8) & 0xff);
@@ -3610,8 +3749,8 @@ static void emit_pool(FILE *out) {
             unsigned char b = (tag == 3) ? (unsigned char)e->s[j] : raw[j];
             unsigned char enc = (unsigned char)(b ^ pool_xor(i, j)
                                 ^ (unsigned char)(here >> ((j & 3) * 8)));
-            sig ^= (unsigned)enc; sig *= 16777619u;
-            chain ^= (unsigned)enc; chain *= 0x01000193u;
+            sig = l2c_h_step(sig, enc);
+            chain = l2c_h_step(chain, enc);
             fprintf(out, " %u,", (unsigned)enc);
         }
         fprintf(out, "\n");
@@ -3635,27 +3774,32 @@ static void emit_pool(FILE *out) {
         "static unsigned l2c_chain[%d];\n"
         "static void l2c_chain_init (void) {\n"
         "  const unsigned char *p = l2c_%s;\n"
-        "  unsigned h = 0x85EBCA6Bu;\n"
+        "  unsigned h = 0x3B9ACB93u;\n"
         "  int i;\n"
         "  for (i = 0; i < %d; i++) {\n"
         "    size_t k, m;\n"
         "    l2c_chain[i] = h;\n"
         "    m = (size_t)(p[1] | (p[2] << 8)) + 3u;\n"
-        "    for (k = 0; k < m; k++) { h ^= (unsigned)p[k]; h *= 0x01000193u; }\n"
+        "    for (k = 0; k < m; k++) {\n"
+        "      h += (unsigned)p[k] + 0x000000A7u;\n"
+        "      h ^= h >> 13;\n"
+        "      h *= 0x7A2D1B95u;\n"
+        "      h = (h << 17) | (h >> 15);\n"
+        "    }\n"
         "    p += m;\n"
         "  }\n"
         "}\n"
         "static unsigned char l2c_%s (int i, int j) {\n"
         "  unsigned s = (unsigned)(j & 3) * 8u;\n"
-        "  unsigned x = (0x%08Xu ^ 0x%08Xu) ^ (unsigned)i * 0x9E3779B9u\n"
-        "             ^ (unsigned)j * 0x85EBCA6Bu;\n"
-        "  x ^= x >> 15; x *= 0x2545F491u; x ^= x >> 13;\n"
+        "  unsigned x = (0x%08Xu ^ 0x%08Xu) ^ (unsigned)i * 0x%08Xu\n"
+        "             ^ (unsigned)j * 0x%08Xu;\n"
+        "  x ^= x >> 15; x *= 0x%08Xu; x ^= x >> 13;\n"
         /* Three terms: the build-specific static stream, the chain value (which
         ** moves if any earlier ciphertext byte was touched) and the run key
         ** (zero unless something was detected).  All three are XOR, and XOR of
         ** three quantities is still one value a reader has to trace back. */
-        "  return (unsigned char)((x ^ (l2c_chain[i] >> s) ^ (l2c_key >> s))\n"
-        "                         & 0xffu);\n"
+        "  return (unsigned char)((x ^ (l2c_chain[i] >> s)\n"
+        "                         ^ ((l2c_key ^ l2c_key2) >> s)) & 0xffu);\n"
         "}\n"
         "/* Bind the run to this process.  The plaintext of every constant was\n"
         "** written under a zero key, so an intact run recovers it exactly; the\n"
@@ -3676,14 +3820,15 @@ static void emit_pool(FILE *out) {
         "  l2c_entropy ^= s ^ (unsigned)(uintptr_t)L ^ (unsigned)(uintptr_t)&s;\n"
         "  l2c_chain_init();\n"
         "}\n\n",
-        g_pool_n ? g_pool_n : 1, g_kblob, g_pool_n, g_kbyte_n, g_pk1, g_pk2);
+        g_pool_n ? g_pool_n : 1, g_kblob, g_pool_n, g_kbyte_n, g_pk1, g_pk2,
+        g_mx1, g_mx2, g_mx3);
     fprintf(out, "#define L2C_POOL_SIG 0x%08Xu\n\n", g_pool_sig);
     if (g_guard)
         fprintf(out,
             "/* Signature of the pool blob as it sits in .rodata: a hand-edited\n"
             "** or byte-patched pool cannot match this. */\n"
             "static unsigned l2c_poolsig (void) {\n"
-            "  return l2c_fnv(l2c_%s, sizeof(l2c_%s), 0x1B873593u);\n"
+            "  return l2c_fnv(l2c_%s, sizeof(l2c_%s), 0x3C6EF35Fu);\n"
             "}\n\n", g_kblob, g_kblob);
 
     /* (the key stream itself is emitted above, next to the chain: the static
@@ -4094,6 +4239,9 @@ static void flat_split(FILE *body, FILE *pre, const char *buf, size_t n,
         fwrite(d, 1, l, pre);
     }
 
+    /* Block order is left alone on purpose: flat_split_block carries state
+    ** across calls (the per-block prologue is harvested from the text before
+    ** the first label), so reordering them is not a text-level shuffle. */
     for (int i = 0; i < nb; i++) {
         const char *s  = bstart[i];
         const char *se = (i + 1 < nb) ? lp[i + 1] : limit;
@@ -4418,11 +4566,11 @@ static size_t l2c_rva_to_off(const unsigned char *img, size_t n,
     return 0;
 }
 
-/* The slot: magic 'LCS1' at offset 0, 0x9E3779B9 at offset 28. */
+/* The slot: magic 'LCS1' at offset 0, and a second magic at offset 28. */
 static size_t l2c_find_slot(const unsigned char *img, size_t n) {
     for (size_t i = 0; i + 32 <= n; i += 4) {
         if (l2c_rd32(img + i) == 0x3143534Cu &&
-            l2c_rd32(img + i + 28) == 0x9E3779B9u) {
+            l2c_rd32(img + i + 28) == 0x3B9ACB93u) {
             unsigned f = l2c_rd32(img + i + 12);
             if (f == 0u || f == 1u) return i;
         }
@@ -4435,7 +4583,7 @@ static void emit_wm_slot(FILE *out) {
     ** signer writes 1..5 and never touches it, so the word survives signing. */
     fprintf(out,
         "static unsigned l2c_sigslot[8] = {\n"
-        "  0x3143534Cu, 0u, 0u, 0u, 0u, 0u, 0x%08Xu, 0x9E3779B9u\n"
+        "  0x3143534Cu, 0u, 0u, 0u, 0u, 0u, 0x%08Xu, 0x3B9ACB93u\n"
         "};\n\n", g_fp_wm);
 }
 
@@ -4478,7 +4626,7 @@ static int cmd_sign(int argc, char **argv) {
     }
     size_t span = fb - fa;
     if (span > ((size_t)1 << 24)) span = (size_t)1 << 24;
-    unsigned h = fnv32(img + fa, span, 2166136261u);
+    unsigned h = l2c_h_bytes(img + fa, span, L2C_H_INIT);
     l2c_wr32(img + slot + 4, (unsigned)fa);
     l2c_wr32(img + slot + 8, (unsigned)fb);
     l2c_wr32(img + slot + 12, 1u);
@@ -4781,9 +4929,18 @@ int main(int argc, char **argv) {
         g_flatten = 0; g_split = 0; g_indirect = 0; g_guard = 0; g_opaque = 0;
         g_mba = 0; g_wipe = 0;
     }
+    if (g_mx1 == 0u) {                      /* --static: fixed, still not FNV */
+        g_mx1 = 0x2C1B3C6Du; g_mx2 = 0x5D2A4F17u; g_mx3 = 0x6B8E3AC1u;
+        g_hmul = 0x01000193u; g_hseed = 0x3C6EF35Fu;
+    }
     if (g_diversify) {
         g_pk1  = rng_u32();                 /* two shares of the pool key */
         g_pk2  = rng_u32();
+        g_mx1  = rng_u32() | 1u;            /* odd: the mixer is invertible   */
+        g_mx2  = rng_u32() | 1u;
+        g_mx3  = rng_u32() | 1u;
+        g_hmul = rng_u32() | 1u;
+        g_hseed = rng_u32();
         g_st_a = rng_u32() | 1u;            /* odd => bijection mod 2^32  */
         if (g_st_a == 1u) g_st_a = 3u;
         g_st_b = rng_u32();
