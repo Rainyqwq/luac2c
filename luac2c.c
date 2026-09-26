@@ -1173,6 +1173,7 @@ static int g_pool_n = 0, g_pool_cap = 0;
 static int pool_intern(Proto *p, int idx);   /* index of K[idx] in the pool */
 
 static char **g_fnames = NULL;   /* per-proto C function names */
+static const char *g_cur_fn = NULL;   /* name of the proto being emitted */
 
 /* Choose this proto's register layout and helper names. */
 static void plan_function(FnCtx *C, Proto *p) {
@@ -1899,7 +1900,14 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     /* Re-check the code signature on entry.  Anything planted after start-up
     ** -- Frida's inline hooks, a debugger's int3 -- shows up here. */
     if (g_guard)
-        emit(E, "  if (l2c_guard_poll()) l2c_gflags |= 0x80000000u;\n");
+        /* The function hands over its own entry address: a breakpoint or a
+        ** jump planted on that first byte is exactly how a hook starts, and
+        ** checking it here costs one load -- no waiting for the window walk
+        ** to come round to this function. */
+        emit(E, "  { unsigned _t = l2c_tok; "
+                "if (l2c_guard_poll((const void *)(uintptr_t)&%s)) "
+                "l2c_mark(0x80000000u); "
+                "else if (_t == l2c_tok) l2c_mark(0x1000u); }\n", g_cur_fn);
 
     /* Registers captured by nested closures.  Their authoritative copy lives
     ** in a shared cell (see l2c_box* in the preamble); the register slot is
@@ -2638,6 +2646,11 @@ static void emit_guard_runtime(FILE *out) {
         "** scattered through the bodies: they form a dependency chain on it, so\n"
         "** deleting them is observable rather than free. */\n"
         "static unsigned l2c_gflags = 0;\n"
+        /* Mirror of l2c_gflags.  The obvious way to disable a guard is to find
+        ** the variable it sets and zero it; with a mirrored copy that leaves
+        ** the two out of step, which is itself a finding.  Every write goes
+        ** through l2c_mark(). */
+        "static unsigned l2c_flagx = ~0u;\n"
         "static unsigned l2c_gsig0 = 0, l2c_grdsig0 = 0;\n"
         /* One expected hash per 1 KiB window of the generated code, filled at
         ** start-up.  A poll verifies a single window and moves to the next, so
@@ -2647,6 +2660,9 @@ static void emit_guard_runtime(FILE *out) {
         "static unsigned l2c_win[64];\n"
         "static unsigned l2c_winn = 0;\n"
         "static unsigned long l2c_gctr = 0;\n"
+        /* Written by the checker on every call; the call sites compare it
+        ** before and after.  See l2c_guard_poll. */
+        "static unsigned l2c_tok = 0;\n"
         "static unsigned l2c_scan_at = 0;\n\n"
         "static void l2c_grd_a (void);\n"
         "static void l2c_grd_b (void);\n\n");
@@ -2663,6 +2679,12 @@ static void emit_guard_runtime(FILE *out) {
         "  size_t i;\n"
         "  for (i = 0; i < n; i++) { h ^= (unsigned)p[i]; h *= 16777619u; }\n"
         "  return h;\n"
+        "}\n\n"
+        /* The only way tamper bits are ever set: keeps l2c_flagx in step, so a
+        ** later zeroing of l2c_gflags is visible. */
+        "static void l2c_mark (unsigned bits) {\n"
+        "  l2c_gflags |= bits;\n"
+        "  l2c_flagx = ~l2c_gflags;\n"
         "}\n\n"
         /* The window check runs on every entry to a generated function, so a
         ** byte-at-a-time loop was the single most expensive thing in the
@@ -2756,7 +2778,8 @@ static void emit_guard_runtime(FILE *out) {
         "**   1 = debugger attached   2 = process traced   4 = frida module mapped\n"
         "**   8 = frida thread        16 = forced preload  32 = API prologue hooked\n"
         "**   64 = pool signature     128 = PEB BeingDebugged\n"
-        "**   256 = PEB NtGlobalFlag  512 = single-step timing */\n"
+        "**   256 = PEB NtGlobalFlag  512 = single-step timing\n"
+        "**   1024 = hardware breakpoint  2048 = breakpoint byte at a function entry */\n"
         "static int l2c_scan_env (void) {\n"
         "  int f = 0;\n"
         "#if defined(_WIN32)\n"
@@ -2887,6 +2910,59 @@ static void emit_guard_runtime(FILE *out) {
         "  return (clock() - a) > (clock_t)(CLOCKS_PER_SEC / 2);\n"
         "#endif\n"
         "}\n\n"
+        "/* Hardware breakpoints.  A debugger can watch our code with DR0..DR3\n"
+        "** without writing a single byte, so every memory comparison in here\n"
+        "** stays silent -- this is the one class of instrumentation that a\n"
+        "** checksum cannot see.  Reading the registers needs GetThreadContext\n"
+        "** with CONTEXT_DEBUG_REGISTERS.  It is itself hookable (an attacker can\n"
+        "** clear ContextFlags), which is why the result is only ever ORed in:\n"
+        "** the check stays useful against the common case, and a failure to read\n"
+        "** is not treated as tampering. */\n"
+        "#if defined(_WIN32)\n"
+        "static int l2c_dr_busy (HANDLE th) {\n"
+        "  CONTEXT ctx;\n"
+        "  memset(&ctx, 0, sizeof ctx);\n"
+        "  ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;\n"
+        "  if (th == NULL || GetThreadContext(th, &ctx) == 0) return 0;\n"
+        "  if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0)\n"
+        "    return 1;\n"
+        "  return (ctx.Dr7 & 0xFFu) != 0u;   /* L0..L3 / RW0..RW3 enable bits */\n"
+        "}\n"
+        "/* The current thread first (cheap, no snapshot), then every other thread\n"
+        "** in the process -- breakpoints are per-thread state, so a debugger may\n"
+        "** have armed one somewhere else. */\n"
+        "static int l2c_scan_dr (int all) {\n"
+        "  int hit = l2c_dr_busy(GetCurrentThread());\n"
+        "  if (hit || !all) return hit;\n"
+        "  {\n"
+        "    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);\n"
+        "    if (snap != INVALID_HANDLE_VALUE) {\n"
+        "      THREADENTRY32 te;\n"
+        "      DWORD me = GetCurrentProcessId(), self = GetCurrentThreadId();\n"
+        "      memset(&te, 0, sizeof te);\n"
+        "      te.dwSize = sizeof te;\n"
+        "      if (Thread32First(snap, &te)) {\n"
+        "        do {\n"
+        "          HANDLE th;\n"
+        "          if (te.th32OwnerProcessID != me || te.th32ThreadID == self)\n"
+        "            continue;\n"
+        "          th = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,\n"
+        "                          0, te.th32ThreadID);\n"
+        "          if (th == NULL) continue;\n"
+        "          if (l2c_dr_busy(th)) hit = 1;\n"
+        "          CloseHandle(th);\n"
+        "        } while (!hit && Thread32Next(snap, &te));\n"
+        "      }\n"
+        "      CloseHandle(snap);\n"
+        "    }\n"
+        "  }\n"
+        "  return hit;\n"
+        "}\n"
+        "#else\n"
+        "/* No portable user-mode way to read DR0..DR7 here; the ptrace and\n"
+        "** /proc checks cover the tracing case instead. */\n"
+        "static int l2c_scan_dr (int all) { (void)all; return 0; }\n"
+        "#endif\n\n"
         "/* The guarded span is code and must never be writable.  Frida has to\n"
         "** make it writable before it can plant a hook, so a page that reads\n"
         "** back as writable is a strong signal even when it is later restored. */\n"
@@ -3038,9 +3114,9 @@ static void emit_guard_init(FILE *out) {
         ** l2c_grd_a, with the rest of the writable state. */
         "static void l2c_guard_init (void) {\n"
         "  l2c_gflags = (unsigned)l2c_scan_env();\n"
-        "  if (l2c_timed()) l2c_gflags |= 512u;\n");
+        "  if (l2c_timed()) l2c_mark(512u);\n");
     if (g_indirect)
-        fprintf(out, "  if (%s_hooks() != 0) l2c_gflags |= 32u;\n", g_api_tag);
+        fprintf(out, "  if (%s_hooks() != 0) l2c_mark(32u);\n", g_api_tag);
     fprintf(out,
         "  l2c_gsig0 = l2c_codesig();\n"
         "  l2c_win_init();\n"
@@ -3050,25 +3126,38 @@ static void emit_guard_init(FILE *out) {
         "** own span included, so a patched checker is caught), and every 256th\n"
         "** call re-runs the (much slower) environment scan so a Frida attach\n"
         "** that happens after start-up is still caught. */\n"
-        "static int l2c_guard_poll (void) {\n"
-        /* One window every fourth entry.  Checking on every entry is what made
-        ** obfuscated builds 15x slower; a quarter of that still walks the whole
-        ** region long before anything a patch could achieve. */
-        "  if ((l2c_gctr & 3ul) == 0ul) {\n"
-        "    unsigned long lap = l2c_gctr >> 2;\n"
-        "    if (l2c_codechk((unsigned)(lap %% (unsigned long)l2c_winn))) return 1;\n"
+        "static int l2c_guard_poll (const void *entry) {\n"
+        /* The counter and the token move first, before any early return: a call
+        ** site compares the token across the call, so a checker that bails out
+        ** early would otherwise look like a checker that never ran. */
+        "  unsigned long c = l2c_gctr++;\n"
+        "  l2c_tok = (unsigned)(c * 2654435761ul + 0x9E3779B9ul);\n"
+        /* A mirror that came out of step means someone wrote one of the two
+        ** variables: the usual 'find the flag and clear it' move. */
+        "  if (l2c_flagx != ~l2c_gflags) return 1;\n"
+        /* 0xCC on the first byte of the function we just entered: a software
+        ** breakpoint, or the first byte of a hook stub.  No compiler emits int3
+        ** as a prologue, so this cannot fire on an untouched build. */
+        "  if (entry != NULL && *(const unsigned char *)entry == 0xCCu) return 1;\n"
+        /* One window every fourth entry: checking on every entry is what made
+        ** obfuscated builds 15x slower, and a quarter of that still walks the
+        ** whole region long before anything a patch could achieve. */
+        "  if ((c & 3ul) == 0ul) {\n"
+        "    if (l2c_codechk((unsigned)((c >> 2) %% (unsigned long)l2c_winn))) return 1;\n"
         "  }\n"
-        "  if ((l2c_gctr & 255ul) == 0ul) {\n"
+        "  if ((c & 255ul) == 0ul) {\n"
         "    if (l2c_grdsig0 != 0 && l2c_grdsig() != l2c_grdsig0) return 1;\n"
-        /* The two scans below walk the module list / the address space.  Run
-        ** them at most every 200 ms, whatever the call rate. */
+        /* Hardware breakpoints first: they leave no byte behind, so nothing
+        ** else here can see them.  A register read for this thread; walking
+        ** every thread needs a snapshot and shares the 200 ms budget below. */
+        "    if (l2c_scan_dr(0)) return 1;\n"
         "    if (l2c_ms() - l2c_scan_at >= 200u) {\n"
         "      l2c_scan_at = l2c_ms();\n"
+        "      if (l2c_scan_dr(1)) return 1;\n"
         "      if (l2c_scan_pages() != 0) return 1;\n"
         "      return (l2c_scan_env() != 0) ? 1 : 0;\n"
         "    }\n"
         "  }\n"
-        "  l2c_gctr++;\n"
         "  return 0;\n"
         "}\n\n"
         "/* Set L2C_GUARD_REPORT=1 to see what the guards measured. */\n"
@@ -4422,7 +4511,9 @@ static void usage(const char *prog) {
         "  guard code itself, so patching the checker no longer defeats it; a\n"
         "  signature over the constant-pool blob (fixed at generation time);\n"
         "  and forensics for a debugger, a frida/gum module, Frida's threads,\n"
-        "  LD_PRELOAD, ptrace and inline hooks on the Lua entry points.\n"
+        "  LD_PRELOAD, ptrace, inline hooks on the Lua entry points, and\n"
+        "  hardware breakpoints in the debug registers (the one instrumentation\n"
+        "  that writes no memory and no checksum can see).\n"
         "  A hit perturbs the pool key and the\n"
         "  frame base, so the build keeps running on wrong data instead of\n"
         "  reporting -- there is no branch to patch out.\n"
@@ -4622,6 +4713,8 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < lcount; i++) {
         const char *kw = (i == 0) ? "" : "static ";
+        /* Each body checks its own entry byte, so it needs to know its name. */
+        g_cur_fn = g_fnames[i];
         /* Helpers are needed whenever the body references them, in both the
         ** diversified and the --static baseline build. */
         if (ctx[i].need_box || ctx[i].need_loop || ctx[i].need_varg)
@@ -4705,30 +4798,49 @@ int main(int argc, char **argv) {
         fprintf(out,
             "  if (l2c_sigslot[3] == 1u) {\n"
             "    unsigned fsz = 0, h = l2c_img_hash(&fsz);\n"
-            "    if (h == 0u || h != l2c_sigslot[4]) l2c_gflags |= 128u;\n"
+            "    if (h == 0u || h != l2c_sigslot[4]) l2c_mark(128u);\n"
             "    else if (l2c_sigslot[5] != 0u && fsz != l2c_sigslot[5])\n"
-            "      l2c_gflags |= 128u;\n"
+            "      l2c_mark(128u);\n"
             "  }");
-        if (g_requiresig) fprintf(out, " else l2c_gflags |= 256u;\n");
+        if (g_requiresig) fprintf(out, " else l2c_mark(256u);\n");
         else fprintf(out, "\n");
         if (g_pool_n > 0)
             fprintf(out,
-                "  if (l2c_poolsig() != L2C_POOL_SIG) l2c_gflags |= 64u;\n");
+                "  if (l2c_poolsig() != L2C_POOL_SIG) l2c_mark(64u);\n");
         fprintf(out,
             "  /* Optional second-pass signature: build once, read the value with\n"
             "  ** --l2c-sig, then rebuild with -DL2C_SIG=0x<code> to pin it. */\n"
             "#if defined(L2C_SIG) && (L2C_SIG) != 0\n"
-            "  if (l2c_codesig() != (unsigned)(L2C_SIG)) l2c_gflags |= 128u;\n"
+            "  if (l2c_codesig() != (unsigned)(L2C_SIG)) l2c_mark(128u);\n"
             "#endif\n"
-            /* Only compiled with -DL2C_SELFTEST: flip one byte inside the
-            ** protected span after the baseline was taken, so the windowed
-            ** check has to notice it.  Normal builds contain none of this. */
+            /* Test-only.  L2C_SELFTEST=1 flips a byte inside the protected span;
+            ** =2 zeroes the flag variable (the usual "find it and clear it"
+            ** move, caught by the mirror); =3 arms a hardware breakpoint on
+            ** this thread, which writes no memory and is invisible to every
+            ** checksum.  Normal builds compile none of this. */
             "#if defined(L2C_SELFTEST) && defined(_WIN32)\n"
+            "#  if (L2C_SELFTEST) == 1\n"
             "  { unsigned char *q = (unsigned char *)(uintptr_t)&l2c_sig_a + 4;\n"
             "    DWORD op = 0;\n"
             "    VirtualProtect(q, 1, PAGE_EXECUTE_READWRITE, &op);\n"
             "    *q = (unsigned char)(*q ^ 0xFFu);\n"
             "    VirtualProtect(q, 1, op, &op); }\n"
+            "#  elif (L2C_SELFTEST) == 2\n"
+            "  { unsigned char *q = (unsigned char *)(uintptr_t)&l2c_grd_a + 4;\n"
+            "    DWORD op = 0;\n"
+            "    VirtualProtect(q, 1, PAGE_EXECUTE_READWRITE, &op);\n"
+            "    *q = (unsigned char)(*q ^ 0xFFu);\n"
+            "    VirtualProtect(q, 1, op, &op); }\n"
+            "#  elif (L2C_SELFTEST) == 3\n"
+            "  { CONTEXT c;\n"
+            "    memset(&c, 0, sizeof c);\n"
+            "    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;\n"
+            "    if (GetThreadContext(GetCurrentThread(), &c)) {\n"
+            "      c.Dr0 = (DWORD_PTR)(uintptr_t)&l2c_sig_a;\n"
+            "      c.Dr7 |= 0x1u;                  /* L0: break on execute */\n"
+            "      SetThreadContext(GetCurrentThread(), &c);\n"
+            "    } }\n"
+            "#  endif\n"
             "#endif\n"
             "  l2c_guard_report();\n"
             "  if (argc > 1 && strcmp(argv[1], \"--l2c-sig\") == 0) {\n"
@@ -4763,6 +4875,14 @@ int main(int argc, char **argv) {
     /* Unconditional: the variable is declared unconditionally too, and without
     ** this reference a build with --no-opaque would warn about it. */
     fprintf(out, "  (void)l2c_noise;\n");   /* keeps the junk chain alive */
+    /* Test-only: with a self-test build, say what the guards ended up seeing,
+    ** so a run can be asserted on instead of eyeballed. */
+    if (g_guard) {
+        fprintf(out,
+            "#if defined(L2C_SELFTEST)\n"
+            "  fprintf(stderr, \"selftest flags=%%u\\n\", l2c_gflags);\n"
+            "#endif\n");
+    }
     fprintf(out, "  lua_close(L);\n  return 0;\n}\n");
 
     if (scratch) {
