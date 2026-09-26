@@ -834,8 +834,9 @@ static unsigned fnv32(const unsigned char *p, size_t n, unsigned h) {
     return h;
 }
 
-static char *g_kblob = NULL, *g_kbuild = NULL, *g_kxor = NULL;
+static char *g_kblob = NULL, *g_kbuild = NULL;
 static char *g_kpush = NULL, *g_koff = NULL, *g_kscrub = NULL;
+static char *g_kbyte_n = NULL;   /* the run-time keyed byte stream */
 
 /* Static-hardening switches.  Both default on in diversify mode and are
 ** forced off by --static, so the reproducible baseline stays readable. */
@@ -846,6 +847,7 @@ static int  g_guard    = 1;    /* 1 = runtime anti-debug / anti-tamper guards */
 static int  g_opaque   = 1;    /* 1 = opaque predicates + junk + anti-disasm  */
 static int  g_mba      = 1;    /* 1 = index arithmetic as MBA identities       */
 static int  g_wipe     = 1;    /* 1 = string constants decoded on demand+wiped */
+static int  g_release  = 0;    /* 1 = strip comments, flatten all names    */
 static int  g_requiresig = 0;  /* 1 = an unsigned image counts as tampered    */
 static unsigned g_pool_sig = 0;   /* FNV of the emitted constant-pool blob    */
 static unsigned g_st_a = 1u;   /* affine state encoding: st -> (id*a + b)    */
@@ -977,9 +979,10 @@ static void plan_api_table(void) {
     g_api_ntab = size;
 }
 
-/* Constant-pool keystream.  Positional only in shape; the value is a keyed
-** mixer so the three constants that used to describe it no longer invert it
-** on inspection.  The generated decoder emits exactly this expression. */
+/* Constant-pool keystream, the *static* half: the blob is stored XOR'd with
+** this, so a dump of .rodata does not read as text.  The decoder adds a
+** run-time pad on top (l2c_padf), which is the half an attacker cannot
+** compute from the file -- see l2c_seed in the emitted code. */
 static unsigned pool_xor(int i, int j) {
     unsigned x = (g_pk1 ^ g_pk2)
                ^ (unsigned)i * 0x9E3779B9u
@@ -1002,8 +1005,13 @@ static char *xstrdup(const char *s) {
 }
 static char *mkname(const char *pfx) {
     char tmp[64];
-    snprintf(tmp, sizeof tmp, "%s%02x%llx", pfx,
-             (unsigned)(rng_u32() & 0xffu), g_nctr++ & 0xfffffULL);
+    /* Release builds drop the per-purpose prefix as well: nothing in the name
+    ** says whether it is a helper, a table or a function. */
+    if (g_release)
+        snprintf(tmp, sizeof tmp, "a%llu", g_nctr++ & 0xfffffULL);
+    else
+        snprintf(tmp, sizeof tmp, "%s%02x%llx", pfx,
+                 (unsigned)(rng_u32() & 0xffu), g_nctr++ & 0xfffffULL);
     return xstrdup(tmp);
 }
 
@@ -1906,9 +1914,8 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
         ** checking it here costs one load -- no waiting for the window walk
         ** to come round to this function. */
         emit(E, "  { unsigned _t = l2c_tok; "
-                "if (l2c_guard_poll((const void *)(uintptr_t)&%s)) "
-                "l2c_mark(0x80000000u); "
-                "else if (_t == l2c_tok) l2c_mark(0x1000u); }\n", g_cur_fn);
+                "if (l2c_guard_poll((const void *)(uintptr_t)&%s) "
+                "|| _t == l2c_tok) l2c_poison(); }\n", g_cur_fn);
 
     /* Registers captured by nested closures.  Their authoritative copy lives
     ** in a shared cell (see l2c_box* in the preamble); the register slot is
@@ -2041,7 +2048,9 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     ** the neighbouring slot, so the program keeps running and keeps exiting 0
     ** while silently computing nonsense -- there is no branch to flip back. */
     if (g_guard)
-        emit(E, "  b = b + (int)(l2c_gflags != 0u);\n");
+        /* The bias follows the *key*, not a flag: if the key was corrupted the
+    ** registers shift, and there is no flag to clear that would undo it. */
+    emit(E, "  b = b + (int)(l2c_key != l2c_key0);\n");
     emit(E, "  lua_settop(L, b + %d);\n", fsz);
     emit(E, "  top = b + %d;\n", nparams + (isvatab ? 2 : 1));
 
@@ -3119,9 +3128,12 @@ static void emit_guard_init(FILE *out) {
         /* l2c_gsig0 / gsigq0 / grdsig0 / qstep / gctr are declared ahead of
         ** l2c_grd_a, with the rest of the writable state. */
         "static void l2c_guard_init (void) {\n"
-        /* Through l2c_mark, not a plain assignment: the mirror has to follow
-        ** from the very first write, or a start-up finding would look like a
-        ** tampered mirror at the next poll. */
+        /* Entropy from this run only: a stack address that ASLR places, and the
+        ** clock.  Used to make the damage of a detection unpredictable rather
+        ** than to gate decryption (a value that changes every run cannot be
+        ** known when the blob is written). */
+        "  l2c_entropy = (unsigned)(uintptr_t)&l2c_entropy\n"
+        "               ^ (unsigned)l2c_ms() * 0x9E3779B9u;\n"
         "  l2c_mark((unsigned)l2c_scan_env());\n"
         "  if (l2c_timed()) l2c_mark(512u);\n");
     if (g_indirect)
@@ -3201,7 +3213,8 @@ static void emit_preamble(FILE *out, const char *in_path) {
     ** anyone who opened the file (and made the same seed hash differently
     ** depending on how the input was named on the command line).  --annotate
     ** is the only mode that puts the origin back. */
-    if (g_annotate && in_path && in_path[0]) {
+    if (g_release) { /* release builds carry no banner at all */ }
+    else if (g_annotate && in_path && in_path[0]) {
         /* The path comes from the command line and is not ours to trust: a
         ** name containing a comment terminator would close this comment and
         ** put arbitrary C into the generated file.  Print it neutralised. */
@@ -3261,15 +3274,56 @@ static void emit_preamble(FILE *out, const char *in_path) {
                 t, g_api_slot[i], i, t, i, g_api_names[i], kk);
         }
         fprintf(out, "}\n");
-        for (int i = 0; i < n; i++) {
-            unsigned long long kk = g_api_k64[i];
-            fprintf(out,
-                "#undef %s\n"
-                "#define %s(...)  ((%s_pt%d)((intptr_t)"
-                "%s_t[%u].m%d ^ ((intptr_t)(uintptr_t)%s_k"
-                " ^ (intptr_t)0x%016llXULL)))(__VA_ARGS__)\n",
-                g_api_names[i], g_api_names[i], t, i,
-                t, g_api_slot[i], i, t, kk);
+        /* The 42 entry points are emitted in a shuffled order, and each
+        ** expansion spells its XOR a different way.  The point is that reading
+        ** one call site teaches nothing about the next: the same key recovery
+        ** appears as x^y, (x|y)-(x&y), (x+y)-2*(x&y) or ~(~x^y) depending on
+        ** where it is. */
+        {
+            int *ord = (int*)xmalloc((size_t)n * sizeof(int));
+            for (int i = 0; i < n; i++) ord[i] = i;
+            for (int i = n - 1; i > 0; i--) {
+                int j = (int)rng_below((unsigned)(i + 1));
+                int tmp = ord[i]; ord[i] = ord[j]; ord[j] = tmp;
+            }
+            for (int oi = 0; oi < n; oi++) {
+                int i = ord[oi];
+                unsigned long long kk = g_api_k64[i];
+                /* x ^ (k ^ K) written four equivalent ways */
+                const char *forms[4] = {
+                    "((intptr_t)%s_t[%u].m%d ^ ((intptr_t)(uintptr_t)%s_k"
+                        " ^ (intptr_t)0x%016llXULL))",
+                    "((((intptr_t)%s_t[%u].m%d | ((intptr_t)(uintptr_t)%s_k"
+                        " ^ (intptr_t)0x%016llXULL))"
+                        " - ((intptr_t)%s_t[%u].m%d & ((intptr_t)(uintptr_t)%s_k"
+                        " ^ (intptr_t)0x%016llXULL))))",
+                    "((((intptr_t)%s_t[%u].m%d + ((intptr_t)(uintptr_t)%s_k"
+                        " ^ (intptr_t)0x%016llXULL))"
+                        " - 2 * ((intptr_t)%s_t[%u].m%d & ((intptr_t)(uintptr_t)%s_k"
+                        " ^ (intptr_t)0x%016llXULL))))",
+                    /* x ^ y == (x & ~y) + (y & ~x) */
+                    "((((intptr_t)%s_t[%u].m%d & ~((intptr_t)(uintptr_t)%s_k"
+                        " ^ (intptr_t)0x%016llXULL))"
+                        " + (((intptr_t)(uintptr_t)%s_k"
+                        " ^ (intptr_t)0x%016llXULL) & ~(intptr_t)%s_t[%u].m%d)))"
+                };
+                int f = (int)rng_below(4);
+                fprintf(out, "#undef %s\n#define %s(...)  ((%s_pt%d)",
+                        g_api_names[i], g_api_names[i], t, i);
+                if (f == 0)
+                    fprintf(out, forms[0], t, g_api_slot[i], i, t, kk);
+                else if (f == 1)
+                    fprintf(out, forms[1], t, g_api_slot[i], i, t, kk,
+                            t, g_api_slot[i], i, t, kk);
+                else if (f == 2)
+                    fprintf(out, forms[2], t, g_api_slot[i], i, t, kk,
+                            t, g_api_slot[i], i, t, kk);
+                else
+                    fprintf(out, forms[3], t, g_api_slot[i], i, t, kk,
+                            t, kk, t, g_api_slot[i], i);
+                fprintf(out, ")(__VA_ARGS__)\n");
+            }
+            free(ord);
         }
         fprintf(out, "\n");
     }
@@ -3280,6 +3334,16 @@ static void emit_preamble(FILE *out, const char *in_path) {
     fprintf(out,
         "/* Sink for the junk instructions in the generated bodies. */\n"
         "static unsigned long l2c_noise = 0;\n\n");
+    /* Declared unconditionally: the pool decoder is emitted in every build, and
+    ** a release/--static build has no guard runtime to declare them in. */
+    fprintf(out,
+        "/* Run key and its saved copy.  The key is derived at run time (see\n"
+        "** l2c_seed) and every constant decodes through it, so there is no\n"
+        "** clean value an attacker can restore: a wrong key means wrong\n"
+        "** constants, which means the program computes the wrong thing. */\n"
+        "static unsigned l2c_key = 0u, l2c_entropy = 0u%s;\n"
+        "static void l2c_poison (void);\n\n",
+        g_guard ? ", l2c_key0 = 0u" : "");
 
     if (g_guard) {
         emit_guard_runtime(out);
@@ -3464,14 +3528,46 @@ static void emit_helpers(FILE *out, FnCtx *C) {
 ** a Lua table, so no string or number from the original chunk survives as a
 ** literal in the object file. */
 static void emit_pool(FILE *out) {
+    /* Key corruption, defined in every build: the pool builder calls it when
+    ** the guard word is non-zero, so it always has a caller. */
+    /* On an intact run the key is 0 and every constant decodes to its real
+    ** value.  A detection sets it to something derived from this run's
+    ** addresses and clock, so the corrupted stream differs from run to run:
+    ** there is no fixed "post-patch" output an attacker can aim for, and no
+    ** clean value to write back -- only the real key would do, and that one
+    ** only exists inside the process. */
+    if (g_guard)
+        fprintf(out,
+            "static void l2c_poison (void) "
+            "{ l2c_key = (l2c_key ^ l2c_entropy ^ 0x5A5A5A5Au) | 1u; "
+            "l2c_mark(0x80000000u); }\n\n");
+    else
+        fprintf(out,
+            "static void l2c_poison (void) "
+            "{ l2c_key = (l2c_key ^ l2c_entropy ^ 0x5A5A5A5Au) | 1u; }\n\n");
+
     if (g_pool_n == 0) {                 /* nothing to hide; keep it minimal */
         /* Same signature as the real builder: the forward declaration above
         ** takes (L, rk) and main calls it that way, so a one-argument stub was
         ** a conflicting-types error in every empty-pool build (--no-pool, or a
         ** chunk whose constants never reach the pool). */
         fprintf(out, "static void l2c_%s (lua_State *L, unsigned rk) "
-                     "{ (void)rk; lua_createtable(L, 0, 0); }\n\n",
+                     "{ if (rk != 0u) l2c_poison(); lua_createtable(L, 0, 0); }\n\n",
                 g_kbuild);
+        /* main always calls l2c_seed before the builder, and --wipe forward
+        ** declares the on-demand decoder either way: with no blob there is
+        ** nothing to chain, but both symbols still have to exist and stay
+        ** referenced (an unused static function is a warning). */
+        if (g_wipe)
+            fprintf(out, "static void l2c_%s (lua_State *L, int i) "
+                         "{ (void)i; lua_pushnil(L); }\n"
+                         "static void l2c_seed (lua_State *L) { (void)L; "
+                         "(void)&l2c_%s; "
+                         "l2c_entropy ^= (unsigned)(uintptr_t)&l2c_entropy; }\n\n",
+                    g_kpush, g_kpush);
+        else
+            fprintf(out, "static void l2c_seed (lua_State *L) { (void)L; "
+                         "l2c_entropy ^= (unsigned)(uintptr_t)&l2c_entropy; }\n\n");
         return;
     }
     /* Byte offset of every entry in the blob, so a single constant can be
@@ -3482,6 +3578,9 @@ static void emit_pool(FILE *out) {
     ** in .rodata, so the generated program can re-derive and compare it. */
     unsigned sig = 0x1B873593u;
     unsigned off = 0;
+    /* The mirror of the decoder's chain: a running hash over the *ciphertext*,
+    ** which both sides can compute (it does not involve the run key). */
+    unsigned chain = 0x85EBCA6Bu;
     for (int i = 0; i < g_pool_n; i++) {
         offs[i] = off;
         PoolEnt *e = &g_pool_tab[i];
@@ -3494,17 +3593,25 @@ static void emit_pool(FILE *out) {
         } else {
             len = (int)strlen(e->s); tag = 3;
         }
+        /* The decoder holds the chain value from *before* this entry, so it is
+        ** captured first and the entry's own bytes are folded in afterwards. */
+        unsigned here = chain;
         {   /* the three header bytes belong to the blob as well */
             unsigned char hb[3];
             hb[0] = (unsigned char)tag; hb[1] = (unsigned char)(len & 0xff);
             hb[2] = (unsigned char)((len >> 8) & 0xff);
-            for (int z = 0; z < 3; z++) { sig ^= (unsigned)hb[z]; sig *= 16777619u; }
+            for (int z = 0; z < 3; z++) {
+                sig ^= (unsigned)hb[z]; sig *= 16777619u;
+                chain ^= (unsigned)hb[z]; chain *= 0x01000193u;
+            }
         }
         fprintf(out, "  %d,%d,%d,", tag, len & 0xff, (len >> 8) & 0xff);
         for (int j = 0; j < len; j++) {
             unsigned char b = (tag == 3) ? (unsigned char)e->s[j] : raw[j];
-            unsigned char enc = (unsigned char)(b ^ pool_xor(i, j));
+            unsigned char enc = (unsigned char)(b ^ pool_xor(i, j)
+                                ^ (unsigned char)(here >> ((j & 3) * 8)));
             sig ^= (unsigned)enc; sig *= 16777619u;
+            chain ^= (unsigned)enc; chain *= 0x01000193u;
             fprintf(out, " %u,", (unsigned)enc);
         }
         fprintf(out, "\n");
@@ -3519,6 +3626,57 @@ static void emit_pool(FILE *out) {
     }
     free(offs);
     g_pool_sig = sig;
+
+    /* Per-entry chain: a hash over the ciphertext that precedes the entry,
+    ** seeded with the run key.  A patched ciphertext byte therefore shifts the
+    ** key stream of every later entry, and those constants decode to garbage
+    ** that goes straight into the program's own arithmetic. */
+    fprintf(out,
+        "static unsigned l2c_chain[%d];\n"
+        "static void l2c_chain_init (void) {\n"
+        "  const unsigned char *p = l2c_%s;\n"
+        "  unsigned h = 0x85EBCA6Bu;\n"
+        "  int i;\n"
+        "  for (i = 0; i < %d; i++) {\n"
+        "    size_t k, m;\n"
+        "    l2c_chain[i] = h;\n"
+        "    m = (size_t)(p[1] | (p[2] << 8)) + 3u;\n"
+        "    for (k = 0; k < m; k++) { h ^= (unsigned)p[k]; h *= 0x01000193u; }\n"
+        "    p += m;\n"
+        "  }\n"
+        "}\n"
+        "static unsigned char l2c_%s (int i, int j) {\n"
+        "  unsigned s = (unsigned)(j & 3) * 8u;\n"
+        "  unsigned x = (0x%08Xu ^ 0x%08Xu) ^ (unsigned)i * 0x9E3779B9u\n"
+        "             ^ (unsigned)j * 0x85EBCA6Bu;\n"
+        "  x ^= x >> 15; x *= 0x2545F491u; x ^= x >> 13;\n"
+        /* Three terms: the build-specific static stream, the chain value (which
+        ** moves if any earlier ciphertext byte was touched) and the run key
+        ** (zero unless something was detected).  All three are XOR, and XOR of
+        ** three quantities is still one value a reader has to trace back. */
+        "  return (unsigned char)((x ^ (l2c_chain[i] >> s) ^ (l2c_key >> s))\n"
+        "                         & 0xffu);\n"
+        "}\n"
+        "/* Bind the run to this process.  The plaintext of every constant was\n"
+        "** written under a zero key, so an intact run recovers it exactly; the\n"
+        "** material gathered here is what a poisoned key is made of, and it\n"
+        "** cannot be reproduced offline.  The Lua call is real and its result is\n"
+        "** consumed: hooking it changes the key instead of hiding a flag. */\n"
+        "static void l2c_seed (lua_State *L) {\n"
+        "  unsigned s;\n"
+        /* The caller has already pushed values it needs (the error handler and
+        ** the global table, which become upvalues of the chunk): only the slot
+        ** pushed here may be removed, so the top is saved and restored rather
+        ** than zeroed. */
+        "  int top = lua_gettop(L);\n"
+        "  lua_pushinteger(L, 7);\n"
+        "  { const char *t = lua_tolstring(L, -1, NULL);\n"
+        "    s = (unsigned)(uintptr_t)t; }\n"
+        "  lua_settop(L, top);\n"
+        "  l2c_entropy ^= s ^ (unsigned)(uintptr_t)L ^ (unsigned)(uintptr_t)&s;\n"
+        "  l2c_chain_init();\n"
+        "}\n\n",
+        g_pool_n ? g_pool_n : 1, g_kblob, g_pool_n, g_kbyte_n, g_pk1, g_pk2);
     fprintf(out, "#define L2C_POOL_SIG 0x%08Xu\n\n", g_pool_sig);
     if (g_guard)
         fprintf(out,
@@ -3528,17 +3686,8 @@ static void emit_pool(FILE *out) {
             "  return l2c_fnv(l2c_%s, sizeof(l2c_%s), 0x1B873593u);\n"
             "}\n\n", g_kblob, g_kblob);
 
-    fprintf(out,
-        "static unsigned char l2c_%s (int i, int j, unsigned rk) {\n"
-        /* Hex, not decimal: a decimal 10 next to '^' makes GCC read the line
-        ** as a power and fire -Wxor-used-as-pow (part of -Wall). */
-        "  unsigned x = (0x%08Xu ^ 0x%08Xu ^ rk)\n"
-        "             ^ (unsigned)i * 0x9E3779B9u\n"
-        "             ^ (unsigned)j * 0x85EBCA6Bu;\n"
-        "  x ^= x >> 15; x *= 0x2545F491u; x ^= x >> 13;\n"
-        "  return (unsigned char)(x & 0xffu);\n"
-        "}\n\n",
-        g_kxor, g_pk1, g_pk2);
+    /* (the key stream itself is emitted above, next to the chain: the static
+    ** half lives there with the blob it decodes) */
 
     if (g_wipe) {
         /* l2c_gflags only exists when the guard runtime is emitted; without
@@ -3568,12 +3717,12 @@ static void emit_pool(FILE *out) {
             "                                   : (char *)malloc((size_t)len + 1u);\n"
             "  if (buf == NULL) { lua_pushnil(L); return; }\n"
             "  for (j = 0; j < len; j++)\n"
-            "    buf[j] = (char)((unsigned char)p[j] ^ l2c_%s(i, j, %s));\n"
+            "    buf[j] = (char)((unsigned char)p[j] ^ l2c_%s(i, j));\n"
             "  lua_pushlstring(L, buf, (size_t)len);\n"
             "  l2c_%s(buf, (size_t)len);\n"
             "  if (buf != small) free(buf);\n"
             "}\n\n",
-            g_kscrub, g_kpush, g_pool_n, g_kblob, g_koff, g_kxor, rk, g_kscrub);
+            g_kscrub, g_kpush, g_pool_n, g_kblob, g_koff, g_kbyte_n, g_kscrub);
     }
 
     fprintf(out,
@@ -3582,6 +3731,10 @@ static void emit_pool(FILE *out) {
         "** the original constants; anything else shifts the stream, so the\n"
         "** program keeps running on corrupted data instead of reporting. */\n"
         "static void l2c_%s (lua_State *L, unsigned rk) {\n"
+        /* A non-zero guard word means the checks that ran at start-up found
+        ** something: corrupt the key, so every constant from here on decodes
+        ** to the wrong value and the program's own arithmetic goes wrong. */
+        "  if (rk != 0u) l2c_poison();\n"
         "  const unsigned char *p = l2c_%s;\n"
         "  int i, n = %d;\n"
         "  lua_createtable(L, n, 0);\n"
@@ -3598,19 +3751,19 @@ static void emit_pool(FILE *out) {
         "      luaL_Buffer b;\n"
         "      luaL_buffinit(L, &b);\n"
         "      for (j = 0; j < len; j++)\n"
-        "        luaL_addchar(&b, (char)((unsigned char)p[j] ^ l2c_%s(i, j, rk)));\n"
+        "        luaL_addchar(&b, (char)((unsigned char)p[j] ^ l2c_%s(i, j)));\n"
         "      luaL_pushresult(&b);\n"
         "      }\n"
         "    } else {\n"
         "      unsigned char raw[8];\n"
-        "      for (j = 0; j < 8; j++) raw[j] = (unsigned char)(p[j] ^ l2c_%s(i, j, rk));\n"
+        "      for (j = 0; j < 8; j++) raw[j] = (unsigned char)(p[j] ^ l2c_%s(i, j));\n"
         "      if (tag == 1) { lua_Integer v; memcpy(&v, raw, 8); lua_pushinteger(L, v); }\n"
         "      else           { lua_Number  v; memcpy(&v, raw, 8); lua_pushnumber(L, v); }\n"
         "    }\n"
         "    p += len;\n"
         "    lua_rawseti(L, -2, i + 1);\n"
         "  }\n"
-        "}\n\n", g_kbuild, g_kblob, g_pool_n, g_wipe ? 1 : 0, g_kxor, g_kxor);
+        "}\n\n", g_kbuild, g_kblob, g_pool_n, g_wipe ? 1 : 0, g_kbyte_n, g_kbyte_n);
 }
 
 /* ---------------------------------------------------------------------------
@@ -4069,7 +4222,7 @@ static void scrub_write(FILE *dst, const char *buf, size_t n, ScrubMap *m) {
         if (c == '/' && i + 1 < n && buf[i + 1] == '/') {   /* line comment */
             size_t j = i;
             while (j < n && buf[j] != '\n') j++;
-            fwrite(buf + i, 1, j - i, dst);
+            if (!g_release) fwrite(buf + i, 1, j - i, dst);
             i = j;
             continue;
         }
@@ -4077,7 +4230,9 @@ static void scrub_write(FILE *dst, const char *buf, size_t n, ScrubMap *m) {
             size_t j = i + 2;
             while (j + 1 < n && !(buf[j] == '*' && buf[j + 1] == '/')) j++;
             j = (j + 1 < n) ? j + 2 : n;
-            fwrite(buf + i, 1, j - i, dst);
+            /* A dropped comment leaves its line behind; emit nothing and let
+            ** the blank line stand rather than trying to be clever about it. */
+            if (!g_release) fwrite(buf + i, 1, j - i, dst);
             i = j;
             continue;
         }
@@ -4516,6 +4671,7 @@ static void usage(const char *prog) {
         "  --no-opaque     no opaque predicates / junk / anti-disasm (default: on)\n"
         "  --no-mba        plain a+b instead of MBA identities (default: on)\n"
         "  --no-wipe       decode every constant up front (default: on-demand)\n"
+        "  --l2c-release   strip comments, flatten names, shuffle emitted order\n"
         "  --require-sig   treat an unsigned image as tampered (default: off)\n"
         "  --fingerprint ID\n"
         "                  stamp the build with ID so a copy can be traced\n"
@@ -4594,6 +4750,8 @@ int main(int argc, char **argv) {
             g_mba = 0;        /* plain a+b instead of MBA identities */
         } else if (strcmp(argv[i], "--no-wipe") == 0) {
             g_wipe = 0;       /* decode every constant up front (old behaviour) */
+        } else if (strcmp(argv[i], "--l2c-release") == 0) {
+            g_release = 1;    /* no comments, opaque names, shuffled macro order */
         } else if (strcmp(argv[i], "--require-sig") == 0) {
             g_requiresig = 1; /* treat an unsigned image as tampered */
         } else if (strcmp(argv[i], "--fingerprint") == 0 && i + 1 < argc) {
@@ -4698,7 +4856,7 @@ int main(int argc, char **argv) {
     }
     g_kblob  = g_diversify ? mkname("kd") : xstrdup("kdata");
     g_kbuild = g_diversify ? mkname("kb") : xstrdup("kbuild");
-    g_kxor   = g_diversify ? mkname("kx") : xstrdup("kxor");
+    g_kbyte_n = g_diversify ? mkname("kb2") : xstrdup("kbyte");
     g_kpush  = g_diversify ? mkname("kp") : xstrdup("kpush");
     g_koff   = g_diversify ? mkname("ko") : xstrdup("koff");
     g_kscrub = g_diversify ? mkname("kw") : xstrdup("kwipe");
@@ -4819,20 +4977,20 @@ int main(int argc, char **argv) {
         fprintf(out,
             "  if (l2c_sigslot[3] == 1u) {\n"
             "    unsigned fsz = 0, h = l2c_img_hash(&fsz);\n"
-            "    if (h == 0u || h != l2c_sigslot[4]) l2c_mark(128u);\n"
+            "    if (h == 0u || h != l2c_sigslot[4]) l2c_poison();\n"
             "    else if (l2c_sigslot[5] != 0u && fsz != l2c_sigslot[5])\n"
-            "      l2c_mark(128u);\n"
+            "      l2c_poison();\n"
             "  }");
-        if (g_requiresig) fprintf(out, " else l2c_mark(256u);\n");
+        if (g_requiresig) fprintf(out, " else l2c_poison();\n");
         else fprintf(out, "\n");
         if (g_pool_n > 0)
             fprintf(out,
-                "  if (l2c_poolsig() != L2C_POOL_SIG) l2c_mark(64u);\n");
+                "  if (l2c_poolsig() != L2C_POOL_SIG) l2c_poison();\n");
         fprintf(out,
             "  /* Optional second-pass signature: build once, read the value with\n"
             "  ** --l2c-sig, then rebuild with -DL2C_SIG=0x<code> to pin it. */\n"
             "#if defined(L2C_SIG) && (L2C_SIG) != 0\n"
-            "  if (l2c_codesig() != (unsigned)(L2C_SIG)) l2c_mark(128u);\n"
+            "  if (l2c_codesig() != (unsigned)(L2C_SIG)) l2c_poison();\n"
             "#endif\n"
             /* Test-only.  L2C_SELFTEST=1 flips a byte inside the protected span;
             ** =2 zeroes the flag variable (the usual "find it and clear it"
@@ -4888,7 +5046,8 @@ int main(int argc, char **argv) {
         "  luaL_openlibs(L);\n"
         "  lua_pushcclosure(L, l2c_report, 0);\n"
         "  lua_pushglobaltable(L);\n"
-        "  l2c_%s(L, %s);\n"      /* _ENV, then the constant pool */
+        "  l2c_seed(L);\n"          /* key first: the pool decodes through it */
+        "  l2c_%s(L, %s);\n"        /* _ENV, then the constant pool */
         "  lua_pushcclosure(L, %s, 2);\n"
         "  status = lua_pcall(L, 0, 0, 1);\n"
         "  if (status != LUA_OK) { lua_close(L); return 1; }\n",
