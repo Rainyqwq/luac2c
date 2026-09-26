@@ -1596,12 +1596,13 @@ static void validate_proto(Proto *p) {
                 int tgt = (op == OP_FORPREP) ? pc + 2 + Bx : pc + 1 - Bx;
                 validate_req(tgt >= 0 && tgt <= p->ncode, "loop jump target",
                              pc, p, tgt);
-                /* R[A]..R[A+3] hold index/limit/step/control (TFORLOOP only
-                ** needs R[A] and R[A+1]). */
-                int hi = (op == OP_TFORLOOP) ? A + 1 : A + 3;
+                /* Numeric for keeps three slots (lvm.c: ra = counter, ra+1 =
+                ** step, ra+2 = control variable) -- there is no ra+3, so the
+                ** frame ends at A+2.  TFORLOOP only reads R[A] and R[A+1]. */
+                int hi = (op == OP_TFORLOOP) ? A + 1 : A + 2;
                 validate_req(hi < p->maxstack,
                              (op == OP_TFORLOOP) ? "generic-for control A+1"
-                                                 : "loop frame A+3", pc, p, hi);
+                                                 : "loop frame A+2", pc, p, hi);
                 break;
             }
             /* R[A] := vararg[R[C]]: C is a register, not a constant. */
@@ -2663,7 +2664,12 @@ static void emit_guard_runtime(FILE *out) {
         /* Written by the checker on every call; the call sites compare it
         ** before and after.  See l2c_guard_poll. */
         "static unsigned l2c_tok = 0;\n"
-        "static unsigned l2c_scan_at = 0;\n\n"
+        "static unsigned l2c_scan_at = 0;\n"
+        /* Was the protected page writable before anything ran?  On some
+        ** linker layouts the first image page is legitimately RWX (a 4 KiB
+        ** page shared by .text and a writable section), so "writable" alone
+        ** is not evidence -- only a transition from read-only to writable is. */
+        "static unsigned char l2c_pg0 = 0;\n\n"
         "static void l2c_grd_a (void);\n"
         "static void l2c_grd_b (void);\n\n");
     emit_wm_slot(out);
@@ -3113,7 +3119,10 @@ static void emit_guard_init(FILE *out) {
         /* l2c_gsig0 / gsigq0 / grdsig0 / qstep / gctr are declared ahead of
         ** l2c_grd_a, with the rest of the writable state. */
         "static void l2c_guard_init (void) {\n"
-        "  l2c_gflags = (unsigned)l2c_scan_env();\n"
+        /* Through l2c_mark, not a plain assignment: the mirror has to follow
+        ** from the very first write, or a start-up finding would look like a
+        ** tampered mirror at the next poll. */
+        "  l2c_mark((unsigned)l2c_scan_env());\n"
         "  if (l2c_timed()) l2c_mark(512u);\n");
     if (g_indirect)
         fprintf(out, "  if (%s_hooks() != 0) l2c_mark(32u);\n", g_api_tag);
@@ -3121,6 +3130,7 @@ static void emit_guard_init(FILE *out) {
         "  l2c_gsig0 = l2c_codesig();\n"
         "  l2c_win_init();\n"
         "  l2c_grdsig0 = l2c_grdsig();\n"
+        "  l2c_pg0 = (unsigned char)l2c_scan_pages();\n"
         "}\n\n"
         "/* Cheap re-check: both code signatures must still match (the guard's\n"
         "** own span included, so a patched checker is caught), and every 256th\n"
@@ -3154,7 +3164,7 @@ static void emit_guard_init(FILE *out) {
         "    if (l2c_ms() - l2c_scan_at >= 200u) {\n"
         "      l2c_scan_at = l2c_ms();\n"
         "      if (l2c_scan_dr(1)) return 1;\n"
-        "      if (l2c_scan_pages() != 0) return 1;\n"
+        "      if (!l2c_pg0 && l2c_scan_pages() != 0) return 1;\n"
         "      return (l2c_scan_env() != 0) ? 1 : 0;\n"
         "    }\n"
         "  }\n"
@@ -3168,6 +3178,12 @@ static void emit_guard_init(FILE *out) {
         "                  \"flags=%%u noise=%%lu\\n\",\n"
         "          l2c_gsig0, l2c_grdsig0, l2c_winn,\n"
         "          l2c_gflags, l2c_noise);\n"
+        /* One window means the two span markers ended up next to each other --
+        ** the optimiser moved them.  Coverage is then a single KiB, which is
+        ** worth saying out loud rather than leaving the operator to guess. */
+        "  if (l2c_winn <= 1u)\n"
+        "    fprintf(stderr, \"note: protected span is only %%u window(s); \"\n"
+        "                    \"compile with -O0 for full coverage\\n\", l2c_winn);\n"
         "}\n\n");
 }
 
@@ -3449,7 +3465,12 @@ static void emit_helpers(FILE *out, FnCtx *C) {
 ** literal in the object file. */
 static void emit_pool(FILE *out) {
     if (g_pool_n == 0) {                 /* nothing to hide; keep it minimal */
-        fprintf(out, "static void l2c_%s (lua_State *L) { lua_createtable(L, 0, 0); }\n\n",
+        /* Same signature as the real builder: the forward declaration above
+        ** takes (L, rk) and main calls it that way, so a one-argument stub was
+        ** a conflicting-types error in every empty-pool build (--no-pool, or a
+        ** chunk whose constants never reach the pool). */
+        fprintf(out, "static void l2c_%s (lua_State *L, unsigned rk) "
+                     "{ (void)rk; lua_createtable(L, 0, 0); }\n\n",
                 g_kbuild);
         return;
     }

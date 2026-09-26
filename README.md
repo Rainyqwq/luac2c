@@ -10,6 +10,11 @@ gcc out.c -I lua-5.5.1/src -I lua5.5-include -std=c99 -w -O0 -o out.exe lua-5.5.
 out.exe                          # 3. 运行，输出与 lua.exe 完全一致
 ```
 
+编译生成的 C 请用 `-O0`（客户端也是这么做的）。`-O1/-O2` 编出来的产物**行为正确**，
+但优化器会把受保护区的两个边界标记函数挪到一起，受保护区随后只剩一小段，代码篡改的
+覆盖范围大幅缩水 —— 这一点会在 `L2C_GUARD_REPORT=1` 的 `windows=` 里显示出来，
+`windows=1` 时程序也会在报告里附一句提示。
+
 ## 目录结构
 
 ```
@@ -94,6 +99,9 @@ to-be-closed 语义、generic for 三槽位这些容易出错的运行时细节�
   不受重定位影响），并同时校验文件大小，实测改 1 个字节即失配。
   没有第二个工具时，也可 `./prog --l2c-sig` 后用 `-DL2C_SIG=0x<code>` 重编替代
 - `--require-sig`：未签名的映像直接视为被篡改，防止直接删掉签名槽
+- 代码页可写检测：Frida 下钩子前必须先把代码页改成可写，所以"可写"是个信号。但有些
+  链接布局下映像首页本来就是 RWX（一个 4 KiB 页被 .text 和可写段共享），因此判据是
+  **启动时先记基线，只检测"从只读变成可写"这次翻转**，而不是"当前是否可写"
 - 环境取证：调试器（`IsDebuggerPresent` / `TracerPid` / `P_TRACED`）、直读 PEB 的
   `BeingDebugged` 与 `NtGlobalFlag`（`IsDebuggerPresent` 是反反调试插件最先挂钩的 API，
   读 PEB 原始字段可以绕过被改的 API）、frida|gadget|gum|jshook|dobby|minhook|detours|injector
@@ -192,6 +200,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File sweepall.ps1 -MaxSeed 4   # 
 | `fuzz.py N` | 畸形输入下 luac2c 自身不崩（崩溃表现为返回码 ≥ 0x80000000） |
 | `fuzzc.py N` | 被接受的那些畸形输入，生成的 C 必须能完整编译 |
 | `check_ops.py` | 定向：把控制流指令的操作数逐个改坏，逐个检查输出质量 |
+| `check_combos.py` | 14 种开关组合 × 2 个优化级别：每种都要能编译**并正确运行** |
 
 ## 许可
 
