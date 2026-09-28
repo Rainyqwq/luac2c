@@ -1227,6 +1227,7 @@ static int pool_intern(Proto *p, int idx);   /* index of K[idx] in the pool */
 
 static char **g_fnames = NULL;   /* per-proto C function names */
 static const char *g_cur_fn = NULL;   /* name of the proto being emitted */
+static int g_nfuncs = 0;            /* protos in the chunk, for the span table */
 
 /* Choose this proto's register layout and helper names. */
 static void plan_function(FnCtx *C, Proto *p) {
@@ -2699,6 +2700,17 @@ static void emit_guard_runtime(FILE *out) {
         "#  include <mach-o/dyld.h>\n"
         "#endif\n\n");
 
+    /* The table the protected span is computed from, declared before anything
+    ** that uses it.  Emitted as its own call so the size can be interpolated
+    ** without threading an argument through the big block below. */
+    fprintf(out,
+        "/* Entries are the generated functions, filled in by l2c_fns_init.\n"
+        "** The run-time span is taken from these rather than from the two\n"
+        "** marker functions, which an optimiser is free to move. */\n"
+        "static const void *l2c_fns[%d];\n"
+        "static unsigned long l2c_fnn = %d;\n"
+        "static void l2c_fns_init (void);\n\n", g_nfuncs, g_nfuncs);
+
     /* Everything the program *writes* at run time must sit outside
     ** [l2c_grd_a, l2c_grd_b): that span is hashed while running, so a guard
     ** variable changing inside it would read exactly like a patch. */
@@ -2785,10 +2797,30 @@ static void emit_guard_runtime(FILE *out) {
         "}\n\n"
         "static void l2c_sig_a (void);\n"
         "static void l2c_sig_b (void);\n\n"
-        "/* The protected span covers every generated function. */\n"
+        /* The protected span reaches from the lowest to the highest generated
+        ** function entry, and covers the markers too if they sit outside that
+        ** range.  Everything between the entries is code as well, so the only
+        ** thing this can miss is the tail of whichever function was emitted
+        ** last -- and that one is the driver, not the translated chunk. */
+        /* uintptr_t, not unsigned long: on Windows the latter is 32 bits even
+        ** in a 64-bit build, and truncating a pointer here produced an address
+        ** that faults on the first read. */
+        "static void l2c_span (unsigned char **plo, unsigned char **phi) {\n"
+        "  uintptr_t lo = (uintptr_t)&l2c_sig_a;\n"
+        "  uintptr_t hi = (uintptr_t)&l2c_sig_b;\n"
+        "  unsigned long i;\n"
+        "  if (hi < lo) { uintptr_t t = lo; lo = hi; hi = t; }\n"
+        "  for (i = 0; i < l2c_fnn; i++) {\n"
+        "    uintptr_t a = (uintptr_t)l2c_fns[i];\n"
+        "    if (a != (uintptr_t)0 && a < lo) lo = a;\n"
+        "    if (a != (uintptr_t)0 && a + 1u > hi) hi = a + 1u;\n"
+        "  }\n"
+        "  *plo = (unsigned char *)lo;\n"
+        "  *phi = (unsigned char *)hi;\n"
+        "}\n\n"
         "static unsigned l2c_codesig (void) {\n"
-        "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_sig_a;\n"
-        "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_sig_b;\n"
+        "  unsigned char *a, *b;\n"
+        "  l2c_span(&a, &b);\n"
         "  size_t n;\n"
         "  if (b <= a) return 0x3B9ACB93u;\n"
         "  n = (size_t)(b - a);\n"
@@ -2813,23 +2845,32 @@ static void emit_guard_runtime(FILE *out) {
         ** per entry is one slice, not the whole span.
         ** The seed mixes the slice index in, so two identical slices do not
         ** produce the same digest and a patch cannot be moved to a "free" one. */
+        /* The window digests are stored masked with a value derived from this
+        ** run's entropy.  Patching the code is not enough any more: the attacker
+        ** has to forge the matching digest too, and computing it means reading
+        ** the run key out of the process he is trying to fool. */
+        "static unsigned l2c_wmask (unsigned w) {\n"
+        "  unsigned x = l2c_entropy ^ (w * 0x5D2A4F17u);\n"
+        "  x ^= x >> 15; x *= 0x2C1B3C6Du; x ^= x >> 13;\n"
+        "  return x;\n"
+        "}\n"
         "static void l2c_win_init (void) {\n"
-        "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_sig_a;\n"
-        "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_sig_b;\n"
+        "  unsigned char *a, *b;\n"
+        "  l2c_span(&a, &b);\n"
         "  size_t n; unsigned w = 0;\n"
         "  if (b <= a) return;\n"
         "  n = (size_t)(b - a);\n"
         "  if (n > (size_t)65536) n = (size_t)65536;\n"
         "  while (w < 64u && n > 0u) {\n"
         "    size_t m = (n < (size_t)1024) ? n : (size_t)1024;\n"
-        "    l2c_win[w] = l2c_whash(a, m, 0x3C6EF35Fu ^ (unsigned)w);\n"
+        "    l2c_win[w] = l2c_whash(a, m, 0x3C6EF35Fu ^ (unsigned)w) ^ l2c_wmask(w);\n"
         "    a += m; n -= m; w++;\n"
         "  }\n"
         "  l2c_winn = w;\n"
         "}\n"
         "static int l2c_codechk (unsigned w) {\n"
-        "  unsigned char *a = (unsigned char *)(uintptr_t)&l2c_sig_a;\n"
-        "  unsigned char *b = (unsigned char *)(uintptr_t)&l2c_sig_b;\n"
+        "  unsigned char *a, *b;\n"
+        "  l2c_span(&a, &b);\n"
         "  size_t n, off, m;\n"
         "  if (l2c_winn == 0u || w >= l2c_winn) return 0;\n"
         "  if (b <= a) return 0;\n"
@@ -2838,7 +2879,8 @@ static void emit_guard_runtime(FILE *out) {
         "  off = (size_t)w * (size_t)1024;\n"
         "  if (off >= n) return 0;\n"
         "  m = (n - off < (size_t)1024) ? (n - off) : (size_t)1024;\n"
-        "  return l2c_whash(a + off, m, 0x3C6EF35Fu ^ w) != l2c_win[w];\n"
+        "  return (l2c_whash(a + off, m, 0x3C6EF35Fu ^ w) ^ l2c_wmask(w))\n"
+        "         != l2c_win[w];\n"
         "}\n\n"
         /* Milliseconds, for pacing the expensive scans.  A call-counted
         ** cadence is wrong in both directions: a hot loop hits the counter
@@ -3050,11 +3092,18 @@ static void emit_guard_runtime(FILE *out) {
         "** the check stays useful against the common case, and a failure to read\n"
         "** is not treated as tampering. */\n"
         "#if defined(_WIN32)\n"
-        "static int l2c_dr_busy (HANDLE th) {\n"
+        "static int l2c_dr_busy (HANDLE th, int mine) {\n"
         "  CONTEXT ctx;\n"
         "  memset(&ctx, 0, sizeof ctx);\n"
         "  ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;\n"
-        "  if (th == NULL || GetThreadContext(th, &ctx) == 0) return 0;\n"
+        /* Reading the current thread's own context always succeeds, so a failure
+        ** there is itself the finding: the documented way past this check is to
+        ** hook GetThreadContext or narrow ContextFlags, and both show up as a
+        ** refusal or as flags that came back changed. */
+        "  if (th == NULL) return mine;\n"
+        "  if (GetThreadContext(th, &ctx) == 0) return mine;\n"
+        "  if ((ctx.ContextFlags & CONTEXT_DEBUG_REGISTERS) != CONTEXT_DEBUG_REGISTERS)\n"
+        "    return 1;\n"
         "  if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0)\n"
         "    return 1;\n"
         "  return (ctx.Dr7 & 0xFFu) != 0u;   /* L0..L3 / RW0..RW3 enable bits */\n"
@@ -3063,7 +3112,7 @@ static void emit_guard_runtime(FILE *out) {
         "** in the process -- breakpoints are per-thread state, so a debugger may\n"
         "** have armed one somewhere else. */\n"
         "static int l2c_scan_dr (int all) {\n"
-        "  int hit = l2c_dr_busy(GetCurrentThread());\n"
+        "  int hit = l2c_dr_busy(GetCurrentThread(), 1);\n"
         "  if (hit || !all) return hit;\n"
         "  {\n"
         "    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);\n"
@@ -3080,7 +3129,7 @@ static void emit_guard_runtime(FILE *out) {
         "          th = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,\n"
         "                          0, te.th32ThreadID);\n"
         "          if (th == NULL) continue;\n"
-        "          if (l2c_dr_busy(th)) hit = 1;\n"
+        "          if (l2c_dr_busy(th, 0)) hit = 1;\n"
         "          CloseHandle(th);\n"
         "        } while (!hit && Thread32Next(snap, &te));\n"
         "      }\n"
@@ -3248,6 +3297,7 @@ static void emit_guard_init(FILE *out) {
         ** clock.  Used to make the damage of a detection unpredictable rather
         ** than to gate decryption (a value that changes every run cannot be
         ** known when the blob is written). */
+        "  l2c_fns_init();\n"
         "  l2c_cal_init();\n"
         "  l2c_entropy = (unsigned)(uintptr_t)&l2c_entropy\n"
         "               ^ (unsigned)l2c_ms() * 0x2C1B3C6Du;\n"
@@ -3468,6 +3518,10 @@ static void emit_preamble(FILE *out, const char *in_path) {
         "** clean value an attacker can restore: a wrong key means wrong\n"
         "** constants, which means the program computes the wrong thing. */\n"
         "static unsigned l2c_key = 0u, l2c_key2 = 0u, l2c_entropy = 0u%s;\n"
+        /* Filled in later, once the Lua state exists.  Kept apart from
+        ** l2c_entropy because the window digests are masked with that one and
+        ** must not move after they are taken. */
+        "static unsigned l2c_entropy2 = 0u;\n"
         "static void l2c_poison (void);\n\n%s",
         g_guard ? ", l2c_key0 = 0u" : "",
         /* Predicate source for the junk.  It mixes the run key, the junk chain
@@ -3669,20 +3723,28 @@ static void emit_pool(FILE *out) {
     ** only exists inside the process. */
     if (g_guard)
         fprintf(out,
-            "/* Both shares move, and one window digest is flipped as well: putting\n"
-            "** the key back the way it was no longer restores a clean state, the\n"
-            "** window check keeps reporting from then on. */\n"
+            "/* One way only.  Both shares move and one window digest is flipped, so\n"
+            "** restoring the key does not restore a clean state -- and the second\n"
+            "** and later calls must do nothing at all: XORing the same value twice\n"
+            "** would cancel the first corruption and hand the attacker back a\n"
+            "** working program (the flipped digest re-triggers this every lap). */\n"
             "static void l2c_poison (void) {\n"
-            "  l2c_key ^= l2c_entropy | 1u;\n"
-            "  l2c_key2 ^= (l2c_entropy >> 3) | 1u;\n"
+            "  unsigned e;\n"
+            "  if (l2c_key != 0u || l2c_key2 != 0u) return;\n"
+            "  e = l2c_entropy ^ l2c_entropy2;\n"
+            "  l2c_key ^= e | 1u;\n"
+            "  l2c_key2 ^= (e >> 3) | 1u;\n"
             "  l2c_win[0] ^= 0x5A5A5A5Au;\n"
             "  l2c_mark(0x80000000u);\n"
             "}\n\n");
     else
         fprintf(out,
             "static void l2c_poison (void) {\n"
-            "  l2c_key ^= l2c_entropy | 1u;\n"
-            "  l2c_key2 ^= (l2c_entropy >> 3) | 1u;\n"
+            "  unsigned e;\n"
+            "  if (l2c_key != 0u || l2c_key2 != 0u) return;\n"
+            "  e = l2c_entropy ^ l2c_entropy2;\n"
+            "  l2c_key ^= e | 1u;\n"
+            "  l2c_key2 ^= (e >> 3) | 1u;\n"
             "}\n\n");
 
     if (g_pool_n == 0) {                 /* nothing to hide; keep it minimal */
@@ -3702,11 +3764,13 @@ static void emit_pool(FILE *out) {
                          "{ (void)i; lua_pushnil(L); }\n"
                          "static void l2c_seed (lua_State *L) { (void)L; "
                          "(void)&l2c_%s; "
-                         "l2c_entropy ^= (unsigned)(uintptr_t)&l2c_entropy; }\n\n",
+                         /* entropy2, never entropy: the window digests are masked
+                         ** with entropy and are taken before this runs. */
+                         "l2c_entropy2 = (unsigned)(uintptr_t)&l2c_entropy2; }\n\n",
                     g_kpush, g_kpush);
         else
             fprintf(out, "static void l2c_seed (lua_State *L) { (void)L; "
-                         "l2c_entropy ^= (unsigned)(uintptr_t)&l2c_entropy; }\n\n");
+                         "l2c_entropy2 = (unsigned)(uintptr_t)&l2c_entropy2; }\n\n");
         return;
     }
     /* Byte offset of every entry in the blob, so a single constant can be
@@ -3817,7 +3881,7 @@ static void emit_pool(FILE *out) {
         "  { const char *t = lua_tolstring(L, -1, NULL);\n"
         "    s = (unsigned)(uintptr_t)t; }\n"
         "  lua_settop(L, top);\n"
-        "  l2c_entropy ^= s ^ (unsigned)(uintptr_t)L ^ (unsigned)(uintptr_t)&s;\n"
+        "  l2c_entropy2 = s ^ (unsigned)(uintptr_t)L ^ (unsigned)(uintptr_t)&s;\n"
         "  l2c_chain_init();\n"
         "}\n\n",
         g_pool_n ? g_pool_n : 1, g_kblob, g_pool_n, g_kbyte_n, g_pk1, g_pk2,
@@ -4664,6 +4728,15 @@ static unsigned wm_fold(const char *s) {
     return h ? h : 0xA5A5A5A5u;   /* 0 means "no watermark", never an id */
 }
 
+/* The fold used for builds made from now on: same ARX as the checkers, so the
+** binary carries no FNV constants at all.  The legacy fold stays in --who's
+** lookup path, because binaries that were handed out earlier were folded the
+** old way and must remain traceable. */
+static unsigned wm_fold2(const char *s) {
+    unsigned h = l2c_h_bytes((const unsigned char *)s, strlen(s), L2C_H_INIT);
+    return h ? h : 0xA5A5A5A5u;
+}
+
 static const char *wm_ledger_path(void) {
     static char buf[1024];
     const char *e = getenv("L2C_WM_LEDGER");
@@ -4734,7 +4807,9 @@ static int wm_lookup(unsigned wm, const char *list, char *out, size_t outsz) {
                 size_t k = strlen(line);
                 while (k && (line[k - 1] == '\n' || line[k - 1] == '\r')) line[--k] = 0;
                 if (!line[0]) continue;
-                if (wm_fold(line) == wm) {
+                /* Either fold may have produced this word: the current one for
+                ** new builds, the legacy FNV one for anything shipped before. */
+                if (wm_fold2(line) == wm || wm_fold(line) == wm) {
                     snprintf(out, outsz, "%s", line);
                     fclose(f);
                     return 1;
@@ -4954,7 +5029,7 @@ int main(int argc, char **argv) {
     ** it produces without every caller having to remember the option. */
     if (!g_fp_uid || !g_fp_uid[0]) g_fp_uid = getenv("L2C_FINGERPRINT");
     if (g_fp_uid && g_fp_uid[0]) {
-        g_fp_wm = wm_fold(g_fp_uid);
+        g_fp_wm = wm_fold2(g_fp_uid);
         wm_ledger_add(g_fp_uid, g_fp_wm);   /* so --who can name the user later */
     } else {
         g_fp_uid = NULL;
@@ -4997,6 +5072,7 @@ int main(int argc, char **argv) {
     int lcount = 0;
     flatten_protos(root, list, &lcount);
     if (lcount != total) fatal("internal: flattened %d of %d functions", lcount, total);
+    g_nfuncs = lcount;
 
     /* Plan every function first: names, register layout and helper copies are
     ** drawn from the seed before anything is emitted. */
@@ -5029,6 +5105,7 @@ int main(int argc, char **argv) {
     if (g_guard)
         fprintf(out, "static void l2c_sig_a (void) "
                      "{ volatile int z = 1; (void)z; }\n\n");
+
     else if (g_fp_uid)
         emit_wm_slot(out);        /* no guard runtime, but still watermarked */
 
@@ -5091,6 +5168,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* The table the run-time span is computed from, filled here because every
+    ** generated function is defined by now.  guard_init calls it first. */
+    if (g_guard) {
+        fprintf(out, "static void l2c_fns_init (void) {\n");
+        for (int i = 0; i < lcount; i++)
+            fprintf(out, "  l2c_fns[%d] = (const void *)&%s;\n", i, g_fnames[i]);
+        fprintf(out, "}\n\n");
+    }
+
     /* End of the guarded region. */
     if (g_guard)
         fprintf(out, "static void l2c_sig_b (void) "
@@ -5132,6 +5218,11 @@ int main(int argc, char **argv) {
         ** the case the start-up baseline cannot see, because it would simply
         ** have measured the patched bytes. */
         fprintf(out,
+            /* Slot 3 is the signed flag.  Only 0 and 1 are legitimate: any
+            ** other value is somebody editing the flag, which is how the file
+            ** check gets skipped.  A clean 1 -> 0 downgrade cannot be told from
+            ** "built without --sign", which is what --require-sig is for. */
+            "  if (l2c_sigslot[3] > 1u) l2c_poison();\n"
             "  if (l2c_sigslot[3] == 1u) {\n"
             "    unsigned fsz = 0, h = l2c_img_hash(&fsz);\n"
             "    if (h == 0u || h != l2c_sigslot[4]) l2c_poison();\n"
@@ -5180,8 +5271,14 @@ int main(int argc, char **argv) {
             "#endif\n"
             "  l2c_guard_report();\n"
             "  if (argc > 1 && strcmp(argv[1], \"--l2c-sig\") == 0) {\n"
-            "    unsigned long ra = l2c_rva_of((void *)(uintptr_t)&l2c_sig_a);\n"
-            "    unsigned long rb = l2c_rva_of((void *)(uintptr_t)&l2c_sig_b);\n"
+            /* The same span the run-time checks actually cover (see
+            ** l2c_span), not the two markers: those can be moved by the
+            ** optimiser, and then the signature would cover the wrong bytes. */
+            "    unsigned char *sa, *sb;\n"
+            "    unsigned long ra, rb;\n"
+            "    l2c_span(&sa, &sb);\n"
+            "    ra = l2c_rva_of(sa);\n"
+            "    rb = l2c_rva_of(sb);\n"
             "    printf(\"codesig=%%08X\\n\", l2c_gsig0);\n"
             "    /* The two RVAs are what 'luac2c --sign' needs to find the\n"
             "    ** guarded span inside the file. */\n"
