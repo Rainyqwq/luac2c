@@ -129,3 +129,23 @@ String normalizeNewlines(String s) =>
     trimTail(s.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
 
 String trimTail(String s) => s.replaceFirst(RegExp(r'[\s]+$'), '');
+
+/// 比对用规范化：换行统一后，去掉两类"允许两边不同"的行。
+///
+/// 测试脚本本身把这两类行声明成不参与 diff：
+///   - `SMOKE ...` 行是刻意的不确定值（内存占用、耗时），只供人工观察；
+///   - `SKIP ...` 行报告"这一类用例被跳过"。跳过与否取决于产物能力
+///     （yield 跨不过 C 调用边界），参考实现不跳、产物跳，行数天然不同。
+///
+/// 只做逐行过滤，其余顺序与内容保持原样，所以真正的输出差异仍会被抓到。
+String normalizeForCompare(String s) {
+  final lines = normalizeNewlines(s).split('\n');
+  final kept = <String>[];
+  for (final raw in lines) {
+    final line = trimTail(raw);
+    if (line.isEmpty) continue;
+    if (line.startsWith('SMOKE ') || line.startsWith('SKIP ')) continue;
+    kept.add(line);
+  }
+  return kept.join('\n');
+}

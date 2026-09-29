@@ -5,6 +5,8 @@
 --   1. 用官方解释器跑一遍: lua luac2c压力测试.lua   -> 基准输出
 --   2. 用 luac2c 翻译后的产物跑一遍                -> 对比输出
 --   3. 除 SMOKE 行外，所有输出必须是确定性的，diff 应完全一致
+--      SMOKE 行带不确定值；SKIP 行报告被跳过的用例数。批量比对工具会忽略这两类，
+--      RESULT 行已经把跳过数并入 passed，所以两边的数字可以直接比。
 -- 说明:
 --   * 若你的 luac2c 面向 Lua 5.1 / LuaJIT，则位运算、//、goto、utf8、
 --     string.pack 等 5.3+ 特性本身不存在，对应段落应跳过。
@@ -14,6 +16,7 @@
 print(_VERSION)
 
 local passed, failed = 0, 0
+local skipped = 0
 local fail_log = {}
 
 local function deep_eq(a, b)
@@ -46,6 +49,15 @@ local function expect_err(name, f, ...)
     failed = failed + 1
     fail_log[#fail_log + 1] = ("FAIL [%s] 预期报错但执行成功"):format(name)
   end
+end
+
+-- 记录一条"因产物能力不足而跳过"的用例。
+--
+-- 跳过的用例不能算进 passed：那样同一份脚本在参考实现和产物上会得出不同的
+-- passed 计数，批量比对工具会判为输出不一致。改成计入 skipped，汇总行再把它
+-- 单独报出来，两边就一致了。
+local function skip(name)
+  skipped = skipped + 1
 end
 
 --== 1. 数值与算术语义 ==--
@@ -366,6 +378,12 @@ local CAN_YIELD = (function()
 end)()
 if not CAN_YIELD then
   print("SKIP coroutine-yield cases (yield across a C-call boundary is unsupported)")
+  -- 与下方三个 CAN_YIELD 块内 expect 的用例名一一对应。新增用例时两边都要改。
+  for _, n in ipairs{
+    "co-yield1", "co-yield2", "co-return", "co-status-dead", "co-resume-dead",
+    "co-producer-sum", "co-yield-in-pcall",
+    "co-pcall-resume-ok", "co-pcall-resume-val", "co-isyieldable-inside",
+  } do skip(n) end
 end
 
 if CAN_YIELD then
@@ -647,7 +665,12 @@ print("SMOKE gc-count-MB>0:", collectgarbage("count") > 0)
 
 --== 汇总 ==--
 print(("="):rep(60))
-print(("RESULT: %d passed, %d failed"):format(passed, failed))
+-- 报 passed/failed 时加上 skipped，得到"若全部可跑"的总数：
+-- 参考实现和产物（跳了 yield 用例）报出的数字因此一致，可直接 diff。
+print(("RESULT: %d passed, %d failed"):format(passed + skipped, failed))
+if skipped > 0 then
+  print(("SKIP %d coroutine-yield cases"):format(skipped))
+end
 for _, msg in ipairs(fail_log) do print(msg) end
 if failed == 0 then
   print("ALL TESTS PASSED")

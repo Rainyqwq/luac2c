@@ -222,7 +222,8 @@ class FileBuild {
     final ref = await runCapture(tools.lua, [p.src], p.dir,
         timeout: const Duration(seconds: 30), isCancelled: cancelled);
     if (ref.timeout) throw 'lua.exe 运行超时，已终止';
-    // 规范化换行：Windows 下 CRLF/LF 差异不应判为失败
+    // 显示原始输出，比对走规范化：SMOKE（刻意不确定）与 SKIP（能力跳过）行
+    // 两边天然不同，不参与 diff。
     final genOut = normalizeNewlines(gen.output);
     final refOut = normalizeNewlines(ref.output);
     if (genOut.isNotEmpty) {
@@ -231,14 +232,46 @@ class FileBuild {
     if (refOut.isNotEmpty) {
       _p('      lua.exe> ${refOut.replaceAll('\n', '\n      ')}');
     }
-    final same = genOut == refOut && gen.exitCode == ref.exitCode;
+    final genCmp = normalizeForCompare(gen.output);
+    final refCmp = normalizeForCompare(ref.output);
+    final same = genCmp == refCmp && gen.exitCode == ref.exitCode;
     if (same) {
       _p('      ✓ 输出一致，退出码一致 (${gen.exitCode})');
       _p('✓ 通过：$srcPath');
     } else {
       _p('      ✗ 不一致（exit ${gen.exitCode} vs ${ref.exitCode}）');
+      if (gen.exitCode == ref.exitCode) {
+        _pDiff(genCmp, refCmp);
+      }
       _p('✗ 失败：$srcPath');
     }
     return same;
+  }
+
+  /// 输出不一致时打印首个差异行的行号与两侧内容，省去人工逐行比对
+  void _pDiff(String gen, String ref) {
+    final a = gen.split('\n');
+    final b = ref.split('\n');
+    final n = a.length > b.length ? a.length : b.length;
+    for (var i = 0; i < n; i++) {
+      final x = i < a.length ? a[i] : '<无此行>';
+      final y = i < b.length ? b[i] : '<无此行>';
+      if (x != y) {
+        _p('      首个差异在第 ${i + 1} 行：');
+        _p('        生成物= $x');
+        _p('        lua.exe= $y');
+        final more = <String>[];
+        for (var j = i + 1; j < n && more.length < 4; j++) {
+          final p = j < a.length ? a[j] : '<无此行>';
+          final q = j < b.length ? b[j] : '<无此行>';
+          if (p != q) more.add('        第 ${j + 1} 行: $p  ≠  $q');
+        }
+        for (final m in more) {
+          _p(m);
+        }
+        if (more.length == 4) _p('        ...（仅列出前 5 处）');
+        return;
+      }
+    }
   }
 }

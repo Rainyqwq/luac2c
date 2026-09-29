@@ -22,7 +22,18 @@ function Invoke-Cmd([string]$exe, [string[]]$ArgList) {
     $code = $LASTEXITCODE
     $o = (Get-Content $to -Raw -ErrorAction SilentlyContinue)
     if ($null -eq $o) { $o = '' }
-    return @{ Code = $code; Out = $o.Trim() }
+    $o = $o -replace "`r", ''
+    # 比对用规范化：去掉 SMOKE（刻意不确定）与 SKIP（能力跳过）行，再去掉空白行。
+    # 测试脚本声明这两类行允许参考实现与产物不同；RESULT 行已把跳过数并入 passed。
+    $kept = @()
+    foreach ($ln in ($o -split "`n")) {
+        $t = $ln.TrimEnd()
+        if ($t -eq '') { continue }
+        if ($t.StartsWith('SMOKE ')) { continue }
+        if ($t.StartsWith('SKIP ')) { continue }
+        $kept += $t
+    }
+    return @{ Code = $code; Out = ($kept -join "`n") }
 }
 
 $log = New-Object System.Collections.Generic.List[string]

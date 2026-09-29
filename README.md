@@ -296,6 +296,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File sweepall.ps1 -MaxSeed 4   # 
 | `bigkx.py` | 造一个含 131080 个常量的函数，逼出 `luac` 从源码层面生成不了的 `LOADKX` |
 | `signcheck.py` | 后链接签名：构建、签名，再翻转签名区间、水印槽、签名标志各一个字节 |
 
+根目录的 `luac2c压力测试.lua` 可以单独跑，也可以在客户端里当普通源文件过一遍流水线。
+它有两类行参考实现和产物天然不同，比对时必须忽略：
+
+- `SMOKE ...` 是刻意不确定的值（内存占用等），只供人工观察；
+- `SKIP ...` 报告因产物能力不足而跳过的用例数。汇总行 `RESULT` 已经把这些跳过数
+  并入 `passed`，所以两边的 `RESULT` 数字可以直接比；产物多出的 `SKIP` 行不参与 diff。
+
+不做这一步的话，一份跳过了协程 yield 用例的产物会因为多一行 `SKIP`、且 `RESULT`
+少 10 而整份被判为不一致。客户端（`normalizeForCompare`）和三个 PowerShell 脚本
+（`runall.ps1` / `sweepall.ps1` / `test.ps1` 的 `Run`）都做了同样的逐行过滤。
+
 ## 许可
 
 本项目依赖的 Lua 5.5 遵循 MIT License（见 `lua-5.5.1/`）。
