@@ -22,6 +22,7 @@ _hash*.json
 # ---- 本地工作目录（不上传） ----
 .workbuddy/
 .claude/
+.st/
 data/
 flutter_windows.dll
 luac2c_client.exe

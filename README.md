@@ -15,13 +15,30 @@ out.exe                          # 3. 运行，输出与 lua.exe 完全一致
 覆盖范围大幅缩水。缩到什么程度看 `L2C_GUARD_REPORT=1` 输出的 `windows=`，
 只剩 1 个窗口时程序会在报告里附一句提示。
 
+命令行开关（`luac2c.exe in.luac -o out.c [选项]`）：
+
+| 开关 | 作用 |
+| --- | --- |
+| `--seed N` | 固定多样化种子（可复现；`N=0` 也是合法种子） |
+| `--static` | 恒等布局基线，同时关掉全部防护（可读、可对照） |
+| `--no-pool` | 关闭常量池，常量内联进代码 |
+| `--pool-all` | 连数字常量也放进池 |
+| `--annotate` | 保留原始指令注释（调试用，会解除部分混淆） |
+| `--no-guard` | 关闭运行时守卫 |
+| `--no-opaque` | 关闭不透明谓词 + 垃圾指令 |
+| `--no-mba` | 关闭整数 MBA 混淆 |
+| `--no-wipe` | 退回"启动即全量解常量"（不做按需解密 + 擦除） |
+| `--no-clear` | 不做死槽清理（保留旧行为，A/B 用） |
+| `--require-sig` | 未签名的产物拒绝运行 |
+| `--l2c-release` | 去注释、拉平所有名字 |
+
 ## 目录结构
 
 ```
 ├── luac2c.c              # 翻译器源码（单文件实现）
 ├── lua-5.5.1/            # vendored Lua 5.5（src + build/liblua.a）
 ├── lua5.5-include/       # 对外暴露的头文件
-├── test/                 # 21 个端到端用例 + 测试脚本（test.ps1 / runall.ps1 / sweep.ps1 / sweepall.ps1）
+├── test/                 # 24 个端到端用例 + 测试脚本（test.ps1 / runall.ps1 / sweep.ps1 / sweepall.ps1）
 ├── luac2c_flutter/       # Windows GUI 客户端（Flutter, Material You / M3）
 │   └── lib/              # main / app / app_shell 三个入口，其余按职责分模块
 │       ├── pipeline.dart # 构建调度（并发池、进度、状态文案），不含 Widget
@@ -40,6 +57,28 @@ out.exe                          # 3. 运行，输出与 lua.exe 完全一致
 to-be-closed 语义、generic for 三槽位这些容易出错的运行时细节都处理过。
 默认开启多样化编译：每次用时间种子给出不同的寄存器置换、常量池布局与标识符命名，
 `--seed N` 可复现，`--static` 是恒等布局的可读基线。
+
+**死槽清理与捕获槽的活跃性分析**：翻译后的帧把 `L->top` 钉在整帧宽度（置换后的槽不按
+活跃性排序，低槽可能是活的而高槽已死）。Lua 的 GC 只扫到 `L->top`，所以真 Lua 看到的死
+临时量本来就在 top 之上、能回收；翻译版却把它们当永久根，弱表条目和 `__gc` 终结器会因此
+多活一轮。发射器为此做一遍**后向活跃性分析**（`compute_dead_after`）：一条指令把某寄存器
+读完之后就把它写回 nil。要点：
+
+- 只清"本条指令读完之后不再被任何后继读到"的槽（`live_in & ~live_out`），跨分支/回边
+  都正确；参数槽和被捕获槽在**原始活跃性**为活的位置保留，其余位置照清。单凭"首次写入
+  之后一律保留"会把整个函数尾部钉住，导致一个早已结束的 `{}` 一直当根（这正是 gc 终结器
+  用例曾经 4/5 的原因）。
+- **OP_CLOSURE 要算作对子原型 instack 上值的读取**：`l2c_boxget` 在 CLOSURE 处从 `R(idx)`
+  建/取共享单元，活跃性必须看见这次读取，否则槽会在更早的 CLOSE 后被清、后面的 CLOSURE
+  读到 nil。
+- 清完之后只修剪**帧以上**的栈（`b + fsz + 1`，与序言抬升的宽度一致）。置换形态下空洞
+  散布在 `[b+1, b+fsz]` 内，用 `b + maxstack + 1` 会切到活槽——`f()` 的结果正好落在
+  逻辑寄存器号之上时就是这个症状。`top` 镜像不动（它是开窗调用取参数的累加器）。
+- `OP_CLOSE A` 只能关**此刻打开**的 tbc 槽：寄存器号会在不同作用域里既当 tbc 又当普通
+  局部量，按"函数里某处是 tbc"去关会关错槽（曾经让 `x <close>` 和循环捕获相互污染，
+  `sum` 出 0 且随后崩）。发射前先做一遍前向扫描（TBC 打开、TFORPREP 打开 `A+2`、
+  CLOSE 关闭 `>= A` 的所有打开槽），逐 pc 记下该 CLOSE 要关的最低打开槽。
+  `--no-clear` 可退回旧的"不清死槽"行为做 A/B。
 
 防护分静态加固和运行时守卫两层。两者都在多样化模式下默认开启，被 `--static` 一并关掉。
 
@@ -215,6 +254,11 @@ flutter build windows --release
 - 程序必须能解开自己的常量，所以密钥一定以某种形式存在于进程里。有调试器的人可以读出来；
   我们能做的是让"读"这件事被察觉，并且每次运行看到的破坏都不一样（破坏值由本机熵派生）。
   这不是加密，是增加人工成本。
+- 协程里 `coroutine.yield` 会报 `attempt to yield across a C-call boundary`。翻译后的函数体是
+  C 函数（由 `lua_call`/`lua_pcall` 调用），yield 跨不过 C 调用边界。要支持它得把函数体改成
+  基于 continuation（`lua_callk`/`lua_yieldk` + 续体函数）的可重入状态机——也就是让状态机
+  能"在指令中间挂起、稍后从同一处继续"，属于大改，目前没做。不带 yield 的协程
+  （`create`/`resume`/`status`/`isyieldable`/`wrap` 里不 yield 的那些）语义与官方一致。
 - 内存里的基准值（窗口摘要表、签名槽）都能被运行期攻击者一起改掉。窗口摘要现在用本次运行
   的熵做了掩码，伪造它得先把密钥从进程里读出来；但一个能持续读写进程内存的对手最终能对齐
   所有副本。对这类对手的主要答案是反调试检查，而反调试检查本身可以被绕过。
@@ -237,7 +281,7 @@ flutter build windows --release
 
 ```powershell
 cd test
-powershell -NoProfile -ExecutionPolicy Bypass -File runall.ps1     # 全量 21 用例
+powershell -NoProfile -ExecutionPolicy Bypass -File runall.ps1     # 全量 24 用例
 powershell -NoProfile -ExecutionPolicy Bypass -File sweepall.ps1 -MaxSeed 4   # 跨种子扫描
 ```
 

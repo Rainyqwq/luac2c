@@ -879,6 +879,7 @@ static int  g_opaque   = 1;    /* 1 = opaque predicates + junk + anti-disasm  */
 static int  g_mba      = 1;    /* 1 = index arithmetic as MBA identities       */
 static int  g_wipe     = 1;    /* 1 = string constants decoded on demand+wiped */
 static int  g_release  = 0;    /* 1 = strip comments, flatten all names    */
+static int  g_no_clear = 0;    /* 1 = keep dead temporaries (old behaviour) */
 static int  g_requiresig = 0;  /* 1 = an unsigned image counts as tampered    */
 static unsigned g_pool_sig = 0;   /* FNV of the emitted constant-pool blob    */
 static unsigned g_st_a = 1u;   /* affine state encoding: st -> (id*a + b)    */
@@ -1212,6 +1213,7 @@ typedef struct {
     char *vb, *vt, *vn;         /* names behind the b / top / ne macros */
     char *h_prep, *h_loop, *h_prep_lim; /* forprep / forloop / forlimit */
     char *h_bget, *h_bsync, *h_bpull, *h_ball;   /* box helpers */
+    char *h_bdrop;                               /* forget a closed cell */
     char *h_vidx;                                /* vararg-index key decoder */
     int   need_loop, need_box, need_varg;
 } FnCtx;
@@ -1318,6 +1320,7 @@ static void plan_function(FnCtx *C, Proto *p) {
         C->h_bsync = mkname("bs");
         C->h_bpull = mkname("bp");
         C->h_ball  = mkname("ba");
+        C->h_bdrop = mkname("bd");
     }
     if (C->need_varg) C->h_vidx = mkname("vi");
     /* mode 0 always needs a materialised permutation table; the name is
@@ -1571,9 +1574,26 @@ static void validate_proto(Proto *p) {
         if (op < 0 || op >= NUM_OPCODES)
             fatal("%s: instruction %d has unknown opcode %d", src, pc, op);
 
-        /* A holds a register for every opcode except the two that pack a wide
-        ** immediate into the A bits (sJ / Ax). */
-        if (op != OP_JMP && op != OP_EXTRAARG && p->maxstack > 0)
+        /* A holds a register for every opcode except these:
+        **   OP_JMP       -- packs a signed offset (sJ) into A..k
+        **   OP_EXTRAARG  -- packs a wide immediate (Ax) into A..k
+        **   OP_RETURN0   -- takes NO operands at all
+        **   OP_RETURN B=1-- returns zero values
+        ** For the last two, luaK_ret() still stores 'freereg' into A, and for a
+        ** function whose body exactly fills its frame that value is legitimately
+        ** == maxstack.  Neither the VM nor the emitter ever reads A in those
+        ** cases (the disassembler itself prints "0 out"), so a range check here
+        ** would reject valid chunks such as
+        **     function() local x, y = 1, 2; return end
+        **     function() ... ; local _ = false and f(); return c end
+        ** (both of which Lua compiles happily).  OP_RETURN1 does read A, and
+        ** OP_RETURN with B==0 or B>=2 reads R[A..A+B-2], so those stay checked.
+        ** A note on the intent: this check exists to stop a malformed chunk from
+        ** reaching the emitter, which would index the register frame out of
+        ** bounds.  Where A is unread, there is nothing to protect. */
+        int a_is_reg = (op != OP_JMP && op != OP_EXTRAARG && op != OP_RETURN0);
+        if (op == OP_RETURN && B == 1) a_is_reg = 0;
+        if (a_is_reg && p->maxstack > 0)
             validate_req(A < p->maxstack, "register A", pc, p, A);
 
         switch (op) {
@@ -1652,10 +1672,11 @@ static void validate_proto(Proto *p) {
                              pc, p, tgt);
                 /* Numeric for keeps three slots (lvm.c: ra = counter, ra+1 =
                 ** step, ra+2 = control variable) -- there is no ra+3, so the
-                ** frame ends at A+2.  TFORLOOP only reads R[A] and R[A+1]. */
-                int hi = (op == OP_TFORLOOP) ? A + 1 : A + 2;
+                ** frame ends at A+2.  TFORLOOP reads the control variable at
+                ** ra+3, so the generic-for frame ends at A+3. */
+                int hi = (op == OP_TFORLOOP) ? A + 3 : A + 2;
                 validate_req(hi < p->maxstack,
-                             (op == OP_TFORLOOP) ? "generic-for control A+1"
+                             (op == OP_TFORLOOP) ? "generic-for control A+3"
                                                  : "loop frame A+2", pc, p, hi);
                 break;
             }
@@ -1677,7 +1698,12 @@ static void validate_proto(Proto *p) {
                                  pc, p, A + B - 1);
                 break;
             case OP_RETURN:
-                if (B > 0)
+                /* B == 1 returns nothing, so R[A] is never read (see the A
+                ** check above).  B == 0 reads R[A..top] and B >= 2 reads
+                ** R[A..A+B-2]; both start at A, so validate the window. */
+                if (B == 0)
+                    validate_req(A < p->maxstack, "return base A", pc, p, A);
+                else if (B > 1)
                     validate_req(A + B - 2 < p->maxstack, "return window A+B-2",
                                  pc, p, A + B - 2);
                 break;
@@ -1777,6 +1803,265 @@ static void mark_goto_targets(Proto *p, int *ref) {
         }
         if (tgt >= 0 && tgt < p->ncode) ref[tgt] = 1;
     }
+}
+
+/* Highest program counter that still *reads* each register, or -1 when the
+** register is never read.
+**
+** The translated frame pins L->top at the whole frame width (permuted slots
+** are not ordered by liveness, so a lower slot can hold a live value while a
+** higher one is dead).  Lua's collector only walks the stack up to L->top, so
+** real Lua sees dead temporaries above top and frees what they point at; the
+** translated program would keep them as roots forever, holding back weak-table
+** entries and __gc finalizers.  Clearing a slot once its last read has passed
+** restores the observable behaviour without any control-flow reasoning: a read
+** that can only be reached *after* this pc is still honoured, because the
+** clear is emitted only when no instruction anywhere reads the slot later.
+**
+** Registers that must survive to the end -- parameters (the call convention
+** reads them again when the function returns) and captured slots (a cell may
+** be read by a sibling closure at any time) -- are excluded by the caller.
+*/
+/* Does instruction 'ins' read register 'r'?  Only the operands the VM actually
+** loads count: a destination slot is not a read even though the same field
+** names it, and an RK field is a register only when the k flag is clear. */
+static int reads_reg (Instruction ins, int r) {
+    int op = getop(ins), A = getA(ins), B = getB(ins), C = getC(ins), k = getk(ins);
+    switch (op) {
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_MOD: case OP_POW:
+        case OP_DIV: case OP_IDIV: case OP_BAND: case OP_BOR: case OP_BXOR:
+        case OP_SHL: case OP_SHR:
+            return r == B || r == C;
+        case OP_UNM: case OP_BNOT: case OP_NOT: case OP_LEN:
+            return r == B;
+        case OP_CONCAT:            /* R[A] := R[A] .. ... .. R[A+B-1] */
+            return r >= A && r < A + B;
+        case OP_GETTABLE: return r == B || r == C;   /* R[A] := R[B][R[C]] */
+        case OP_MOVE: case OP_SELF: case OP_GETI:
+        case OP_GETFIELD: case OP_ADDI: case OP_ADDK: case OP_SUBK:
+        case OP_MULK: case OP_MODK: case OP_POWK: case OP_DIVK: case OP_IDIVK:
+        case OP_BANDK: case OP_BORK: case OP_BXORK: case OP_SHLI: case OP_SHRI:
+            return r == B;
+        case OP_MMBIN:  return r == A || r == B;
+        case OP_MMBINI: case OP_MMBINK: case OP_ERRNNIL: case OP_SETUPVAL:
+        case OP_TEST: case OP_EQK: case OP_EQI: case OP_LTI: case OP_LEI:
+        case OP_GTI: case OP_GEI:
+            return r == A;
+        case OP_TESTSET: return r == B;   /* tests R[B], may copy it to R[A] */
+        case OP_SETTABUP: return !k && r == C;
+        case OP_SETTABLE: return r == A || r == B || (!k && r == C);
+        case OP_SETI: case OP_SETFIELD: return r == A || (!k && r == C);
+        case OP_EQ: case OP_LT: case OP_LE: return r == A || r == B;
+        case OP_GETVARG: return r == B || r == C;
+        case OP_CALL: case OP_TAILCALL:
+            if (r == A) return 1;
+            if (B == 0) return r > A;
+            return r > A && r < A + B;
+        case OP_RETURN:
+            if (B == 0) return r >= A;
+            if (B == 1) return 0;
+            return r >= A && r < A + B - 1;
+        case OP_RETURN1: return r == A;
+        case OP_FORLOOP: case OP_FORPREP:
+            return r == A || r == A + 1 || r == A + 2;
+        /* Lua 5.5 generic-for frame (see lvm.c):
+        **   ra = iterator fn, ra+1 = state, ra+2 = closing var,
+        **   ra+3 = control var, ra+4/ra+5 = call scratch. */
+        case OP_TFORPREP: return r == A + 2 || r == A + 3;   /* swaps ra+2/ra+3 */
+        case OP_TFORCALL: return r == A || r == A + 1 || r == A + 3;
+        case OP_TFORLOOP: return r == A + 3;             /* tests R[A+3] */
+        case OP_SETLIST: return r == A || (r > A && (C == 0 || r <= A + C));
+        case OP_TBC:     return r == A;
+        default:         return 0;
+    }
+}
+
+/* Does instruction 'ins' write register 'r'?  The conservative answer is
+** enough here: a false "yes" only keeps a slot alive a little longer. */
+static int writes_reg (Instruction ins, int r) {
+    int op = getop(ins), A = getA(ins), B = getB(ins), C = getC(ins);
+    switch (op) {
+        case OP_CALL: case OP_TAILCALL:
+            if (r < A) return 0;
+            if (C == 0) return 1;              /* open result window */
+            return r < A + C;
+        case OP_VARARG:
+            if (r < A) return 0;
+            if (C == 0) return 1;
+            return r < A + C;
+        case OP_LOADNIL: return r >= A && r <= A + B;
+        case OP_SELF:    return r == A || r == A + 1;
+        case OP_FORPREP: case OP_FORLOOP: return r == A || r == A + 2;
+        case OP_TFORPREP: return r == A + 2 || r == A + 3;  /* swap */
+        /* TFORCALL copies fn/state/control into ra+3/ra+4/ra+5, calls at
+        ** ra+3, and stores results at ra+3 .. ra+2+C. */
+        case OP_TFORCALL:
+            if (r == A + 2) return 0;            /* closing var untouched */
+            if (r < A + 3) return 0;             /* fn/state untouched */
+            if (C == 0) return 1;
+            return r <= A + 2 + C;
+        case OP_TFORLOOP: return 0;              /* reads only, no write */
+        case OP_SETLIST: case OP_SETTABLE: case OP_SETTABUP:
+        case OP_SETI:    case OP_SETFIELD: case OP_SETUPVAL:
+        case OP_JMP:     case OP_TEST:     case OP_CLOSE: case OP_TBC:
+        case OP_MMBIN:   case OP_MMBINI:   case OP_MMBINK: case OP_ERRNNIL:
+        case OP_RETURN0: case OP_RETURN1:
+            return 0;
+        case OP_EXTRAARG:
+            /* EXTRAARG carries only Ax in the Bx field; its A/C fields are
+            ** padding the compiler never sets.  Treating A as a destination
+            ** (the default below) would falsely kill that register and break
+            ** the liveness chain across the instruction it extends. */
+            return 0;
+        case OP_TESTSET: return r == A;      /* copies R[B] into R[A] */
+        default:         return r == A;
+    }
+}
+
+/* Which registers are dead after every instruction, or NULL when the answer
+** is "none anywhere".  A register is dead after pc when no path from pc+1
+** reads it before writing it; the caller then turns that slot into nil, so the
+** collector no longer sees a stale reference the way real Lua would.
+**
+** The dataflow is the textbook backward one: live_in[pc] = use[pc] |
+** (live_out[pc] - def[pc]), live_out[pc] = union of live_in over successors.
+** It runs to a fixed point because the graph has back edges.  The set is kept
+** as one uint64 bitmask per pc, which caps the analysis at 64 registers; a
+** wider frame falls back to "clear nothing", which is always safe. */
+#define LIVE_MAXREG 64
+static unsigned char *compute_dead_after (Proto *p, unsigned char **liveout,
+                                          unsigned char **rawlive,
+                                          unsigned char **rawlin)
+{
+    int ms = p->maxstack > 0 ? p->maxstack : 1;
+    int nc = p->ncode;
+    if (liveout) *liveout = NULL;
+    if (rawlive) *rawlive = NULL;
+    if (rawlin)  *rawlin  = NULL;
+    if (ms > LIVE_MAXREG || nc <= 0) return NULL;
+
+    uint64_t *lin  = (uint64_t *)xcalloc((size_t)nc, sizeof(uint64_t));
+    uint64_t *lout = (uint64_t *)xcalloc((size_t)nc, sizeof(uint64_t));
+
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int pc = nc - 1; pc >= 0; pc--) {
+            Instruction ins = p->code[pc];
+            int op = getop(ins);
+            uint64_t u = 0, d = 0;
+            for (int r = 0; r < ms; r++) {
+                if (reads_reg(ins, r))  u |= (uint64_t)1 << r;
+                if (writes_reg(ins, r)) d |= (uint64_t)1 << r;
+            }
+            /* OP_CLOSURE consumes the stack slots its child captures as
+            ** instack upvalues: l2c_boxget builds the shared cell from
+            ** R(idx).  reads_reg() has no proto, so the child's upvalue
+            ** list is folded in here -- without it the analysis never sees
+            ** the captured value being used and would let the slot be
+            ** cleared before a later CLOSURE rebuilds the cell. */
+            if (op == OP_CLOSURE) {
+                int bx = getBx(ins);
+                if (bx >= 0 && bx < p->sizep) {
+                    Proto *sub = p->p[bx];
+                    for (int ui = 0; ui < sub->nupvalues; ui++)
+                        if (sub->upvalues[ui].instack) {
+                            int rr = sub->upvalues[ui].idx;
+                            if (rr >= 0 && rr < ms) u |= (uint64_t)1 << rr;
+                        }
+                }
+            }
+            /* live_out = union over successors */
+            uint64_t out = 0;
+            int fall = 1, take = -1;
+            switch (op) {
+                case OP_JMP:      fall = 0; take = pc + 1 + getsJ(ins); break;
+                case OP_FORLOOP:  fall = 1; take = pc + 1 - getBx(ins); break;
+                case OP_TFORLOOP: fall = 1; take = pc + 1 - getBx(ins); break;
+                case OP_FORPREP:  fall = 1; take = pc + 2 + getBx(ins); break;
+                /* TFORPREP jumps straight to its TFORCALL; there is no
+                ** fall-through (the bytecode between is the loop body). */
+                case OP_TFORPREP: fall = 0; take = pc + 1 + getBx(ins); break;
+                /* A test either falls into the paired JMP (pc+1) or skips it
+                ** and continues at pc+2, so it has both edges. */
+                case OP_EQ: case OP_LT: case OP_LE: case OP_EQK: case OP_EQI:
+                case OP_LTI: case OP_LEI: case OP_GTI: case OP_GEI:
+                case OP_TEST: case OP_TESTSET: case OP_LFALSESKIP:
+                    take = pc + 2; break;
+                default: break;
+            }
+            if (fall && pc + 1 < nc) out |= lin[pc + 1];
+            if (take >= 0 && take < nc) out |= lin[take];
+            uint64_t in = u | (out & ~d);
+            if (in != lin[pc])  { lin[pc]  = in;  changed = 1; }
+            if (out != lout[pc]){ lout[pc] = out; changed = 1; }
+        }
+    }
+
+    /* A register that is live *in* but not live *out* dies at this pc: that is
+    ** exactly where the slot can be released.  Also hand back the per-pc
+    ** live-out set so the emitter can shrink L->top to the last needed slot. */
+    unsigned char *dead = (unsigned char *)xcalloc((size_t)nc * (size_t)ms, 1);
+    for (int pc = 0; pc < nc; pc++) {
+        uint64_t dying = lin[pc] & ~lout[pc];
+        for (int r = 0; r < ms; r++)
+            if (dying & ((uint64_t)1 << r)) dead[(size_t)pc * (size_t)ms + r] = 1;
+    }
+    if (liveout) {
+        *liveout = (unsigned char *)xcalloc((size_t)nc * (size_t)ms, 1);
+        for (int pc = 0; pc < nc; pc++)
+            for (int r = 0; r < ms; r++)
+                (*liveout)[(size_t)pc * (size_t)ms + r] =
+                    (unsigned char)((lout[pc] >> r) & 1);
+    }
+    /* Second copy, left untouched by the caller's pinning pass: the emitter
+    ** uses it to tell a genuinely-live captured variable from a dead
+    ** temporary that merely reuses the same register number. */
+    if (rawlive) {
+        *rawlive = (unsigned char *)xcalloc((size_t)nc * (size_t)ms, 1);
+        for (int pc = 0; pc < nc; pc++)
+            for (int r = 0; r < ms; r++)
+                (*rawlive)[(size_t)pc * (size_t)ms + r] =
+                    (unsigned char)((lout[pc] >> r) & 1);
+    }
+    if (rawlin) {
+        *rawlin = (unsigned char *)xcalloc((size_t)nc * (size_t)ms, 1);
+        for (int pc = 0; pc < nc; pc++)
+            for (int r = 0; r < ms; r++)
+                (*rawlin)[(size_t)pc * (size_t)ms + r] =
+                    (unsigned char)((lin[pc] >> r) & 1);
+    }
+    if (getenv("L2C_DUMPLIVE")) {
+        fprintf(stderr, "== live dump nc=%d ms=%d\n", nc, ms);
+        for (int pc = 0; pc < nc; pc++) {
+            Instruction di = p->code[pc];
+            int dop = getop(di), df = 1, dt = -1;
+            switch (dop) {
+                case OP_JMP: df=0; dt=pc+1+getsJ(di); break;
+                case OP_FORLOOP: case OP_TFORLOOP: dt=pc+1-getBx(di); break;
+                case OP_FORPREP: dt=pc+2+getBx(di); break;
+                case OP_TFORPREP: dt=pc+1+getBx(di); break;
+                case OP_EQ: case OP_LT: case OP_LE: case OP_EQK: case OP_EQI:
+                case OP_LTI: case OP_LEI: case OP_GTI: case OP_GEI:
+                case OP_TEST: case OP_TESTSET: dt=pc+2; break;
+                default: break;
+            }
+            fprintf(stderr, "  pc=%-3d %-12s", pc, OP_NAMES[getop(p->code[pc])]);
+            fprintf(stderr, " A=%d B=%d C=%d Bx=%d sJ=%d fall=%d take=%d",
+                    getA(di), getB(di), getC(di), getBx(di), getsJ(di), df, dt);
+            fprintf(stderr, " in=");
+            for (int r = 0; r < ms; r++) if (lin[pc] >> r & 1) fprintf(stderr, "%d,", r);
+            fprintf(stderr, " out=");
+            for (int r = 0; r < ms; r++) if (lout[pc] >> r & 1) fprintf(stderr, "%d,", r);
+            fprintf(stderr, " dead=");
+            for (int r = 0; r < ms; r++) if (dead[(size_t)pc*(size_t)ms+r]) fprintf(stderr, "%d,", r);
+            fprintf(stderr, " cap=");
+            for (int r = 0; r < ms; r++) if (p->capreg[r]) fprintf(stderr, "%d,", r);
+            fprintf(stderr, "\n");
+        }
+    }
+    free(lin); free(lout);
+    return dead;
 }
 
 /* Number of consecutive registers starting at R[A] that 'op' overwrites,
@@ -1955,6 +2240,78 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
             if (r >= 0 && r < maxstack && !istbc[r]) { istbc[r] = 1; ntbc++; }
         }
     }
+    /* A register number can be a to-be-closed slot in one scope and a plain
+    ** local (or a captured one) in another -- the compiler reuses registers.
+    ** istbc[] is therefore only "somewhere in this function", and an OP_CLOSE
+    ** must close the tbc slot that is *open at that pc*, not merely one that
+    ** is a tbc somewhere.  Walk the code forward tracking which tbc slots are
+    ** currently open (TBC r opens r, CLOSE A closes every open slot >= A) and
+    ** remember, per pc, the lowest open slot at or above that CLOSE's A.  -1
+    ** means "no live tbc here", in which case CLOSE only ends upvalues. */
+    int *closelive = (int*)xmalloc((size_t)(p->ncode > 0 ? p->ncode : 1) * sizeof(int));
+    {
+        unsigned char *open = (unsigned char *)xcalloc((size_t)(maxstack > 0 ? maxstack : 1), 1);
+        for (int i = 0; i < p->ncode; i++) {
+            int op = getop(p->code[i]);
+            int A = getA(p->code[i]);
+            if (op == OP_TBC && A >= 0 && A < maxstack) {
+                open[A] = 1;
+                closelive[i] = -1;
+            } else if (op == OP_TFORPREP && A + 2 < maxstack) {
+                /* The generic-for closes its 4th value: TFORPREP marks R[A+2]
+                ** via lua_toclose, so from here on that slot is open too. */
+                open[A + 2] = 1;
+                closelive[i] = -1;
+            } else if (op == OP_CLOSE) {
+                int low = -1;
+                for (int r = A; r < maxstack; r++)
+                    if (open[r]) { low = r; break; }
+                closelive[i] = low;
+                if (low >= 0)
+                    for (int r = low; r < maxstack; r++)
+                        if (open[r]) open[r] = 0;
+            } else {
+                closelive[i] = -1;
+            }
+        }
+        free(open);
+    }
+
+    /* Which registers die at each instruction, so the slot can be released
+    ** the moment it is last needed.  Without this the frame keeps every dead
+    ** temporary rooted and the collector cannot free what real Lua would. */
+    unsigned char *liveout = NULL;
+    unsigned char *rawlive = NULL;
+    unsigned char *rawlin  = NULL;
+    unsigned char *dead = compute_dead_after(p, &liveout, &rawlive, &rawlin);
+    if (getenv("L2C_DUMPLIVE"))
+        fprintf(stderr, "== emit_body maxstack=%d nparams=%d ntbc=%d dead=%s\n",
+                maxstack, nparams, ntbc, dead ? "yes" : "NULL(too wide)");
+    /* Parameters keep their slots to the end (the return convention re-reads
+    ** them), and a to-be-closed slot holds a live object until OP_CLOSE.
+    **
+    ** A captured register must also keep its value wherever a later CLOSURE
+    ** (whose l2c_boxget rebuilds the cell from the slot) may still observe it.
+    ** "Wherever" is exactly the raw live-out set: if the slot is live *after*
+    ** this instruction then some successor still needs it, so it is pinned.
+    ** Where the raw analysis says the slot dies (the value is consumed by this
+    ** very instruction and no successor reads it) it is safe to clear -- that
+    ** is how the finalizer loop's `{}` temporary, which merely reuses the
+    ** register number of an unrelated captured local from an earlier scope,
+    ** stops rooting the object across a collect.  Pinning from the register's
+    ** first write instead (the old rule) pinned the whole tail of the function
+    ** and kept that dead `{}` alive forever. */
+    if (dead != NULL) {
+        for (int pc = 0; pc < p->ncode; pc++)
+            for (int r = 0; r < maxstack; r++) {
+                if (r < nparams || istbc[r] ||
+                    (p->capreg[r] && rawlive != NULL &&
+                     rawlive[(size_t)pc * (size_t)maxstack + r])) {
+                    dead[(size_t)pc * (size_t)maxstack + r] = 0;
+                    if (liveout) liveout[(size_t)pc * (size_t)maxstack + r] = 1;
+                }
+            }
+    }
 
     E_reset(E);
 
@@ -2042,8 +2399,9 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                  FX->h_prep, FX->h_loop);
         if (FX->need_box)
             emit(E, "#define l2c_boxget %s\n#define l2c_boxsync %s\n"
-                    "#define l2c_boxpull %s\n#define l2c_boxpullall %s\n",
-                 FX->h_bget, FX->h_bsync, FX->h_bpull, FX->h_ball);
+                    "#define l2c_boxpull %s\n#define l2c_boxpullall %s\n"
+                    "#define l2c_boxdrop %s\n",
+                 FX->h_bget, FX->h_bsync, FX->h_bpull, FX->h_ball, FX->h_bdrop);
         if (FX->need_varg)
             emit(E, "#define l2c_tointegerns %s\n", FX->h_vidx);
         if (FX->mode == 0) {
@@ -2318,16 +2676,35 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 break;
             }
             case OP_CLOSE: {
-                /* Close every to-be-closed slot at or above R[A]; luaF_close
-                ** walks the list from the top down, so one call suffices. */
-                if (B == 0 && ntbc > 0) {   /* B set => dead placeholder */
-                    int low = -1;
+                /* Close the to-be-closed slot that is open here; luaF_close
+                ** walks the list from the top down, so one call suffices.
+                ** closelive[pc] is -1 when this CLOSE only ends upvalues --
+                ** emitting lua_closeslot for a register that happens to be a
+                ** tbc elsewhere in the function would close the wrong slot. */
+                int low = closelive[pc];
+                if (low >= 0) emit(E, "lua_closeslot(L, R(%d));", low);
+                else          emit(E, "/* CLOSE R(%d): no tbc slot */", A);
+                /* Closing also ends the life of every upvalue at or above
+                ** level A -- the VM's luaF_close() does both in one pass.  That
+                ** second half is what gives a numeric 'for' variable its
+                ** per-iteration copy: the compiler emits CLOSE right after the
+                ** body's last capture of the loop slot, so each turn captures a
+                ** distinct upvalue instead of sharing one cell.
+                **
+                ** Here the authoritative copy of a captured register lives in
+                ** the boxes table (slot 1), keyed by reg+1.  Freezing the
+                ** register into the cell first (boxsync) preserves the value
+                ** the closures made this iteration already see, then dropping
+                ** the key (boxdrop) makes the next l2c_boxget build a fresh
+                ** cell.  Without the drop, all iterations alias one cell and
+                ** every closure observes the final value -- which is how a
+                ** plain 'for i=1,3 do t[i]=function() return i end end' came
+                ** out as 3,3,3 (and, one opcode later, blew up on a nil). */
+                if (p->ncap > 0) {
                     for (int r = A; r < maxstack; r++)
-                        if (istbc[r]) { low = r; break; }
-                    if (low >= 0) emit(E, "lua_closeslot(L, R(%d));", low);
-                    else          emit(E, "/* CLOSE R(%d): no tbc slot */", A);
-                } else {
-                    emit(E, "/* CLOSE R(%d) */", A);
+                        if (p->capreg[r])
+                            emit(E, " l2c_boxsync(L, 1, %d, R(%d));"
+                                    " l2c_boxdrop(L, 1, %d);", r + 1, r, r + 1);
                 }
                 break;
             }
@@ -2634,7 +3011,40 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
             if (wn > 0)
                 for (int r = A; r < A + wn && r < maxstack; r++)
                     if (p->capreg[r])
-                        emit(E, " l2c_boxsync(L, 1, %d, R(%d));", r + 1, r);
+                        emit(E, "\n  l2c_boxsync(L, 1, %d, R(%d));", r + 1, r);
+        }
+        /* released: nothing else to do here */
+        /* Clear registers whose last read has passed.  The frame keeps top at
+        ** the full width, so without this a dead temporary would stay a root
+        ** for the collector -- weak entries and finalizers would then survive
+        ** a collect that real Lua performs.  Parameters and captured slots are
+        ** skipped: the former are re-read by the return convention, the latter
+        ** may be read by a sibling closure at any time. */
+        if (dead != NULL && !g_no_clear) {
+            const unsigned char *dr = &dead[(size_t)pc * (size_t)maxstack];
+            int any = 0;
+            for (int r = 0; r < maxstack; r++)
+                if (dr[r]) {
+                    /* Start on a fresh line: a test instruction prints as
+                    ** `if (...) goto L_n;` with no trailing newline, and a
+                    ** clear glued onto that same line reads to GCC as an
+                    ** unguarded body (-Wmisleading-indentation). */
+                    emit(E, "\n  lua_pushnil(L); lua_replace(L, R(%d));", r);
+                    any = 1;
+                }
+            /* Trim only stack cells *above* the frame.  The frame occupies
+            ** physical slots b+1 .. b+fsz; with a per-function permutation
+            ** (fsz > maxstack) the holes are scattered *inside* that range
+            ** and a lower bound such as b+maxstack+1 would cut live slots --
+            ** the register a caller reads next may sit far above the logical
+            ** last one.  b+fsz+1 is the same width the prologue raised, so
+            ** this never shortens the frame; it only drops whatever a call
+            ** left on top.  'top' is left alone: the mirror is the
+            ** accumulator for open call windows, and every such site
+            ** re-raises L->top with its own lua_settop(_hi) first. */
+            if (any)
+                emit(E, " { int _lt = b + %d; if (lua_gettop(L) > _lt) "
+                        "lua_settop(L, _lt); }", fsz + 1);
         }
         emit(E, "\n");
         emit_junk(E, is_target, p->ncode);
@@ -2647,12 +3057,18 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
             emit(E, "#undef l2c_forprep\n#undef l2c_forloop\n");
         if (FX->need_box)
             emit(E, "#undef l2c_boxget\n#undef l2c_boxsync\n"
-                    "#undef l2c_boxpull\n#undef l2c_boxpullall\n");
+                    "#undef l2c_boxpull\n#undef l2c_boxpullall\n"
+                    "#undef l2c_boxdrop\n");
     }
     emit(E, "  return 0;\n");
     free(is_target);
     free(ref);
     free(istbc);
+    free(closelive);
+    free(dead);
+    free(liveout);
+    free(rawlive);
+    free(rawlin);
 }
 
 /* -------------------------------------------------------------------------
@@ -3585,6 +4001,18 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "}\n\n", C->h_bpull);
 
         fprintf(out,
+        "/* Forget the cached cell for a register, so a later capture makes a\n"
+        "** fresh one.  This is what OP_CLOSE means for upvalues: Lua closes\n"
+        "** every upvalue at or above a level, and that is exactly how a numeric\n"
+        "** 'for' variable gets its per-iteration copy.  The cell itself stays\n"
+        "** alive through whatever closure already holds it, so the caller\n"
+        "** freezes its value (boxsync) before dropping it. */\n"
+        "static inline void %s (lua_State *L, int boxes, int key) {\n"
+        "  lua_pushnil(L);\n"
+        "  lua_rawseti(L, boxes, key);\n"
+        "}\n\n", C->h_bdrop);
+
+        fprintf(out,
         "static inline void %s (lua_State *L, int boxes, int base, const int *regs,\n"
         "                           int n, const unsigned char *map, int xm) {\n"
         "  int i;\n"
@@ -3648,7 +4076,11 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "  if (lua_isinteger(L, ri) && lua_isinteger(L, rs)) {\n"
         "    lua_Integer init = lua_tointeger(L, ri);\n"
         "    lua_Integer step = lua_tointeger(L, rs);\n"
-        "    lua_Integer limit;\n"
+        /* Initialised because the 'forlimit' helper above can only leave the\n"
+        ** slot untouched on a path that raises (luaL_error), which the\n"
+        ** optimiser does not treat as noreturn -- so at -O1/-O2 GCC reports\n"
+        ** 'limit' as maybe-uninitialised.  One store before the loop. */
+        "    lua_Integer limit = 0;\n"
         "    lua_Unsigned count;\n"
         "    if (step == 0) luaL_error(L, \"'for' step is zero\");\n"
         "    if (%s(L, rl, init, &limit, step)) return 1;\n"
@@ -3899,9 +4331,8 @@ static void emit_pool(FILE *out) {
     ** half lives there with the blob it decodes) */
 
     if (g_wipe) {
-        /* l2c_gflags only exists when the guard runtime is emitted; without
-        ** it the tamper word is simply zero. */
-        const char *rk = g_guard ? "l2c_gflags" : "0u";
+        /* The emitted code below decides which tamper word to read; with the
+        ** guard runtime absent that word is simply zero. */
         fprintf(out,
             "/* Scratch wipe.  volatile so the store survives: the buffer is\n"
             "** dead right after, which is exactly what an optimiser deletes. */\n"
@@ -3922,8 +4353,16 @@ static void emit_pool(FILE *out) {
             "  p = l2c_%s + l2c_%s[i];\n"
             "  len = p[1] | (p[2] << 8);\n"
             "  p += 3;\n"
-            "  buf = (len <= (int)sizeof small) ? small\n"
-            "                                   : (char *)malloc((size_t)len + 1u);\n"
+            /* The empty string needs no buffer at all, and saying so keeps
+            ** -Wmaybe-uninitialized quiet: a zero-length lua_pushlstring() of
+            ** a not-yet-written stack array is well defined but not something
+            ** the optimiser proves, so it warns at -O1/-O2. */
+            "  if (len == 0) { lua_pushliteral(L, \"\"); return; }\n"
+            /* buf starts out pointing at the stack scratch, so the compiler
+            ** sees it assigned on every path. */
+            "  buf = small;\n"
+            "  if (len > (int)sizeof small)\n"
+            "    buf = (char *)malloc((size_t)len + 1u);\n"
             "  if (buf == NULL) { lua_pushnil(L); return; }\n"
             "  for (j = 0; j < len; j++)\n"
             "    buf[j] = (char)((unsigned char)p[j] ^ l2c_%s(i, j));\n"
@@ -4973,6 +5412,8 @@ int main(int argc, char **argv) {
             g_mba = 0;        /* plain a+b instead of MBA identities */
         } else if (strcmp(argv[i], "--no-wipe") == 0) {
             g_wipe = 0;       /* decode every constant up front (old behaviour) */
+        } else if (strcmp(argv[i], "--no-clear") == 0) {
+            g_no_clear = 1;   /* keep dead temporaries on the stack (no liveness wipe) */
         } else if (strcmp(argv[i], "--l2c-release") == 0) {
             g_release = 1;    /* no comments, opaque names, shuffled macro order */
         } else if (strcmp(argv[i], "--require-sig") == 0) {
