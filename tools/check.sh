@@ -6,8 +6,8 @@
 #   check.sh [GCC=path] [stage...]
 #
 # Stages (default: all):
-#   --modes      16 switch combinations x 24 end-to-end cases (output == lua.exe)
-#   --apicheck   the same 24 cases linked against an APICHECK-instrumented
+#   --modes      16 switch combinations x every test/*.lua case (output == lua.exe)
+#   --apicheck   the same cases linked against an APICHECK-instrumented
 #                liblua, so Lua's own API assertions fire.  Builds that library
 #                into tools/.audit/chk/ on first use.  This is what caught the
 #                ci->top overflow and the lua_closeslot level mismatch -- both
@@ -31,6 +31,8 @@ GCC="${1:-C:/environments/GCC-16.2.0/bin/gcc.exe}"
 command -v "$GCC" >/dev/null 2>&1 || { echo "gcc not found: $GCC"; exit 1; }
 export GCC
 
+NCASES=$(ls test/*.lua 2>/dev/null | wc -l | tr -d ' ')
+
 MODES=('--static' '--seed 0' '--seed 1' '--seed 3' '--seed 7' '--seed 42' \
        '--seed 123' '--seed 12345' '' '--no-clear' '--no-pool' '--no-guard' \
        '--no-mba' '--no-opaque' '--pool-all' '--no-wipe')
@@ -49,7 +51,7 @@ rc=0
 
 # ---------------------------------------------------------------- modes -----
 if [ $want_modes -eq 1 ]; then
-  echo "== modes: ${#MODES[@]} switch combinations x 24 cases =="
+  echo "== modes: ${#MODES[@]} switch combinations x $NCASES cases =="
   for m in "${MODES[@]}"; do
     out=$(bash tools/runall.sh "$m" 2>&1)
     echo "$out" | grep -E '^MODE|^FAIL'
@@ -74,7 +76,7 @@ if [ $want_api -eq 1 ]; then
       || ar rcs "$LIB" $objs 2>/dev/null \
       || { echo "ar failed"; exit 1; }
   fi
-  echo "== apicheck: 24 cases against APICHECK liblua =="
+  echo "== apicheck: $NCASES cases against APICHECK liblua =="
   for m in '--static' '--seed 0' '--seed 7' '--no-clear' '--no-pool'; do
     out=$(LIB="$LIB" MODE="$m" timeout 900 bash tools/apichk.sh 2>&1)
     echo "$out" | grep -E '^APICHECK'
