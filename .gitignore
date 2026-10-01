@@ -44,3 +44,12 @@ Desktop.ini
 # ---- 打包产物 ----
 luac2c_*.zip
 /.rt/
+
+# ---- 验证脚本的产物（tools/check.sh 生成）----
+tools/.audit/
+tools/.scratch/
+
+# ---- 临时审计/比对目录 ----
+/.audit/
+/test/.chk/
+/luac.out

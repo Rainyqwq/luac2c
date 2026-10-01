@@ -32,13 +32,37 @@ out.exe                          # 3. 运行，输出与 lua.exe 完全一致
 | `--require-sig` | 未签名的产物拒绝运行 |
 | `--l2c-release` | 去注释、拉平所有名字 |
 
+## 构建与验证
+
+新克隆里没有 `lua.exe` / `luac.exe` / `liblua.a`（都不进版本库），先把工具链建出来：
+
+```
+mingw32-make              # 编译 luac2c.exe
+mingw32-make lua          # 从 lua-5.5.1/src 构建 lua.exe / luac.exe / liblua.a
+```
+
+验证分五道，默认一条命令全跑（`mingw32-make check`），也可以只跑其中几道：
+
+| 目标 | 内容 |
+| --- | --- |
+| `modes` | 16 种开关组合 × 每个用例：翻译后运行，输出与 `lua.exe` 逐字节比对 |
+| `apicheck` | 同一批用例链到 `-DLUA_USE_APICHECK` 重编的 liblua，让 Lua 自己的 API 断言开火 |
+| `stress` | `luac2c压力测试.lua`（232 个自带断言的用例）翻译后跑一遍 |
+| `warn` | 生成的 C 在 `-std=c99 -Wall -Wextra` 下必须 0 警告 |
+| `fuzz` | 畸形输入：要么给出清晰错误，要么正常翻译且产出的 C 能编译；不允许崩溃 |
+
+`apicheck` 这一道值得单独说：多重返回值写穿 `ci->top`、`lua_closeslot` 传错层级这类问题，
+在普通构建下完全静默，只有让 Lua 的 `api_check` 真正生效才暴露得出来。
+
 ## 目录结构
 
 ```
 ├── luac2c.c              # 翻译器源码（单文件实现）
+├── Makefile              # 构建 + 测试入口（mingw32-make）
 ├── lua-5.5.1/            # vendored Lua 5.5（src + build/liblua.a）
 ├── lua5.5-include/       # 对外暴露的头文件
-├── test/                 # 24 个端到端用例 + 测试脚本（test.ps1 / runall.ps1 / sweep.ps1 / sweepall.ps1）
+├── test/                 # 端到端用例
+├── tools/                # 验证脚本（runall / apichk / check / fuzz / mkdeep ...）
 ├── luac2c_flutter/       # Windows GUI 客户端（Flutter, Material You / M3）
 │   └── lib/              # main / app / app_shell 三个入口，其余按职责分模块
 │       ├── pipeline.dart # 构建调度（并发池、进度、状态文案），不含 Widget

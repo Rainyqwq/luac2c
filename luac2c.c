@@ -456,7 +456,19 @@ static void loadConstants(Reader *R, Proto *f) {
             case KINT:    c->i = r_readinteger(R); break;
             case KFLT:    c->n = r_readnumber(R); break;
             case KSHRSTR:
-            case KLNGSTR: c->s = r_readstring(R); break;
+            case KLNGSTR:
+                c->s = r_readstring(R);
+                /* A string constant encoded as the "reuse" form with index 0
+                ** decodes to a NULL string.  Real chunks never produce one for a
+                ** KSTR constant, but a hand-made file can, and every consumer
+                ** here (strlen/strcmp/pool_eq/emit_kstr) assumes non-NULL --
+                ** so reject it at the boundary instead of dereferencing NULL
+                ** deeper in. */
+                if (!R->err && c->s == NULL) {
+                    r_error(R, "string constant %d is NULL", i);
+                    return;
+                }
+                break;
             default:
                 r_error(R, "unknown constant tag 0x%02x", c->tag);
                 return;
@@ -2230,6 +2242,46 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     ** relation an analyst would otherwise rely on. */
     int fsz      = FX ? FX->fsz : maxstack;
 
+    /* How far above the frame the code can push in a single window.
+    **
+    ** The prologue reserves stack above b+fsz for the "windows" the
+    ** translation materialises: a call's arguments, its results, the copy-back
+    ** of those results, and the values a RETURN/vararg spill pushes.  A fixed
+    ** slack is not enough -- "return a,b,...,z" or a function that returns a
+    ** flood of varargs pushes as many values as its frame is wide (or more),
+    ** so a caller receiving them would write past ci->top (which lua_checkstack
+    ** raised only once, at entry).  Compute the real worst case and reserve it:
+    **
+    **   CALL/TAILCALL  : window base A..A+nb, then nresults copies back
+    **   RETURN B!=0    : A .. A+B-2 pushed above the frame
+    **   RETURN B==0    : unbounded (bounded by the vararg count at run time,
+    **                    covered by the per-site checkstack instead)
+    **   SETLIST/VARARG : covered by their own per-site checkstack
+    **
+    ** The extra 32 covers the arg-window copy and small fixed overruns. */
+    int slack = 32;
+    for (int i = 0; i < p->ncode; i++) {
+        Instruction ins = p->code[i];
+        int op = getop(ins);
+        if (op == OP_CALL || op == OP_TAILCALL) {
+            int b = getB(ins);
+            int c = getC(ins);
+            /* A..A+nb arguments, plus up to C-1 results (C==0 is unbounded and
+            ** handled per site).  Keep it conservative: 2*255 covers the widest
+            ** legal window rather than trying to be exact. */
+            int need = (b != 0 ? b : 255) + (c != 0 ? c : 255);
+            if (need > slack) slack = need;
+        } else if (op == OP_RETURN) {
+            int b = getB(ins);
+            if (b > 1) {
+                int need = getA(ins) + b - 1;
+                if (need > slack) slack = need;
+            }
+        }
+    }
+    /* Round up so the reserved width does not itself leak the frame size. */
+    slack = (slack + 15) & ~15;
+
     /* Registers declared "to be closed" (local x <close> = ...).  OP_TBC
     ** marks them; OP_CLOSE runs their __close in reverse order. */
     int *istbc = (int*)xcalloc((size_t)maxstack, sizeof(int));
@@ -2249,32 +2301,98 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     ** remember, per pc, the lowest open slot at or above that CLOSE's A.  -1
     ** means "no live tbc here", in which case CLOSE only ends upvalues. */
     int *closelive = (int*)xmalloc((size_t)(p->ncode > 0 ? p->ncode : 1) * sizeof(int));
+    int *closelow  = (int*)xmalloc((size_t)(p->ncode > 0 ? p->ncode : 1) * sizeof(int));
+    /* Per-pc: does the CLOSE here end a generic-for control block rather than a
+    ** plain to-be-closed scope?  Only then is its lua_closeslot guarded by the
+    ** runtime nil test on the closing value, not unconditionally. */
+    int *closefor  = (int*)xcalloc((size_t)(p->ncode > 0 ? p->ncode : 1), sizeof(int));
     {
         unsigned char *open = (unsigned char *)xcalloc((size_t)(maxstack > 0 ? maxstack : 1), 1);
+        /* Which opcode opened the slot currently marked in open[]: 1 = a
+        ** generic-for (OP_TFORPREP), 0 = a plain OP_TBC.  Used so a CLOSE can
+        ** tell the two apart -- TBC-opened slots are always really open (the
+        ** value was there to mark), for-opened ones depend on the runtime
+        ** closing value being non-nil. */
+        unsigned char *openfor = (unsigned char *)xcalloc((size_t)(maxstack > 0 ? maxstack : 1), 1);
         for (int i = 0; i < p->ncode; i++) {
             int op = getop(p->code[i]);
             int A = getA(p->code[i]);
             if (op == OP_TBC && A >= 0 && A < maxstack) {
-                open[A] = 1;
+                open[A] = 1; openfor[A] = 0;
                 closelive[i] = -1;
+                closelow[i] = -1;
             } else if (op == OP_TFORPREP && A + 2 < maxstack) {
-                /* The generic-for closes its 4th value: TFORPREP marks R[A+2]
-                ** via lua_toclose, so from here on that slot is open too. */
-                open[A + 2] = 1;
+                /* The generic-for closes its 4th value *when it is non-nil*:
+                ** lvm.c's OP_TFORPREP calls luaF_newtbcupval(ra+2), which
+                ** returns without marking anything when the value is false or
+                ** nil.  Whether the slot is open is therefore a runtime
+                ** property, and the emitted lua_toclose (and the lua_closeslot
+                ** of the CLOSE that ends the loop) are both guarded by a nil
+                ** test on it.  Statically we still mark the slot "open" so that
+                ** CLOSE can see it -- otherwise the close of a live closing
+                ** value would be dropped entirely. */
+                open[A + 2] = 1; openfor[A + 2] = 1;
                 closelive[i] = -1;
+                closelow[i] = -1;
             } else if (op == OP_CLOSE) {
-                int low = -1;
-                for (int r = A; r < maxstack; r++)
-                    if (open[r]) { low = r; break; }
-                closelive[i] = low;
-                if (low >= 0)
-                    for (int r = low; r < maxstack; r++)
-                        if (open[r]) open[r] = 0;
+                /* lua_closeslot() asserts that the index it is given is the
+                ** *topmost* entry of the tbc list (lapi.c: "L->tbclist.p ==
+                ** level"), and luaF_close() then walks *down* from there.  So a
+                ** CLOSE over several open slots must be emitted as one call per
+                ** slot, highest first -- passing the lowest (as an earlier
+                ** version did) happens to give the right result on a normal
+                ** build but trips the API assertion and leaves the closed
+                ** slots above it un-cleared.  Store the highest open slot in
+                ** closelive[] and remember the low bound to stop at. */
+                int high = -1, low = -1;
+                for (int r = maxstack - 1; r >= A; r--)
+                    if (open[r]) { high = r; break; }
+                if (high >= 0)
+                    for (int r = A; r <= high; r++)
+                        if (open[r]) { low = r; break; }
+                closelive[i] = high;
+                closelow[i] = (high >= 0) ? low : -1;
+                closefor[i]  = (high >= 0 && openfor[high]) ? 1 : 0;
+                for (int r = A; r < maxstack; r++) { open[r] = 0; openfor[r] = 0; }
             } else {
                 closelive[i] = -1;
+                closelow[i] = -1;
             }
         }
         free(open);
+    }
+
+    /* Where the captured-register refresh is actually needed.
+    **
+    ** A captured register lives in two places: the stack slot R(r) and, once a
+    ** closure has touched it, the shared cell in the boxes table.  The cell is
+    ** authoritative, so R(r) has to be refreshed from it before the value is
+    ** used -- that is l2c_boxpullall.  Emitting it in front of *every*
+    ** instruction is the simple correct thing, but it is also the single
+    ** biggest cost in the generated code: three Lua API calls per captured
+    ** register per bytecode executed.  A tight loop over uncaptured registers
+    ** paid the whole price for nothing.
+    **
+    ** The refresh is only observable when the instruction reads a captured
+    ** register, so gate it on that.  Two instructions need it for a different
+    ** reason and are always refreshed:
+    **   OP_CLOSURE -- l2c_boxget builds the cell *from* R(idx), so a stale slot
+    **                 would bake the wrong value into the new closure.
+    **   OP_CLOSE   -- l2c_boxsync freezes R(r) *into* the cell, so a stale slot
+    **                 would overwrite the closure's own updates.
+    ** Anything that only writes a captured register is safe without a pull:
+    ** the write replaces the value and boxsync (emitted after every write to a
+    ** captured slot) republishes it to the cell. */
+    unsigned char *need_pull =
+        (unsigned char *)xcalloc((size_t)(p->ncode > 0 ? p->ncode : 1), 1);
+    if (p->ncap > 0) {
+        for (int i = 0; i < p->ncode; i++) {
+            Instruction ins = p->code[i];
+            int op = getop(ins);
+            if (op == OP_CLOSE || op == OP_CLOSURE) { need_pull[i] = 1; continue; }
+            for (int r = 0; r < maxstack; r++)
+                if (p->capreg[r] && reads_reg(ins, r)) { need_pull[i] = 1; break; }
+        }
     }
 
     /* Which registers die at each instruction, so the slot can be released
@@ -2334,11 +2452,14 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
         emit(E, "  static const int l2c_caps[] = {");
         for (int r = 0; r < maxstack; r++)
             if (p->capreg[r]) { emit(E, "%s%d", first ? "" : ", ", r); first = 0; }
-        emit(E, "};\n");
-        /* The split form leaves this table behind in the dispatcher, which no
-        ** longer runs any instruction; an explicit reference keeps a build
-        ** with -Wextra quiet without changing what is emitted. */
-        emit(E, "  (void)l2c_caps;\n");
+        /* The reference has to sit on the same line as the declaration.
+        ** flatten_emit() collects lines starting with "  static const " and
+        ** copies each into every split block, while anything else stays in the
+        ** dispatcher -- so a (void) on its own line only silences one of the
+        ** copies and the rest warn as unused.  That matters now that the
+        ** boxpullall refresh is gated: a block whose instructions never read a
+        ** captured register has no other reference to the table at all. */
+        emit(E, "}; (void)l2c_caps;\n");
     }
 
     /* Diversification macros.  Everything below is written against the short
@@ -2408,10 +2529,9 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
             emit(E, "  static const unsigned char %s[] = {", FX->mapname);
             for (int r = 0; r < fsz; r++)
                 emit(E, "%s%d", r ? "," : "", r < maxstack ? FX->perm[r] : r);
-            emit(E, "};\n");
-            /* Same reason as l2c_caps above: the dispatcher keeps the table
-            ** but stops indexing it once the blocks own the body. */
-            emit(E, "  (void)%s;\n", FX->mapname);
+            /* Same reason as l2c_caps above: the reference rides along on the
+            ** declaration line so every split block gets it too. */
+            emit(E, "}; (void)%s;\n", FX->mapname);
         }
     } else {
         emit(E, "  int b = 0, top = 0, ne = 0;\n");
@@ -2421,7 +2541,7 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     ** bytecode itself declares, so it can never collide with GETUPVAL. */
     emit(E, "#define KP lua_upvalueindex(%d)\n", p->nupvalues + 1);
     emit(E, "  (void)ne; (void)top;\n");
-    emit(E, "  luaL_checkstack(L, %d + 24, \"l2c\");\n", fsz);
+    emit(E, "  luaL_checkstack(L, %d + %d, \"l2c\");\n", fsz, slack);
 
     if (isvahid) {
         /* Hidden varargs: the VM moves the fixed parameters above the extra
@@ -2430,7 +2550,7 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
         emit(E, "  { int _i, _n = lua_gettop(L) - %d; if (_n < 0) _n = 0; ne = _n;\n",
              nparams);
         emit(E, "    if (_n > 0) {\n");
-        emit(E, "      luaL_checkstack(L, _n + %d + 24, \"l2c\");\n", fsz);
+        emit(E, "      luaL_checkstack(L, _n + %d + %d, \"l2c\");\n", fsz, slack);
         emit(E, "      for (_i = 0; _i < %d; _i++) lua_pushvalue(L, 1 + _i);\n", nparams);
         emit(E, "      for (_i = 0; _i < %d; _i++) lua_remove(L, 1);\n", nparams);
         emit(E, "      b = _n;\n");
@@ -2496,9 +2616,10 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
 
         if (g_annotate)
             emit(E, "  /* [%d] %s */ ", pc, OP_NAMES[op]);
-        if (p->ncap > 0) {
+        if (need_pull[pc]) {
             /* captured registers may have been written through a cell by a
-            ** nested closure: refresh them from the cell before use */
+            ** nested closure: refresh them from the cell before use.  Emitted
+            ** only where a captured register is actually read (see need_pull). */
             const char *map = (FX && FX->mode == 0) ? FX->mapname : "(const unsigned char *)0";
             emit(E, "l2c_boxpullall(L, 1, b, l2c_caps, %d, %s, %d); ",
                  p->ncap, map, (FX && FX->mode == 1) ? FX->xmask : 0);
@@ -2606,11 +2727,17 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 emit(E, "; lua_settable(L, R(%d));", A);
                 break;
             case OP_NEWTABLE: {
-                int hash = vB > 0 ? (1 << (vB - 1)) : 0;
-                int arr  = vC;
+                /* The VM computes the exponent as "1 << (vB-1)" and the array
+                ** size as an *unsigned* Ax * (MAXARG_vC+1) (lvm.c uses
+                ** cast_uint), so both must be evaluated unsigned here too:
+                ** vB is 6 bits (up to 63) and the product can exceed INT_MAX,
+                ** both of which are undefined on signed int. */
+                unsigned hash = vB > 0 ? (1u << (vB - 1)) : 0u;
+                unsigned arr  = vC;
                 if (k && pc + 1 < p->ncode && getop(p->code[pc+1]) == OP_EXTRAARG)
-                    arr += (int)getAx(p->code[++pc]) * (MAXARG_vC + 1);
-                emit(E, "lua_createtable(L, %d, %d); lua_replace(L, R(%d));", arr, hash, A);
+                    arr += (unsigned)getAx(p->code[++pc]) * (unsigned)(MAXARG_vC + 1);
+                emit(E, "lua_createtable(L, %d, %d); lua_replace(L, R(%d));",
+                     (int)arr, (int)hash, A);
                 break;
             }
             case OP_SELF:       /* R[A+1] := R[B]; R[A] := R[B][K[C]] */
@@ -2676,14 +2803,35 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 break;
             }
             case OP_CLOSE: {
-                /* Close the to-be-closed slot that is open here; luaF_close
-                ** walks the list from the top down, so one call suffices.
-                ** closelive[pc] is -1 when this CLOSE only ends upvalues --
-                ** emitting lua_closeslot for a register that happens to be a
-                ** tbc elsewhere in the function would close the wrong slot. */
-                int low = closelive[pc];
-                if (low >= 0) emit(E, "lua_closeslot(L, R(%d));", low);
-                else          emit(E, "/* CLOSE R(%d): no tbc slot */", A);
+                /* Close every to-be-closed slot open here, highest first:
+                ** lua_closeslot() requires the topmost tbclist entry and
+                ** luaF_close() unwinds downward from it.  closelive[pc] is the
+                ** highest open slot and closelow[pc] the lowest, or -1 when this
+                ** CLOSE only ends upvalues -- emitting lua_closeslot for a
+                ** register that happens to be a tbc elsewhere in the function
+                ** would close the wrong slot. */
+                int high = closelive[pc];
+                if (high >= 0) {
+                    if (closefor[pc]) {
+                        /* This CLOSE ends a generic-for's control block.  Its
+                        ** topmost slot holds the loop's closing value, which is
+                        ** only marked when non-nil -- re-test it here rather
+                        ** than trusting a remembered flag (see OP_TFORPREP).
+                        ** The slots below it in the same CLOSE are plain
+                        ** to-be-closed locals that were genuinely marked, so
+                        ** they close unconditionally. */
+                        int low = closelow[pc];
+                        emit(E, "if (!lua_isnil(L, R(%d))) lua_closeslot(L, R(%d)); ",
+                             high, high);
+                        for (int r = high - 1; r >= low; r--)
+                            emit(E, "lua_closeslot(L, R(%d)); ", r);
+                    } else {
+                        for (int r = high; r >= closelow[pc]; r--)
+                            emit(E, "lua_closeslot(L, R(%d)); ", r);
+                    }
+                } else {
+                    emit(E, "/* CLOSE R(%d): no tbc slot */", A);
+                }
                 /* Closing also ends the life of every upvalue at or above
                 ** level A -- the VM's luaF_close() does both in one pass.  That
                 ** second half is what gives a numeric 'for' variable its
@@ -2807,6 +2955,14 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 emit(E, "lua_call(L, _nb - 1, ");
                 if (C == 0) emit(E, "LUA_MULTRET); _nr = lua_gettop(L) - _hi; ");
                 else        emit(E, "%d); _nr = %d; ", C - 1, C - 1);
+                /* _nr is unknown until now, and the copy-back loop pushes _nr
+                ** values *above* the results already sitting on the stack.
+                ** luaL_checkstack at the top of the block only covered the
+                ** arguments, so reserve the result window too: without this a
+                ** function returning more than fsz+24 values writes past the
+                ** frame's reserved stack top (luaconf's api_incr_top would
+                ** assert; a normal build reads/writes out of bounds). */
+                emit(E, "luaL_checkstack(L, _nr + 1, \"l2c\"); ");
                 emit(E, "for (_j = 0; _j < _nr; _j++) "
                         "lua_pushvalue(L, _hi + 1 + _j); ");
                 emit(E, "for (_j = _nr - 1; _j >= 0; _j--) "
@@ -2836,7 +2992,12 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                     else emit(E, "{ int _i; for (_i = 0; _i < %d; _i++) "
                                  "lua_pushvalue(L, R(%d + _i)); return %d; }", n, A, n);
                 } else {
+                    /* B==0: return every value from R(A) up to the top mirror.
+                    ** _n is unbounded (a VARARG with C==0 can have filled the
+                    ** window), and these pushes go *above* the current top, so
+                    ** the frame's reserved slack is not enough on its own. */
                     emit(E, "{ int _i, _n = top - b - %d - 1; if (_n < 0) _n = 0; "
+                            "luaL_checkstack(L, _n + 1, \"l2c\"); "
                             "for (_i = 0; _i < _n; _i++) lua_pushvalue(L, R(%d + _i)); "
                             "return _n; }", A, A);
                 }
@@ -2870,12 +3031,23 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 ** pairs(t)' stays unaffected; a non-nil value without __close
                 ** raises the same error the VM raises. */
                 if (A + 2 < maxstack) istbc[A + 2] = 1;
+                /* lua_toclose is a no-op for false/nil: luaF_newtbcupval
+                ** returns early, so a plain 'for k,v in pairs(t)' -- no 4th
+                ** control value -- opens nothing.  Test it rather than calling
+                ** blind, or the CLOSE at the end of the loop would hand
+                ** lua_closeslot a level that was never marked (lapi.c asserts
+                ** L->tbclist.p == level).  The same test is repeated at that
+                ** CLOSE: R[A+2] is never written while the loop runs (TFORCALL
+                ** skips it, TFORLOOP writes nothing), so it still holds the
+                ** closing value there.  Re-testing beats remembering the answer
+                ** in a variable -- a file-scope one would be clobbered by a
+                ** nested or recursive call, silently dropping a __close. */
                 emit(E, "{ if (lua_gettop(L) < b + %d) lua_settop(L, b + %d); "
                         "lua_pushvalue(L, R(%d + 3)); lua_pushvalue(L, R(%d + 2)); "
                         "lua_replace(L, R(%d + 3)); lua_replace(L, R(%d + 2)); "
-                        "lua_toclose(L, R(%d + 2)); "
+                        "if (!lua_isnil(L, R(%d + 2))) lua_toclose(L, R(%d + 2)); "
                         "goto L_%d; }",
-                     fsz, fsz, A, A, A, A, A, E_LABEL(E, pc + 1 + Bx));
+                     fsz, fsz, A, A, A, A, A, A, E_LABEL(E, pc + 1 + Bx));
                 break;
             case OP_TFORCALL:
                 /* call R[A](R[A+1], R[A+3]); the C results go to R[A+3..] */
@@ -2896,19 +3068,25 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 /* R[A+i] -> t[vC + i] for i = 1..n  (vC is the *last* index
                 ** already stored, so the first new element goes at vC+1). */
                 int n = vB;
-                int base_idx = vC;
+                /* Same unsigned Ax*(MAXARG_vC+1) as the VM.  The index is only
+                ** used as a lua_Integer argument to lua_seti, so keep it in
+                ** int64 rather than truncating to int. */
+                long long base_idx = vC;
                 if (k && pc + 1 < p->ncode && getop(p->code[pc+1]) == OP_EXTRAARG)
-                    base_idx += (int)getAx(p->code[++pc]) * (MAXARG_vC + 1);
+                    base_idx += (long long)getAx(p->code[++pc]) * (MAXARG_vC + 1);
                 if (n == 0)
+                    /* B==0: the element count comes from the top mirror and is
+                    ** unbounded, so make room before the push/seti loop. */
                     emit(E, "{ int _i, _n = top - b - %d - 2; if (_n < 0) _n = 0; "
+                            "luaL_checkstack(L, 2, \"l2c\"); "
                             "for (_i = 1; _i <= _n; _i++) { "
                             "lua_pushvalue(L, R(%d + _i)); "
-                            "lua_seti(L, R(%d), %d + _i); } }",
+                            "lua_seti(L, R(%d), %lld + _i); } }",
                          A, A, A, base_idx);
                 else
                     emit(E, "{ int _i; for (_i = 1; _i <= %d; _i++) { "
                             "lua_pushvalue(L, R(%d + _i)); "
-                            "lua_seti(L, R(%d), %d + _i); } }",
+                            "lua_seti(L, R(%d), %lld + _i); } }",
                          n, A, A, base_idx);
                 break;
             }
@@ -3065,6 +3243,9 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
     free(ref);
     free(istbc);
     free(closelive);
+    free(closelow);
+    free(closefor);
+    free(need_pull);
     free(dead);
     free(liveout);
     free(rawlive);
@@ -3337,7 +3518,7 @@ static void emit_guard_runtime(FILE *out) {
         "  static const unsigned bad[15] = { 0x16B50C12u, 0x9B721511u, 0xB696E214u, 0x6AB5B011u, 0x1772651Eu, 0x96BF1E10u, 0x5B20A712u, 0x7C655010u, 0x8BDE0610u, 0xD8B6941Fu, 0x03285A11u, 0x406E041Eu, 0xF3A5BC1Cu, 0xC3838012u, 0xFED3FC12u };\n"
         "  int pos, i;\n"
         "  for (pos = 0; nm[pos] != 0; pos++) {\n"
-        "    for (i = 0; i < 12; i++) {\n"
+        "    for (i = 0; i < 15; i++) {\n"
         "      unsigned e = bad[i] ^ 0x5B2ED417u;\n"
         "      int len = (int)(e & 0xFFu), k;\n"
         "      for (k = 0; k < len && nm[pos + k] != 0; k++) ;\n"
@@ -4123,7 +4304,11 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "    lua_Unsigned count = (lua_Unsigned)lua_tointeger(L, rc);\n"
         "    if (count > 0) {\n"
         "      lua_pushinteger(L, (lua_Integer)(count - 1)); lua_replace(L, rc);\n"
-        "      lua_pushinteger(L, idx + step);               lua_replace(L, ridx);\n"
+        /* intop(+, idx, step) in the VM is unsigned wraparound; a plain signed
+        ** addition is undefined behaviour near LUAI_MAXINTEGER and lets the
+        ** compiler assume it cannot wrap. */
+        "      lua_pushinteger(L, (lua_Integer)((lua_Unsigned)idx + (lua_Unsigned)step)); "
+        "lua_replace(L, ridx);\n"
         "      return 1;\n"
         "    }\n"
         "  }\n"
@@ -4913,7 +5098,14 @@ static unsigned char *slurp_stream(FILE *f, size_t *n) {
     fflush(f);
     if (fseek(f, 0, SEEK_SET) != 0) { *n = 0; return buf; }
     for (;;) {
-        if (len == cap) { cap *= 2; buf = (unsigned char*)xrealloc(buf, cap, 1); }
+        if (len == cap) {
+            /* Without this guard a stream larger than SIZE_MAX/2 makes cap wrap
+            ** to 0, after which "cap - len" underflows to a huge size and the
+            ** fread below writes out of bounds. */
+            if (cap > (SIZE_MAX / 2)) break;
+            cap *= 2;
+            buf = (unsigned char*)xrealloc(buf, cap, 1);
+        }
         size_t got = fread(buf + len, 1, cap - len, f);
         len += got;
         if (got == 0) break;
@@ -5022,8 +5214,15 @@ static size_t l2c_rva_to_off(const unsigned char *img, size_t n,
             memcpy(&phent, img + 42, 2);
             memcpy(&phnum, img + 44, 2);
         } else return 0;
+        /* Validate before the pointer arithmetic: a hand-crafted or truncated
+        ** image can carry a phoff far past the buffer, and "img + phoff" would
+        ** itself be out-of-bounds (or wrap) before the per-entry check gets a
+        ** chance to run. */
+        if (phent == 0 || phnum == 0) return 0;
+        if (phoff > n || (unsigned long long)phent > (n - phoff)) return 0;
         for (unsigned i = 0; i < phnum; i++) {
-            const unsigned char *ph = img + phoff + (size_t)i * phent;
+            if ((unsigned long long)i * phent > (n - phoff)) break;
+            const unsigned char *ph = img + (size_t)phoff + (size_t)i * phent;
             if (ph + 56 > img + n) break;
             unsigned type = l2c_rd32(ph);
             if (type != 1) continue;             /* PT_LOAD */
