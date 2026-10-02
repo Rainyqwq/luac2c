@@ -1,7 +1,8 @@
-// 主界面（防护）：左右双栏 —— 左栏操作区，右栏运行日志，顶部状态条。
+// 主界面（防护）：左右双栏 —— 左栏操作区，右栏运行日志，顶部状态卡。
 //
 // 页面本身只做两件事：接住拖放文件、把用户操作转给 [PipelineCtl]。
-// 左栏的每一块都是 lib/home/ 下的独立部件，状态条固定在标题栏下方。
+// 左栏的每一块都是 lib/home/ 下的独立部件；顶部状态卡与它们同一套
+// 形状语言（16px 圆角 + 16px 边距），所以是同一版式里的一块。
 // 快捷键按 Windows 惯例配：Ctrl+O 添加文件、Ctrl+Enter 开始构建、
 // Esc 停止。窄窗口下切成单栏（日志在上、操作在下），否则 800px 宽会把
 // 日志压到看不见。
@@ -107,7 +108,8 @@ class _HomePageState extends State<HomePage> {
           autofocus: true,
           child: Column(
             children: [
-              // 状态栏在内容区外面，横跨整个窗口宽度、永不随内容滚动。
+              // 状态条在内容区外面，不随内容滚动。做成一张圆角卡片，
+              // 边距与圆角都和下面的 AppCard 一致（见 home/status_bar.dart）。
               // 放在标题栏正下方：底边那条太沉，而且贴着日志区像是日志的一部分。
               // 它订阅 ctl 的进度与提示 —— 所以单独一个 ListenableBuilder，
               // 状态变化不会重建下面的卡片区。
@@ -116,8 +118,10 @@ class _HomePageState extends State<HomePage> {
                 builder: (context, _) => StatusBar(_ctl),
               ),
               Expanded(
-                child: SafeArea(
-                  top: false,
+                // 状态条已经吃掉顶部安全区，这里只管左右与底部，
+                // 免得内容区与状态条之间多出一道缝。
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
                   child: LayoutBuilder(
                     builder: (context, box) {
                       // 左右双栏：左栏操作区可滚动，右栏是整屏高度的运行日志。
@@ -168,8 +172,9 @@ class _HomePageState extends State<HomePage> {
                         );
                       }
 
+                      // 左边距 16 与上面状态条卡片对齐，两张卡在同一条竖线上
                       return Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
                         child: Row(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
