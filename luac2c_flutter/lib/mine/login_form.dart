@@ -22,6 +22,8 @@ class _LoginFormState extends State<LoginForm> {
   bool _obscure = true;
   bool _busy = false;
   String? _err;
+  /// 成功提示。与 [_err] 一样就地显示在表单里，不弹浮层。
+  String? _msg;
 
   @override
   void dispose() {
@@ -53,12 +55,9 @@ class _LoginFormState extends State<LoginForm> {
     if (err == null) {
       _pwd.clear();
       widget.onDone();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(_reg ? '注册成功，已登录' : '登录成功'),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
+      // 成功提示就地显示在表单里，不弹浮层。错误本来就是内联显示的
+      // （_err），成功也该一致 —— 而且 SnackBar 会盖住表单下半部分。
+      setState(() => _msg = _reg ? '注册成功，已登录' : '登录成功');
     }
   }
 
@@ -97,6 +96,7 @@ class _LoginFormState extends State<LoginForm> {
           onSelectionChanged: (s) => setState(() {
             _reg = s.first;
             _err = null;
+            _msg = null;
           }),
         ),
         const SizedBox(height: 14),
@@ -149,6 +149,7 @@ class _LoginFormState extends State<LoginForm> {
             onPressed: () => setState(() {
               _reg = true;
               _err = null;
+              _msg = null;
             }),
             child: const Text('还没有账号？注册'),
           ),
@@ -162,6 +163,19 @@ class _LoginFormState extends State<LoginForm> {
               Expanded(
                 child: Text(_err!,
                     style: TextStyle(fontSize: 12.5, color: cs.error)),
+              ),
+            ]),
+          ),
+        if (_msg != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Row(children: [
+              Icon(Icons.check_circle_outline,
+                  size: 15, color: cs.primary),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(_msg!,
+                    style: TextStyle(fontSize: 12.5, color: cs.primary)),
               ),
             ]),
           ),

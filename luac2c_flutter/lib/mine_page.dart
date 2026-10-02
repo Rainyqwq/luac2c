@@ -17,6 +17,8 @@ class MinePage extends StatefulWidget {
 
 class _MinePageState extends State<MinePage> {
   int _users = 0;
+  /// 「复制ID」按钮的已复制反馈状态
+  bool _copied = false;
 
   @override
   void initState() {
@@ -108,9 +110,11 @@ class _MinePageState extends State<MinePage> {
           ),
           SizedBox(
             height: 30,
+            // 复制后就地变成「已复制」并短暂禁用。不弹浮层 —— 浮层会盖住
+            // 下方内容，而且这个页面没有状态栏可承载提示。
             child: FilledButton.tonal(
-              onPressed: _copyFingerprint,
-              child: const Text('复制ID'),
+              onPressed: _copied ? null : _copyFingerprint,
+              child: Text(_copied ? '已复制' : '复制ID'),
             ),
           ),
         ]),
@@ -120,12 +124,10 @@ class _MinePageState extends State<MinePage> {
 
   Future<void> _copyFingerprint() async {
     await Clipboard.setData(ClipboardData(text: AccountCtl.I.fingerprint));
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('ID已复制'), behavior: SnackBarBehavior.floating),
-      );
-    }
+    if (!mounted) return;
+    setState(() => _copied = true);
+    await Future<void>.delayed(const Duration(seconds: 2));
+    if (mounted) setState(() => _copied = false);
   }
 
   Widget _fingerprintCard() {

@@ -133,10 +133,6 @@ class AppTheme {
               RoundedRectangleBorder(borderRadius: BorderRadius.circular(20))),
         ),
       ),
-      snackBarTheme: SnackBarThemeData(
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      ),
       dividerTheme: DividerThemeData(color: cs.outlineVariant, thickness: 1),
       tooltipTheme: const TooltipThemeData(
         // Windows 的 tooltip 是淡色小方块，不是深色气泡

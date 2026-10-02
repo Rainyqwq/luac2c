@@ -1,8 +1,7 @@
-// 主界面（防护）：左右双栏 —— 左栏操作区，右栏运行日志。
+// 主界面（防护）：左右双栏 —— 左栏操作区，右栏运行日志，底边状态栏。
 //
-// 页面本身只做三件事：接住拖放文件、把用户操作转给 [PipelineCtl]、
-// 把提示弹成 SnackBar。左栏的每一块都是 lib/home/ 下的独立部件。
-//
+// 页面本身只做两件事：接住拖放文件、把用户操作转给 [PipelineCtl]。
+// 左栏的每一块都是 lib/home/ 下的独立部件，状态栏固定在窗口底边。
 // 快捷键按 Windows 惯例配：Ctrl+O 添加文件、Ctrl+Enter 开始构建、
 // Esc 停止。窄窗口下切成单栏（日志在上、操作在下），否则 800px 宽会把
 // 日志压到看不见。
@@ -45,13 +44,9 @@ class _HomePageState extends State<HomePage> {
       }
       return null;
     });
-    // 控制层不持有 BuildContext，提示由这里弹 SnackBar
-    _ctl.onNotice = (m) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(m), behavior: SnackBarBehavior.floating),
-      );
-    };
+    // 控制层不持有 BuildContext。原先这里挂 SnackBar 弹提示，但它从底部
+    // 浮起来会压住状态条，而状态条当时还要滚动才看得见。现在提示直接写进
+    // 固定在底边的状态栏，没有会挡视野的浮层。
     _ctl.start();
   }
 
@@ -62,6 +57,8 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 左栏的卡片序列。抽出来是为了窄窗时换顺序时只改一处。
+  ///
+  /// 状态栏不在这里 —— 它固定在窗口底边，不随内容滚动。
   List<Widget> _leftColumn(BuildContext context) => <Widget>[
         SourceCard(_ctl),
         const SizedBox(height: 12),
@@ -70,8 +67,6 @@ class _HomePageState extends State<HomePage> {
         ToolsCard(_ctl),
         const SizedBox(height: 12),
         ActionsSection(_ctl),
-        const SizedBox(height: 10),
-        StatusBar(_ctl),
       ];
 
   @override
@@ -110,69 +105,84 @@ class _HomePageState extends State<HomePage> {
         },
         child: Focus(
           autofocus: true,
-          child: SafeArea(
-            child: LayoutBuilder(
-              builder: (context, box) {
-                // 左右双栏：左栏操作区可滚动，右栏是整屏高度的运行日志。
-                // 原先所有卡片排在一列里，固定高度的部分把窗口占满之后，
-                // 日志那个 Expanded 只剩 0 高度 —— 这就是"终端显示不出来"
-                // 的原因。
-                //
-                // 只有左栏订阅流水线状态。日志面板只依赖 LogStore —— 若把它
-                // 也包进同一个监听器，每完成一个文件都要把上千行日志重新排版
-                // 一遍，这就是批量处理时界面发顿的主因。
-                final wide = box.maxWidth >= _twoPaneBreakpoint;
+          child: Column(
+            children: [
+              // 状态栏在内容区外面，横跨整个窗口宽度、永不随内容滚动。
+              // 它订阅 ctl 的进度与提示 —— 所以单独一个 ListenableBuilder，
+              // 状态变化不会重建上面的卡片区。
+              Expanded(
+                child: SafeArea(
+                  bottom: false,
+                  child: LayoutBuilder(
+                    builder: (context, box) {
+                      // 左右双栏：左栏操作区可滚动，右栏是整屏高度的运行日志。
+                      // 原先所有卡片排在一列里，固定高度的部分把窗口占满之后，
+                      // 日志那个 Expanded 只剩 0 高度 —— 这就是"终端显示不出来"
+                      // 的原因。
+                      //
+                      // 只有左栏订阅流水线状态。日志面板只依赖 LogStore —— 若
+                      // 把它也包进同一个监听器，每完成一个文件都要把上千行日志
+                      // 重新排版一遍，这就是批量处理时界面发顿的主因。
+                      final wide = box.maxWidth >= _twoPaneBreakpoint;
 
-                final left = SizedBox(
-                  width: wide ? (box.maxWidth * 0.42).clamp(320.0, 460.0) : null,
-                  child: ListenableBuilder(
-                    listenable: _ctl,
-                    builder: (context, _) => SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: _leftColumn(context),
-                      ),
-                    ),
-                  ),
-                );
-
-                final log = LogPane(
-                  log: _ctl.log,
-                  onCopied: _ctl.noteLogCopied,
-                );
-
-                if (!wide) {
-                  // 窄窗：单栏纵向排。操作区在上、日志在下，给日志一个最小
-                  // 高度，否则它会被上面的卡片压到看不见。
-                  return Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Flexible(child: left),
-                        const SizedBox(height: 10),
-                        SizedBox(
-                          height: (box.maxHeight * 0.45).clamp(180.0, 420.0),
-                          child: log,
+                      final left = SizedBox(
+                        width:
+                            wide ? (box.maxWidth * 0.42).clamp(320.0, 460.0) : null,
+                        child: ListenableBuilder(
+                          listenable: _ctl,
+                          builder: (context, _) => SingleChildScrollView(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: _leftColumn(context),
+                            ),
+                          ),
                         ),
-                      ],
-                    ),
-                  );
-                }
+                      );
 
-                return Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      left,
-                      const SizedBox(width: 12),
-                      Expanded(child: log),
-                    ],
+                      final log = LogPane(
+                        log: _ctl.log,
+                        onCopied: _ctl.noteLogCopied,
+                      );
+
+                      if (!wide) {
+                        // 窄窗：单栏纵向排。操作区在上、日志在下，给日志一个
+                        // 最小高度，否则它会被上面的卡片压到看不见。
+                        return Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Flexible(child: left),
+                              const SizedBox(height: 10),
+                              SizedBox(
+                                height: (box.maxHeight * 0.45).clamp(180.0, 420.0),
+                                child: log,
+                              ),
+                            ],
+                          ),
+                        );
+                      }
+
+                      return Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            left,
+                            const SizedBox(width: 12),
+                            Expanded(child: log),
+                          ],
+                        ),
+                      );
+                    },
                   ),
-                );
-              },
-            ),
+                ),
+              ),
+              ListenableBuilder(
+                listenable: _ctl,
+                builder: (context, _) => StatusBar(_ctl),
+              ),
+            ],
           ),
         ),
       ),

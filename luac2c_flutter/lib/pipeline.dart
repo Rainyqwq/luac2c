@@ -18,6 +18,9 @@ import 'win_dialog.dart';
 // 布局常量（layoutRandom / layoutSeed / layoutPlain）与单文件构建步骤都在
 // steps.dart 里，这里直接复用，不再各自定义一份。
 
+/// 状态栏的语义等级。写在类外 —— Dart 不允许在类体内声明 enum。
+enum Level { idle, working, good, bad }
+
 class PipelineCtl extends ChangeNotifier {
   PipelineCtl();
 
@@ -36,6 +39,10 @@ class PipelineCtl extends ChangeNotifier {
   bool cancel = false;
   String status = '就绪';
 
+  /// 状态栏配色不靠"文案里有没有某个关键词"判断，那是隐式约定 ——
+  /// 改一句提示词就可能让配色悄悄失配。改成由写入方显式声明。
+  Level statusLevel = Level.idle;
+
   // ---- 输出选项 ----
   int mode = layoutRandom;
   final TextEditingController seed = TextEditingController(text: '0');
@@ -43,9 +50,6 @@ class PipelineCtl extends ChangeNotifier {
   bool annotate = false;
   /// 运行时防护：反调试 + 代码/常量完整性自校验（关闭等价于 --no-guard）
   bool guard = true;
-
-  /// UI 侧的提示回调（弹 SnackBar）。控制层不持有 BuildContext。
-  void Function(String message)? onNotice;
 
   bool _disposed = false;
   Timer? _notifyTimer;
@@ -68,8 +72,9 @@ class PipelineCtl extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _setStatus(String s, {bool force = false}) {
+  void _setStatus(String s, {Level level = Level.idle, bool force = false}) {
     status = s;
+    statusLevel = level;
     _touch(force: force);
   }
 
@@ -207,11 +212,12 @@ class PipelineCtl extends ChangeNotifier {
   /// 复制完整路径到剪贴板
   Future<void> copyPath(String path) async {
     await Clipboard.setData(ClipboardData(text: path));
-    _setStatus('路径已复制到剪贴板');
+    _setStatus('路径已复制到剪贴板', level: Level.good);
   }
 
   /// 日志面板复制完成后回写状态条
-  void noteLogCopied() => _setStatus('日志已复制到剪贴板');
+  void noteLogCopied() =>
+      _setStatus('日志已复制到剪贴板', level: Level.good);
 
   // ---------------------------------------------------------------- 选项
   void setMode(int v) {
@@ -314,7 +320,8 @@ class PipelineCtl extends ChangeNotifier {
           if (_disposed) return;
           doneCount++;
           results[f] = o.ok;
-          _setStatus('进度 $doneCount/$totalCount —— 已通过 $pass');
+          _setStatus('进度 $doneCount/$totalCount —— 已通过 $pass',
+              level: Level.working);
         }
       }
 
@@ -322,7 +329,7 @@ class PipelineCtl extends ChangeNotifier {
       if (cancel) log.add('■ 已停止，剩余任务未执行');
     } catch (e) {
       log.add('! 流程异常：$e');
-      _setStatus('流程异常：$e');
+      _setStatus('流程异常：$e', level: Level.bad);
     } finally {
       log.flush();
       busy = false;
@@ -333,13 +340,15 @@ class PipelineCtl extends ChangeNotifier {
     final failed = done - pass;
     final secs = (sw.elapsedMilliseconds / 1000).toStringAsFixed(1);
     if (cancel) {
-      _setStatus('已停止：完成 $done/$totalCount，通过 $pass');
+      _setStatus('已停止：完成 $done/$totalCount，通过 $pass',
+          level: Level.idle);
       log.add('■ 已停止（耗时 ${secs}s）');
     } else if (failed == 0) {
-      _setStatus('批量通过：$pass/$done（${secs}s）');
+      _setStatus('批量通过：$pass/$done（${secs}s）', level: Level.good);
       log.add('✓ 批量全部通过（$pass/$done，耗时 ${secs}s）');
     } else {
-      _setStatus('批量完成：$pass 通过，$failed 失败（${secs}s）');
+      _setStatus('批量完成：$pass 通过，$failed 失败（${secs}s）',
+          level: failed > 0 ? Level.bad : Level.good);
       log.add('✗ 批量结束：失败 $failed 个，通过 $pass 个（耗时 ${secs}s）');
     }
   }
@@ -357,7 +366,7 @@ class PipelineCtl extends ChangeNotifier {
     if (!busy) return;
     cancel = true;
     killActiveProcesses(); // 立刻终止正在跑的子进程，不等它们自然结束
-    _setStatus('正在停止…', force: true);
+    _setStatus('正在停止…', level: Level.working, force: true);
     log.add('! 收到停止请求，已终止子进程');
     log.flush();
   }
@@ -392,24 +401,27 @@ class PipelineCtl extends ChangeNotifier {
       if (txt.isNotEmpty) log.add('      ${txt.replaceAll('\n', '\n      ')}');
       if (r.exitCode == 0) {
         log.add('      ✓ luac2c.exe 已重新编译');
-        _setStatus('luac2c.exe 已重新编译');
+        _setStatus('luac2c.exe 已重新编译', level: Level.good);
       } else {
         log.add('      ✗ gcc 退出码 ${r.exitCode}');
-        _setStatus('重新编译失败');
+        _setStatus('重新编译失败', level: Level.bad);
       }
     } catch (e) {
       log.add('      ✗ $e');
-      _setStatus('重新编译失败');
+      _setStatus('重新编译失败', level: Level.bad);
     } finally {
       busy = false;
       _touch();
     }
   }
 
-  /// 一次性提示：写日志 + 改状态条 + 交给 UI 弹 SnackBar
-  Future<void> _notice(String m) async {
+  /// 一次性提示：写日志 + 改状态条。
+  ///
+  /// 原来还会弹 SnackBar，问题是它从底部浮起来正好压在状态条上 ——
+  /// 而状态条当时在左栏滚动区最底部，不滚就看不见，等于提示把结果盖住了。
+  /// 现在状态条固定在窗口底栏，提示直接写在那里，不再有浮层。
+  Future<void> _notice(String m, {Level level = Level.bad}) async {
     log.add('! $m');
-    _setStatus(m);
-    onNotice?.call(m);
+    _setStatus(m, level: level);
   }
 }
