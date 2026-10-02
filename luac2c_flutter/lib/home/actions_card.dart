@@ -1,4 +1,7 @@
 // 操作区：一键构建 / 停止 / 进度条 / 三个次操作按钮。
+//
+// 主按钮上标注快捷键（Ctrl+Enter / Esc），Windows 用户是照着提示找键位的，
+// 不太可能去猜。
 import 'package:flutter/material.dart';
 
 import '../pipeline.dart';
@@ -14,7 +17,7 @@ class ActionsSection extends StatelessWidget {
       Row(children: [
         Expanded(
           child: Tooltip(
-            message: '编译字节码 → 转译为 C → gcc 编译 → 运行生成物',
+            message: '编译字节码 → 转译为 C → gcc 编译 → 运行生成物 (Ctrl+Enter)',
             child: FilledButton.icon(
               onPressed: ctl.busy ? null : () => ctl.run(full: true),
               icon: ctl.busy
@@ -25,7 +28,7 @@ class ActionsSection extends StatelessWidget {
                     )
                   : const Icon(Icons.play_arrow, size: 20),
               label: const Padding(
-                padding: EdgeInsets.symmetric(vertical: 12),
+                padding: EdgeInsets.symmetric(vertical: 10),
                 child: Text('一键构建', style: TextStyle(fontSize: 15)),
               ),
             ),
@@ -33,12 +36,15 @@ class ActionsSection extends StatelessWidget {
         ),
         if (ctl.busy) ...[
           const SizedBox(width: 10),
-          FilledButton.tonalIcon(
-            onPressed: ctl.stop,
-            icon: const Icon(Icons.stop, size: 18),
-            label: const Padding(
-              padding: EdgeInsets.symmetric(vertical: 12),
-              child: Text('停止', style: TextStyle(fontSize: 14)),
+          Tooltip(
+            message: '终止正在运行的子进程 (Esc)',
+            child: FilledButton.tonalIcon(
+              onPressed: ctl.stop,
+              icon: const Icon(Icons.stop, size: 18),
+              label: const Padding(
+                padding: EdgeInsets.symmetric(vertical: 10),
+                child: Text('停止', style: TextStyle(fontSize: 14)),
+              ),
             ),
           ),
         ],
@@ -46,11 +52,11 @@ class ActionsSection extends StatelessWidget {
       if (ctl.busy) ...[
         const SizedBox(height: 8),
         ClipRRect(
-          borderRadius: BorderRadius.circular(4),
+          borderRadius: BorderRadius.circular(2),
           child: LinearProgressIndicator(
             value:
                 ctl.totalCount == 0 ? null : ctl.doneCount / ctl.totalCount,
-            minHeight: 6,
+            minHeight: 4,
           ),
         ),
       ],
@@ -59,7 +65,7 @@ class ActionsSection extends StatelessWidget {
         Expanded(
           child: MinorButton(Icons.description_outlined, '仅生成 C 源码',
               ctl.busy ? null : () => ctl.run(full: false),
-              tip: '仅生成 C 源码，不运行'),
+              tip: '仅生成 C 源码，不运行生成物'),
         ),
         const SizedBox(width: 10),
         Expanded(
@@ -71,7 +77,7 @@ class ActionsSection extends StatelessWidget {
         Expanded(
           child: MinorButton(Icons.folder_open_outlined, '打开输出目录',
               ctl.busy ? null : ctl.openOutDir,
-              tip: '在资源管理器中打开源文件所在目录'),
+              tip: '在资源管理器中定位到第一个源文件'),
         ),
       ]),
     ]);

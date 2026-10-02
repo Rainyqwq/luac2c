@@ -7,11 +7,13 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'log_store.dart';
 import 'runner.dart';
 import 'steps.dart';
 import 'tools.dart';
+import 'win_dialog.dart';
 
 // 布局常量（layoutRandom / layoutSeed / layoutPlain）与单文件构建步骤都在
 // steps.dart 里，这里直接复用，不再各自定义一份。
@@ -78,6 +80,8 @@ class PipelineCtl extends ChangeNotifier {
     tools = findTools();
     _touch();
     log.add('配置文件遍历完成。选择 .lua 文件，或直接把文件拖进窗口。');
+    // 原生文件对话框的结果从这条回调进来
+    WinDialog.I.ensureHandler(addFiles);
     _toolsTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (busy || _disposed) return;
       final t = findTools();
@@ -102,20 +106,49 @@ class PipelineCtl extends ChangeNotifier {
 
   // ---------------------------------------------------------------- 文件列表
   /// 把外部给进来的路径加入待处理列表（去重、只收存在的文件）
+  ///
+  /// 被拒的路径要说出原因。原先一律 `continue` 静默丢弃，用户选完文件
+  /// 看列表没变，只能猜自己是不是没选对。
   void addFiles(List<String> paths) {
     var added = 0;
+    final rejected = <String>[];
+    var dup = 0;
     for (final p in paths) {
       final t = p.trim();
       if (t.isEmpty) continue;
-      if (!File(t).existsSync()) continue;
-      if (files.contains(t)) continue;
+      if (!File(t).existsSync()) {
+        rejected.add(t);
+        continue;
+      }
+      if (files.contains(t)) {
+        dup++;
+        continue;
+      }
       files.add(t);
       added++;
     }
     if (added > 0) {
       log.add('已添加 $added 个文件（当前共 ${files.length} 个）');
-      _touch();
     }
+    if (dup > 0) {
+      log.add('· 跳过 $dup 个已在列表中的文件');
+    }
+    if (rejected.isNotEmpty) {
+      // 只记前几个，全量打出来日志会被路径刷爆
+      final shown = rejected.take(3).map((e) => _baseName(e)).join('、');
+      log.add('! 跳过 ${rejected.length} 个不存在的文件：$shown'
+          '${rejected.length > 3 ? ' 等' : ''}');
+      unawaited(_notice('已跳过 ${rejected.length} 个不存在的文件'));
+    }
+    if (added > 0 || dup > 0 || rejected.isNotEmpty) _touch();
+  }
+
+  /// 取路径的文件名部分。日志与界面用短名，长路径没有信息量。
+  static String _baseName(String path) {
+    final i = path.lastIndexOf(r'\');
+    final j = path.lastIndexOf('/');
+    final k = i > j ? i : j;
+    return k >= 0 ? path.substring(k + 1) : path;
   }
 
   void removeFileAt(int i) {
@@ -145,37 +178,36 @@ class PipelineCtl extends ChangeNotifier {
         .toList();
   }
 
-  /// 多选文件（Windows 文件对话框，Multiselect）
+  /// 多选文件。走 runner 里的 IFileOpenDialog（资源管理器同款对话框）。
+  ///
+  /// 原先的实现是拉起 powershell.exe + WinForms，既糊又容易被主窗口挡住，
+  /// 详见 win_dialog.dart 顶部的说明。结果通过 WinDialog 的回调进来，
+  /// 这里只负责把请求发出去。
   Future<void> pickFiles() async {
-    final r = await runCapture(
-        'powershell.exe',
-        [
-          // -STA：WinForms 的 OpenFileDialog 要求单线程套间，否则可能直接抛异常
-          '-NoProfile',
-          '-STA',
-          '-Command',
-          'Add-Type -AssemblyName System.Windows.Forms;'
-              '\$f = New-Object System.Windows.Forms.OpenFileDialog;'
-              '\$f.Multiselect = \$true;'
-              '\$f.Filter = "Lua 源文件(*.lua;*.luac)|*.lua;*.luac|所有文件(*.*)|*.*";'
-              'if (\$f.ShowDialog() -eq "OK") { \$f.FileNames | ForEach-Object { Write-Output \$_ } }'
-        ],
-        null,
-        // 对话框要等人操作，超时必须放宽，否则默认 60s 会把 powershell 杀掉
-        timeout: const Duration(minutes: 10));
-    final lines = r.output
-        .split('\n')
-        .map((e) => e.trim())
-        .where((e) => e.isNotEmpty && File(e).existsSync())
-        .toList();
-    if (r.exitCode == 0 && lines.isNotEmpty) addFiles(lines);
+    try {
+      await WinDialog.I.pickFiles();
+    } catch (e) {
+      await _notice('无法打开文件对话框：$e');
+    }
   }
 
   void openOutDir() {
-    final p = files.isNotEmpty ? files.first : '';
-    final dir =
-        p.contains(r'\') ? p.substring(0, p.lastIndexOf(r'\')) : tools.root;
-    Process.run('explorer.exe', [dir]);
+    // Windows 的习惯是"定位并选中"，不是"打开目录让你自己找"。
+    // 列表为空时退回根目录，只开目录不加 /select。
+    if (files.isEmpty) {
+      Process.run('explorer.exe', [tools.root]);
+      return;
+    }
+    WinDialog.I.revealInExplorer(files.first);
+  }
+
+  /// 在资源管理器中定位到指定文件（列表行双击、右键菜单都走这里）
+  void revealFile(String path) => WinDialog.I.revealInExplorer(path);
+
+  /// 复制完整路径到剪贴板
+  Future<void> copyPath(String path) async {
+    await Clipboard.setData(ClipboardData(text: path));
+    _setStatus('路径已复制到剪贴板');
   }
 
   /// 日志面板复制完成后回写状态条

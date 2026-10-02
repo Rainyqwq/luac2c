@@ -88,7 +88,10 @@ fi
 if [ $want_stress -eq 1 ]; then
   echo "== stress: luac2c压力测试.lua through the translator =="
   mkdir -p tools/.audit/stress
-  S="luac2c压力测试.lua"
+  # 压力测试已挪进 test/。runall.sh 只匹配 test_*.lua，天然不会碰它
+  # （文件名不匹配通配），所以它归这一道单独跑，只走两种模式。
+  S="test/luac2c压力测试.lua"
+  [ -f "$S" ] || S="luac2c压力测试.lua"
   ./luac.exe -o tools/.audit/stress/s.luac "$S" 2>/dev/null || { echo "stress: luac failed"; rc=1; }
   ./lua.exe "$S" 2>&1 | grep -v '^SMOKE\|^SKIP' > tools/.audit/stress/ref.txt
   for m in '--static' '--seed 7'; do

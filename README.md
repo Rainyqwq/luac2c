@@ -54,6 +54,16 @@ mingw32-make lua          # 从 lua-5.5.1/src 构建 lua.exe / luac.exe / liblua
 `apicheck` 这一道值得单独说：多重返回值写穿 `ci->top`、`lua_closeslot` 传错层级这类问题，
 在普通构建下完全静默，只有让 Lua 的 `api_check` 真正生效才暴露得出来。
 
+清理有两档，`distclean` 会带走审计期攒下的临时目录（约 330 MB）：
+
+```
+mingw32-make clean        # 构建产物：luac2c.exe、test 下的 .luac / _out.c / _out.exe
+mingw32-make distclean    # 再加上 .audit/ .rt/ .st/ tools/.audit/ 与散落的旧二进制
+```
+
+工具链（`lua.exe` / `luac.exe` / `liblua.a`）两档都不删：每个测试目标本来就依赖 `lua`，
+删掉只省几 MB，却要多一次重建。
+
 ## 目录结构
 
 ```
@@ -61,8 +71,13 @@ mingw32-make lua          # 从 lua-5.5.1/src 构建 lua.exe / luac.exe / liblua
 ├── Makefile              # 构建 + 测试入口（mingw32-make）
 ├── lua-5.5.1/            # vendored Lua 5.5（src + build/liblua.a）
 ├── lua5.5-include/       # 对外暴露的头文件
-├── test/                 # 端到端用例
-├── tools/                # 验证脚本（runall / apichk / check / fuzz / mkdeep ...）
+├── test/                 # 端到端用例（test_*.lua，runall.sh 逐个比对 lua.exe）
+├── tools/                # 验证脚本
+│   ├── check.sh          # 五道门的统一入口
+│   ├── runall.sh         # 单模式全量：luac → luac2c → gcc → 运行 → 比对
+│   ├── apichk.sh         # 链到 APICHECK 版 liblua 的那一道
+│   └── *.py              # fuzz / fuzzc / check_ops / check_combos / mkdeep / signcheck
+├── luac2c压力测试.lua     # 232 个自带断言的用例
 ├── luac2c_flutter/       # Windows GUI 客户端（Flutter, Material You / M3）
 │   └── lib/              # main / app / app_shell 三个入口，其余按职责分模块
 │       ├── pipeline.dart # 构建调度（并发池、进度、状态文案），不含 Widget
@@ -259,7 +274,7 @@ to-be-closed 语义、generic for 三槽位这些容易出错的运行时细节�
    TDM-GCC-64、Strawberry …）；仍找不到时，才在系统盘 / `Program Files` 下做有预算的
    两层浅扫找 `gcc.exe`（总量封顶、命中即返回，不会遍历整个磁盘）
 
-`test\*.ps1` 与 `.workbuddy/tm/runall.sh` 同样不写死路径：根目录由脚本自身位置推导
+`tools/` 下的脚本同样不写死路径：根目录由脚本自身位置推导
 （可用 `LUAC2C_ROOT` 覆盖），gcc 取 `$env:GCC` / `$GCC`，其次 `PATH`。
 
 ## 构建客户端
@@ -270,6 +285,20 @@ flutter pub get
 flutter build windows --release
 # 产物在 build\windows\x64\runner\Release\，拷到项目根即可使用
 ```
+
+客户端按 Windows 桌面习惯做的几处取舍：
+
+| 做法 | 原因 |
+| --- | --- |
+| 文件对话框用 COM 的 `IFileOpenDialog`（runner 内原生调用） | 拉 `powershell.exe` + WinForms 那条路有两个硬伤：powershell 进程没有 PerMonitorV2 感知，系统按 96 DPI 渲染对话框再位图放大，高分屏上必然发虚；对话框的父窗口是 powershell 的控制台，会被主窗口压住。换成 `IFileOpenDialog` 后同进程、同 HWND 当父窗口、宽字符路径直接取 |
+| 左侧导航条，不用底部标签栏 | 底部导航是手机习惯，Windows 桌面程序靠左边的导航条切换视图 |
+| 圆角 4~8px、按钮高 36~38px | M3 默认 16px 圆角加胶囊按钮偏 Android 观感，桌面上过于圆润 |
+| 切换视图用 `Ctrl+1` / `Ctrl+2` | 与浏览器一致 |
+| `Ctrl+O` 添加文件、`Ctrl+Enter` 开始构建、`Esc` 停止 | Windows 用户照提示找键位，不猜 |
+| 文件列表双击 = 在资源管理器中定位；移除挂在行尾 `×` | 移动端列表的双击和右键都不是这个语义 |
+| 日志区 `Ctrl+C` 永远复制、右键出菜单 | `SelectionArea` 只管鼠标划选，键盘用户不该按了没反应 |
+| 窗口窄于 900px 自动切成单栏 | 否则日志区被压到 0 高度，就是"终端显示不出来"的成因 |
+| 不存在的文件会被点名报出来 | 旧实现一律静默丢弃，用户选完看列表没变只能猜自己选错了 |
 
 ## 已知限制
 
@@ -303,13 +332,15 @@ flutter build windows --release
 
 ## 测试
 
-```powershell
-cd test
-powershell -NoProfile -ExecutionPolicy Bypass -File runall.ps1     # 全量 24 用例
-powershell -NoProfile -ExecutionPolicy Bypass -File sweepall.ps1 -MaxSeed 4   # 跨种子扫描
+```bash
+bash tools/runall.sh "--static"   # 每个用例走 luac → luac2c → gcc → 运行 → 与 lua.exe 比对
+bash tools/check.sh               # 五道门全跑，约 1 小时
 ```
 
-`.workbuddy/tm/` 下另有三类命令行检查（都接受迭代次数作为参数）：
+模式要作为单个参数传。`runall.sh "--seed 7"` 是对的，写成 `--seed 7` 会被拆成两个参数、
+模式落空，全数失败。
+
+`tools/` 下的检查脚本接受迭代次数之类的位置参数：
 
 | 脚本                | 查什么                                      |
 | ----------------- | ---------------------------------------- |
@@ -317,7 +348,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File sweepall.ps1 -MaxSeed 4   # 
 | `fuzzc.py N`      | 被接受的那些畸形输入，生成的 C 必须能完整编译                 |
 | `check_ops.py`    | 定向：把控制流指令的操作数逐个改坏，逐个检查输出质量               |
 | `check_combos.py` | 16 种开关组合 × 2 个优化级别：每种都要能编译并跑出正确结果 |
-| `bigkx.py` | 造一个含 131080 个常量的函数，逼出 `luac` 从源码层面生成不了的 `LOADKX` |
+| `mkdeep.py`       | 造深层嵌套的源文件，压递归深度与常量表上限 |
 | `signcheck.py` | 后链接签名：构建、签名，再翻转签名区间、水印槽、签名标志各一个字节 |
 
 根目录的 `luac2c压力测试.lua` 可以单独跑，也可以在客户端里当普通源文件过一遍流水线。
@@ -328,8 +359,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File sweepall.ps1 -MaxSeed 4   # 
   并入 `passed`，所以两边的 `RESULT` 数字可以直接比；产物多出的 `SKIP` 行不参与 diff。
 
 不做这一步的话，一份跳过了协程 yield 用例的产物会因为多一行 `SKIP`、且 `RESULT`
-少 10 而整份被判为不一致。客户端（`normalizeForCompare`）和三个 PowerShell 脚本
-（`runall.ps1` / `sweepall.ps1` / `test.ps1` 的 `Run`）都做了同样的逐行过滤。
+少 10 而整份被判为不一致。客户端的 `normalizeForCompare` 和 `tools/check.sh` 的
+stress 一道都做了同样的逐行过滤。
 
 ## 许可
 

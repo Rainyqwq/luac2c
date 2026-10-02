@@ -28,6 +28,20 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  // 窄窗口下要切成单栏，否则日志区会被压到 0 高度（这正是"终端显示不出来"
+  // 的成因）。断言的是布局分支走通且没有溢出。
+  testWidgets('home page survives a narrow window', (tester) async {
+    tester.view.physicalSize = const Size(760, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(_wrap(const HomePage()));
+    await tester.pumpAndSettle();
+
+    expect(find.text('一键构建'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('mine page renders login form', (tester) async {
     tester.view.physicalSize = const Size(1440, 900);
     tester.view.devicePixelRatio = 1.0;

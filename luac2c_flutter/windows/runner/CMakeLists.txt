@@ -36,6 +36,8 @@ target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 # 原生拖拽支持（DragAcceptFiles / DragQueryFileW）所需
 target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib" "comctl32.lib")
+# IFileOpenDialog（系统文件对话框）走 COM，需要 ole32
+target_link_libraries(${BINARY_NAME} PRIVATE "ole32.lib")
 # 源码含中文（UTF-8），告知 MSVC 按 UTF-8 解析，避免 C4819 在 /WX 下升级为错误
 target_compile_options(${BINARY_NAME} PRIVATE /utf-8)
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")

@@ -42,6 +42,13 @@ class _LogPaneState extends State<LogPane> {
     widget.onCopied?.call();
   }
 
+  /// 复制全部行。和工具栏那个「复制」是同一件事。
+  ///
+  /// 单独给一份快捷键是为了 Ctrl+C：SelectionArea 只处理鼠标划选的复制，
+  /// 焦点落在日志区而没有划选时按 Ctrl+C 不会有反应。Windows 用户不会
+  /// 区分"选中才能复制"，他们期望 Ctrl+C 永远管用。
+  void _copyViaKeyboard() => _copy();
+
   /// 滚到底部。变高 item 的滚动范围是估算值，一次性追加一大批行之后
   /// 再校正一帧，否则会停在"上次"的底部。
   void _toBottom() {
@@ -65,78 +72,159 @@ class _LogPaneState extends State<LogPane> {
       height: 1.45,
       color: cs.onSurface,
     );
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(14, 8, 6, 4),
-            child: Row(children: [
-              Icon(Icons.terminal, size: 16, color: cs.onSurfaceVariant),
-              const SizedBox(width: 8),
-              Text('运行日志',
-                  style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: cs.onSurface)),
-              const Spacer(),
-              // 行数用 ListenableBuilder 单独订阅，避免整页随日志重建
-              ListenableBuilder(
-                listenable: widget.log,
-                builder: (context, _) => Text('${widget.log.lines.length} 行',
-                    style: TextStyle(
-                        fontSize: 11.5, color: cs.onSurfaceVariant)),
-              ),
-              TextButton.icon(
-                onPressed: _copy,
-                icon: const Icon(Icons.copy_all, size: 15),
-                label: const Text('复制'),
-              ),
-              TextButton.icon(
-                onPressed: widget.log.clear,
-                icon: const Icon(Icons.delete_outline, size: 15),
-                label: const Text('清空'),
-              ),
-            ]),
+    // Ctrl+C：焦点在本面板时永远能复制整份日志
+    return Shortcuts(
+      shortcuts: const <ShortcutActivator, Intent>{
+        SingleActivator(LogicalKeyboardKey.keyC, control: true):
+            _CopyLogIntent(),
+      },
+      child: Actions(
+        actions: <Type, Action<Intent>>{
+          _CopyLogIntent: CallbackAction<_CopyLogIntent>(
+            onInvoke: (_) {
+              _copyViaKeyboard();
+              return null;
+            },
           ),
-          Divider(height: 1, color: cs.outlineVariant),
-          Expanded(
-            child: ListenableBuilder(
-              listenable: widget.log,
-              builder: (context, _) {
-                // 新日志到达后跟随到底部（用户上翻时由 _stickBottom 暂停）
-                if (_stickBottom) {
-                  WidgetsBinding.instance.addPostFrameCallback((_) => _toBottom());
-                }
-                final lines = widget.log.lines;
-                if (lines.isEmpty) {
-                  return Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Text('（暂无输出）', style: style),
-                  );
-                }
-                // 逐行虚拟化：只布局视口内的行。原来是一整个 SelectableText，
-                // 每刷新一次都要把上千行重新排版一遍，批量处理时会明显发顿。
-                return Scrollbar(
-                  controller: _scroll,
-                  thumbVisibility: true,
-                  child: SelectionArea(
-                    child: ListView.builder(
-                      controller: _scroll,
-                      padding: const EdgeInsets.all(12),
-                      itemCount: lines.length,
-                      // 多缓存一些，跟随底部时向上翻动不会现白
-                      scrollCacheExtent: const ScrollCacheExtent.pixels(1200),
-                      itemBuilder: (context, i) => Text(lines[i], style: style),
+        },
+        child: Focus(
+          autofocus: true,
+          child: Card(
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 8, 6, 4),
+                  child: Row(children: [
+                    Icon(Icons.terminal, size: 16, color: cs.onSurfaceVariant),
+                    const SizedBox(width: 8),
+                    Text('运行日志',
+                        style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: cs.onSurface)),
+                    const Spacer(),
+                    // 行数用 ListenableBuilder 单独订阅，避免整页随日志重建
+                    ListenableBuilder(
+                      listenable: widget.log,
+                      builder: (context, _) => Text('${widget.log.lines.length} 行',
+                          style: TextStyle(
+                              fontSize: 11.5, color: cs.onSurfaceVariant)),
                     ),
+                    Tooltip(
+                      message: '复制全部日志 (Ctrl+C)',
+                      child: TextButton.icon(
+                        onPressed: _copy,
+                        icon: const Icon(Icons.copy_all, size: 15),
+                        label: const Text('复制'),
+                      ),
+                    ),
+                    Tooltip(
+                      message: '清空日志',
+                      child: TextButton.icon(
+                        onPressed: widget.log.clear,
+                        icon: const Icon(Icons.delete_outline, size: 15),
+                        label: const Text('清空'),
+                      ),
+                    ),
+                  ]),
+                ),
+                Divider(height: 1, color: cs.outlineVariant),
+                Expanded(
+                  child: ListenableBuilder(
+                    listenable: widget.log,
+                    builder: (context, _) {
+                      // 新日志到达后跟随到底部（用户上翻时由 _stickBottom 暂停）
+                      if (_stickBottom) {
+                        WidgetsBinding.instance
+                            .addPostFrameCallback((_) => _toBottom());
+                      }
+                      final lines = widget.log.lines;
+                      if (lines.isEmpty) {
+                        return Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Text('（暂无输出）', style: style),
+                        );
+                      }
+                      // 逐行虚拟化：只布局视口内的行。原来是一整个 SelectableText，
+                      // 每刷新一次都要把上千行重新排版一遍，批量处理时会明显发顿。
+                      return Scrollbar(
+                        controller: _scroll,
+                        thumbVisibility: true,
+                        child: SelectionArea(
+                          // 右键菜单：Windows 上文本区右就该出菜单，
+                          // 只有划选时的浮动工具条是不够的
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.translucent,
+                            onSecondaryTapDown: (d) => _showMenu(context, d),
+                            child: ListView.builder(
+                              controller: _scroll,
+                              padding: const EdgeInsets.all(12),
+                              itemCount: lines.length,
+                              // 多缓存一些，跟随底部时向上翻动不会现白
+                              scrollCacheExtent:
+                                  const ScrollCacheExtent.pixels(1200),
+                              itemBuilder: (context, i) =>
+                                  Text(lines[i], style: style),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
                   ),
-                );
-              },
+                ),
+              ],
             ),
           ),
-        ],
+        ),
       ),
     );
   }
+
+  /// 右键菜单。放在日志正文上而不是标题栏那一行：Windows 里右的是内容区。
+  void _showMenu(BuildContext context, TapDownDetails d) {
+    final sel = SelectableRegion.maybeOf(context);
+    final hasSelection = sel != null &&
+        sel.selection.isValid &&
+        !sel.selection.isCollapsed;
+    final pos = d.globalPosition;
+    final overlay = Overlay.of(context).context.findRenderObject()! as RenderBox;
+    showMenu(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        pos.dx,
+        pos.dy,
+        overlay.size.width - pos.dx,
+        overlay.size.height - pos.dy,
+      ),
+      items: <PopupMenuEntry<String>>[
+        // 有划选时"复制"复制选段，没有时复制全文 —— 与记事本一致
+        PopupMenuItem(
+          value: 'copy',
+          child: Text(hasSelection ? '复制所选' : '复制全部'),
+        ),
+        const PopupMenuItem(
+          value: 'clear',
+          child: Text('清空日志'),
+        ),
+      ],
+    ).then((v) {
+      if (v == 'copy') {
+        // 有划选时交给 SelectionArea 的复制键（模拟 Ctrl+C 让它自己处理）
+        if (hasSelection) {
+          final action = Actions.invoke(context, const CopySelectionIntent());
+          if (action == null) _copy();
+        } else {
+          _copy();
+        }
+      } else if (v == 'clear') {
+        widget.log.clear();
+      }
+    });
+  }
+}
+
+class _CopyLogIntent extends Intent {
+  const _CopyLogIntent();
 }

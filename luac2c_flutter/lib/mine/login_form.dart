@@ -74,7 +74,7 @@ class _LoginFormState extends State<LoginForm> {
             height: 34,
             decoration: BoxDecoration(
               color: cs.primaryContainer,
-              borderRadius: BorderRadius.circular(10),
+              borderRadius: BorderRadius.circular(6),
             ),
             alignment: Alignment.center,
             child: Icon(Icons.lock_open_outlined,

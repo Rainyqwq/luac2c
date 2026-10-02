@@ -8,7 +8,8 @@
 #   mingw32-make stress     # luac2c压力测试.lua (232 self-checking cases)
 #   mingw32-make warn       # -Wall -Wextra warning gate on the generated C
 #   mingw32-make fuzz       # malformed-input fuzzing
-#   mingw32-make clean
+#   mingw32-make clean      # drop build output
+#   mingw32-make distclean  # drop build output + all scratch dirs (~340 MB)
 #
 # GCC can be overridden:  mingw32-make GCC=/c/msys64/mingw64/bin/gcc.exe
 
@@ -22,7 +23,7 @@ INC      = -I $(SRC) -I lua5.5-include
 # Everything liblua.a needs except the two interpreters (which have main()).
 LIBOBJS := $(patsubst $(SRC)/%.c,$(BUILD)/%.o,$(filter-out $(SRC)/lua.c $(SRC)/luac.c,$(wildcard $(SRC)/*.c)))
 
-.PHONY: all lua check modes apicheck stress warn fuzz clean
+.PHONY: all lua check modes apicheck stress warn fuzz clean distclean
 
 all: luac2c.exe
 
@@ -69,6 +70,20 @@ warn: luac2c.exe lua
 fuzz: luac2c.exe lua
 	@bash tools/check.sh "$(GCC)" --fuzz-only
 
+# --- housekeeping ----------------------------------------------------------
+# clean     drops what a build regenerates in seconds.
+# distclean drops every scratch directory earlier sessions left behind (~330 MB).
+#           Nothing here is source: `make` rebuilds luac2c.exe and `tools/check.sh`
+#           recreates its own scratch.  The vendored toolchain (lua.exe / luac.exe /
+#           build/liblua.a) is left alone on purpose -- every test target already
+#           depends on `lua`, so deleting it only buys a few MB and costs a rebuild.
 clean:
-	rm -f luac2c.exe lua.exe luac.exe
-	rm -rf $(BUILD) test/.rt .audit/rt
+	rm -f luac2c.exe luac.out deep.luac
+	rm -f test/*.luac test/*_out.c test/*_out.exe test/*_n.exe
+	rm -f test/_test_report.txt test/_sweep.txt
+	rm -rf test/.rt test/.chk tools/.scratch
+
+distclean: clean
+	rm -rf .audit .rt .st tools/.audit
+	rm -f luac2c_dbg.exe luac2c_hash.exe luac2c_new.exe luac2c_sweep.exe
+	rm -f luac2c_*.zip
