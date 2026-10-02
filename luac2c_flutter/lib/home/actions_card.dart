@@ -51,12 +51,13 @@ class ActionsSection extends StatelessWidget {
       ]),
       if (ctl.busy) ...[
         const SizedBox(height: 8),
+        // M3 的进度条两端是圆头（track 与 indicator 同粗、圆角为半高）
         ClipRRect(
-          borderRadius: BorderRadius.circular(2),
+          borderRadius: BorderRadius.circular(4),
           child: LinearProgressIndicator(
             value:
                 ctl.totalCount == 0 ? null : ctl.doneCount / ctl.totalCount,
-            minHeight: 4,
+            minHeight: 8,
           ),
         ),
       ],

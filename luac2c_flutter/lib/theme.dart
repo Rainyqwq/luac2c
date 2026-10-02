@@ -96,8 +96,6 @@ class AppTheme {
         backgroundColor: cs.surface,
         surfaceTintColor: cs.surfaceTint,
         foregroundColor: cs.onSurface,
-        // Windows 标题栏矮：56 太像网页，留 48 更接近原生
-        toolbarHeight: 48,
         titleTextStyle: base.textTheme.titleMedium?.copyWith(
           fontWeight: FontWeight.w600,
           color: cs.onSurface,
@@ -110,22 +108,21 @@ class AppTheme {
         margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       ),
+      // M3 的形状规范：主要按钮全圆角（胶囊），次级按钮同规格。
+      // 这套尺寸与圆角就是 M3 的默认观感，别按传统桌面习惯往回收。
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
           minimumSize: const Size(0, 48),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
         ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
         style: OutlinedButton.styleFrom(
           minimumSize: const Size(0, 44),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
         ),
-      ),
-      // 输入框收窄：M3 默认 56 高，桌面上显得松垮
-      inputDecorationTheme: const InputDecorationTheme(
-        isDense: true,
-        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
       ),
       segmentedButtonTheme: SegmentedButtonThemeData(
         style: ButtonStyle(
@@ -134,11 +131,6 @@ class AppTheme {
         ),
       ),
       dividerTheme: DividerThemeData(color: cs.outlineVariant, thickness: 1),
-      tooltipTheme: const TooltipThemeData(
-        // Windows 的 tooltip 是淡色小方块，不是深色气泡
-        waitDuration: Duration(milliseconds: 500),
-        showDuration: Duration(seconds: 4),
-      ),
     );
   }
 }
