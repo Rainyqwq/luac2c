@@ -1,7 +1,7 @@
-// 主界面（防护）：左右双栏 —— 左栏操作区，右栏运行日志，底边状态栏。
+// 主界面（防护）：左右双栏 —— 左栏操作区，右栏运行日志，顶部状态条。
 //
 // 页面本身只做两件事：接住拖放文件、把用户操作转给 [PipelineCtl]。
-// 左栏的每一块都是 lib/home/ 下的独立部件，状态栏固定在窗口底边。
+// 左栏的每一块都是 lib/home/ 下的独立部件，状态条固定在标题栏下方。
 // 快捷键按 Windows 惯例配：Ctrl+O 添加文件、Ctrl+Enter 开始构建、
 // Esc 停止。窄窗口下切成单栏（日志在上、操作在下），否则 800px 宽会把
 // 日志压到看不见。
@@ -108,11 +108,16 @@ class _HomePageState extends State<HomePage> {
           child: Column(
             children: [
               // 状态栏在内容区外面，横跨整个窗口宽度、永不随内容滚动。
+              // 放在标题栏正下方：底边那条太沉，而且贴着日志区像是日志的一部分。
               // 它订阅 ctl 的进度与提示 —— 所以单独一个 ListenableBuilder，
-              // 状态变化不会重建上面的卡片区。
+              // 状态变化不会重建下面的卡片区。
+              ListenableBuilder(
+                listenable: _ctl,
+                builder: (context, _) => StatusBar(_ctl),
+              ),
               Expanded(
                 child: SafeArea(
-                  bottom: false,
+                  top: false,
                   child: LayoutBuilder(
                     builder: (context, box) {
                       // 左右双栏：左栏操作区可滚动，右栏是整屏高度的运行日志。
@@ -177,10 +182,6 @@ class _HomePageState extends State<HomePage> {
                     },
                   ),
                 ),
-              ),
-              ListenableBuilder(
-                listenable: _ctl,
-                builder: (context, _) => StatusBar(_ctl),
               ),
             ],
           ),
