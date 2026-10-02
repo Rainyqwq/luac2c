@@ -65,7 +65,7 @@ class SourceCard extends StatelessWidget {
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color: cs.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(12),
         ),
         child: Text('点击「添加文件」多选，或把多个 .lua 文件拖进窗口',
             style: TextStyle(fontSize: 12.5, color: cs.onSurfaceVariant)),
@@ -81,7 +81,7 @@ class SourceCard extends StatelessWidget {
       return Container(
         decoration: BoxDecoration(
           color: cs.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(12),
         ),
         child: ListView.separated(
           padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),

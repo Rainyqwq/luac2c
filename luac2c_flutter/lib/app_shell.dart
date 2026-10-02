@@ -162,7 +162,7 @@ class _NavRail extends StatelessWidget {
                   message: loggedIn ? '已登录，点击前往「我的」' : '未登录，点击前往「我的」',
                   child: InkWell(
                     onTap: () => onSelect(1),
-                    borderRadius: BorderRadius.circular(6),
+                    borderRadius: BorderRadius.circular(20),
                     child: Padding(
                       padding: const EdgeInsets.all(8),
                       child: Icon(

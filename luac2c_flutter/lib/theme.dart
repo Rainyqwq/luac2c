@@ -108,20 +108,18 @@ class AppTheme {
         color: cs.surfaceContainerLow,
         surfaceTintColor: cs.surfaceTint,
         margin: EdgeInsets.zero,
-        // M3 默认 12、Windows 风格约 4~8。原来的 16 在桌面上过于圆润。
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       ),
-      // Windows 的按钮是方角小圆角 + 紧凑高度，不是胶囊
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
-          minimumSize: const Size(0, 38),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+          minimumSize: const Size(0, 48),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
         ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
         style: OutlinedButton.styleFrom(
-          minimumSize: const Size(0, 36),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+          minimumSize: const Size(0, 44),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
         ),
       ),
       // 输入框收窄：M3 默认 56 高，桌面上显得松垮
@@ -132,13 +130,12 @@ class AppTheme {
       segmentedButtonTheme: SegmentedButtonThemeData(
         style: ButtonStyle(
           shape: WidgetStatePropertyAll(
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(4))),
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20))),
         ),
       ),
-      // Windows 上 Snackbar 从底部弹，不该是悬浮在中间的样子
       snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
       dividerTheme: DividerThemeData(color: cs.outlineVariant, thickness: 1),
       tooltipTheme: const TooltipThemeData(

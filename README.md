@@ -292,7 +292,7 @@ flutter build windows --release
 | --- | --- |
 | 文件对话框用 COM 的 `IFileOpenDialog`（runner 内原生调用） | 拉 `powershell.exe` + WinForms 那条路有两个硬伤：powershell 进程没有 PerMonitorV2 感知，系统按 96 DPI 渲染对话框再位图放大，高分屏上必然发虚；对话框的父窗口是 powershell 的控制台，会被主窗口压住。换成 `IFileOpenDialog` 后同进程、同 HWND 当父窗口、宽字符路径直接取 |
 | 左侧导航条，不用底部标签栏 | 底部导航是手机习惯，Windows 桌面程序靠左边的导航条切换视图 |
-| 圆角 4~8px、按钮高 36~38px | M3 默认 16px 圆角加胶囊按钮偏 Android 观感，桌面上过于圆润 |
+| 圆角保持 M3 默认（卡片 16px、按钮胶囊 24px） | 试过收到 Windows 风格的 4~8px，视觉上太生硬，还是原来的好看 |
 | 切换视图用 `Ctrl+1` / `Ctrl+2` | 与浏览器一致 |
 | `Ctrl+O` 添加文件、`Ctrl+Enter` 开始构建、`Esc` 停止 | Windows 用户照提示找键位，不猜 |
 | 文件列表双击 = 在资源管理器中定位；移除挂在行尾 `×` | 移动端列表的双击和右键都不是这个语义 |
