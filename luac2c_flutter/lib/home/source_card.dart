@@ -96,15 +96,18 @@ class SourceCard extends StatelessWidget {
                 : res
                     ? cs.primary
                     : cs.error;
-            return ListTile(
-              dense: true,
-              contentPadding: const EdgeInsets.symmetric(horizontal: 8),
-              // Windows 里双击文件名 = 去它所在的位置。放在这里能省掉
-              // "打开输出目录"再自己找文件的步骤。
+            // Windows 里双击文件名 = 去它所在的位置。放在这里能省掉
+            // "打开输出目录"再自己找文件的步骤。
+            return GestureDetector(
+              behavior: HitTestBehavior.translucent,
               onDoubleTap: ctl.busy ? null : () => ctl.revealFile(p),
-              onSecondaryTapDown:
-                  ctl.busy ? null : (d) => _rowMenu(context, p, d.globalPosition),
-              leading: Icon(
+              onSecondaryTapDown: ctl.busy
+                  ? null
+                  : (d) => _rowMenu(context, p, d.globalPosition),
+              child: ListTile(
+                dense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                leading: Icon(
                   res == null
                       ? Icons.description_outlined
                       : res
@@ -112,18 +115,19 @@ class SourceCard extends StatelessWidget {
                           : Icons.cancel,
                   size: 18,
                   color: c),
-              title: Text(name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 12.5)),
-              subtitle: Text(p.substring(0, p.lastIndexOf(r'\')),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 10.5, color: cs.onSurfaceVariant)),
-              trailing: IconButton(
-                icon: const Icon(Icons.close, size: 16),
-                tooltip: '移除',
-                onPressed: ctl.busy ? null : () => ctl.removeFileAt(i),
+                title: Text(name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 12.5)),
+                subtitle: Text(p.substring(0, p.lastIndexOf(r'\')),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 10.5, color: cs.onSurfaceVariant)),
+                trailing: IconButton(
+                  icon: const Icon(Icons.close, size: 16),
+                  tooltip: '移除',
+                  onPressed: ctl.busy ? null : () => ctl.removeFileAt(i),
+                ),
               ),
             );
           },

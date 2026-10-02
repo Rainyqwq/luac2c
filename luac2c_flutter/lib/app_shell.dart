@@ -26,9 +26,9 @@ class _AppShellState extends State<AppShell> {
   int _index = 0;
 
   // Windows 上 Ctrl+1 / Ctrl+2 切页，和浏览器一致
-  static const _switchShortcuts = <ShortcutActivator, int>{
-    SingleActivator(LogicalKeyboardKey.digit1): 0,
-    SingleActivator(LogicalKeyboardKey.digit2): 1,
+  static const _switchShortcuts = <ShortcutActivator, Intent>{
+    SingleActivator(LogicalKeyboardKey.digit1): _SelectIntent(0),
+    SingleActivator(LogicalKeyboardKey.digit2): _SelectIntent(1),
   };
 
   void _select(int i) {

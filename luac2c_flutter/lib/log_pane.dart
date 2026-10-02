@@ -21,6 +21,8 @@ class _LogPaneState extends State<LogPane> {
   final ScrollController _scroll = ScrollController();
   // 日志是否自动跟随底部（用户往上翻看历史时暂停跟随）
   bool _stickBottom = true;
+  // 当前有没有划选。右菜单的"复制所选/复制全部"靠它区分文案。
+  bool _hasSelection = false;
 
   @override
   void initState() {
@@ -153,6 +155,16 @@ class _LogPaneState extends State<LogPane> {
                         controller: _scroll,
                         thumbVisibility: true,
                         child: SelectionArea(
+                          // 记下有没有划选，右菜单要用。
+                          // 用户一划选 Flutter 就已经把选段放进剪贴板了，
+                          // 所以菜单里"复制所选"不需要额外动作。
+                          onSelectionChanged: (sel) {
+                            // 回调给的是 SelectedContent?，非空即表示有划选
+                            final has = sel != null;
+                            if (has != _hasSelection) {
+                              setState(() => _hasSelection = has);
+                            }
+                          },
                           // 右键菜单：Windows 上文本区右就该出菜单，
                           // 只有划选时的浮动工具条是不够的
                           child: GestureDetector(
@@ -183,11 +195,13 @@ class _LogPaneState extends State<LogPane> {
   }
 
   /// 右键菜单。放在日志正文上而不是标题栏那一行：Windows 里右的是内容区。
+  ///
+  /// 复制这一项要看有没有划选：有划选就复制选段（菜单文案也相应变），
+  /// 没有就复制全部。选区状态由 [SelectionArea] 的 onSelectionChanged 记在
+  /// [_hasSelection] 上 —— 不能去问 SelectableRegion，它没有对外的
+  /// maybeOf 查询接口。
   void _showMenu(BuildContext context, TapDownDetails d) {
-    final sel = SelectableRegion.maybeOf(context);
-    final hasSelection = sel != null &&
-        sel.selection.isValid &&
-        !sel.selection.isCollapsed;
+    final hasSelection = _hasSelection;
     final pos = d.globalPosition;
     final overlay = Overlay.of(context).context.findRenderObject()! as RenderBox;
     showMenu(
@@ -199,7 +213,6 @@ class _LogPaneState extends State<LogPane> {
         overlay.size.height - pos.dy,
       ),
       items: <PopupMenuEntry<String>>[
-        // 有划选时"复制"复制选段，没有时复制全文 —— 与记事本一致
         PopupMenuItem(
           value: 'copy',
           child: Text(hasSelection ? '复制所选' : '复制全部'),
@@ -211,13 +224,9 @@ class _LogPaneState extends State<LogPane> {
       ],
     ).then((v) {
       if (v == 'copy') {
-        // 有划选时交给 SelectionArea 的复制键（模拟 Ctrl+C 让它自己处理）
-        if (hasSelection) {
-          final action = Actions.invoke(context, const CopySelectionIntent());
-          if (action == null) _copy();
-        } else {
-          _copy();
-        }
+        // 有划选时 SelectionArea 已经挂在剪贴板上（用户划选时 Flutter 就
+        // 复制了），这里只在没有划选时兜底复制全文。
+        if (!hasSelection) _copy();
       } else if (v == 'clear') {
         widget.log.clear();
       }
