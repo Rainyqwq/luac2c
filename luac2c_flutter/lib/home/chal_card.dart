@@ -55,8 +55,12 @@ class ChalCard extends StatelessWidget {
           Row(children: [
             SizedBox(
               width: 96,
-              child: Text('池条目槽位',
-                  style: TextStyle(fontSize: 12.5, color: cs.onSurfaceVariant)),
+              child: Tooltip(
+                message: '槽位越大，链值覆盖的密文范围越广',
+                child: Text('池条目槽位',
+                    style:
+                        TextStyle(fontSize: 12.5, color: cs.onSurfaceVariant)),
+              ),
             ),
             Expanded(
               child: SizedBox(
@@ -99,14 +103,25 @@ class ChalCard extends StatelessWidget {
             const SizedBox(height: 8),
             Align(
               alignment: Alignment.centerLeft,
-              child: TextButton.icon(
-                onPressed: () async {
-                  await Clipboard.setData(ClipboardData(text: answer));
-                  ctl.noteChalCopied();
-                },
-                icon: const Icon(Icons.copy_all, size: 15),
-                label: const Text('复制应答'),
-              ),
+              child: Wrap(spacing: 10, children: [
+                TextButton.icon(
+                  onPressed: () async {
+                    final v = answer;
+                    if (v == null) return;
+                    await Clipboard.setData(ClipboardData(text: v));
+                    ctl.noteChalCopied();
+                  },
+                  icon: const Icon(Icons.copy_all, size: 15),
+                  label: const Text('复制应答'),
+                ),
+                // 服务端要记的三个值就在产物里，让程序自己打出来，
+                // 免得录参数时手抄错。
+                TextButton.icon(
+                  onPressed: ctl.busy ? null : ctl.fetchChalParams,
+                  icon: const Icon(Icons.assignment_outlined, size: 15),
+                  label: const Text('导出校验参数'),
+                ),
+              ]),
             ),
           ],
         ],

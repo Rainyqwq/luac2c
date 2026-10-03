@@ -54,10 +54,13 @@ class PipelineCtl extends ChangeNotifier {
   // ---- 挑战应答 ----
   /// 是否让产物带上应答能力（--chal）。
   bool chal = false;
-  /// 槽位：常量池条目下标，0 起。由界面上的输入框给出。
-  final TextEditingController chalSlot = TextEditingController(text: '0');
+  /// 槽位：常量池条目下标，0 起。取值越大覆盖的密文范围越广（链值只含
+  /// 该条目之前的字节），所以默认给一个靠后的值而不是 0。
+  final TextEditingController chalSlot = TextEditingController(text: '64');
   /// 取最近一次应答（--chal-respond 的输出），null 表示还没取过。
   String? chalAnswer;
+  /// 最近一次导出的校验参数（id / chal_nonce / chal_chain / poolsig）
+  String? chalParams;
   /// 刚构建完的产物路径，应答要从它身上取。
   String? chalExe;
 
@@ -179,8 +182,9 @@ class PipelineCtl extends ChangeNotifier {
     results.clear();
     doneCount = 0;
     totalCount = 0;
-    // 产物没了，上一次应答也就没有意义（它对应的是那份产物）。
+    // 产物没了，上一次应答与参数也就没有意义（它们对应的是那份产物）。
     chalAnswer = null;
+    chalParams = null;
     chalExe = null;
     _touch();
   }
@@ -262,7 +266,11 @@ class PipelineCtl extends ChangeNotifier {
   void setChal(bool v) {
     if (chal == v) return;
     chal = v;
-    if (v) chalAnswer = null; // 换了一次构建，旧的应答不再对应
+    // 换了一次构建，旧的应答与参数都不再对应
+    if (v) {
+      chalAnswer = null;
+      chalParams = null;
+    }
     _touch();
   }
 
@@ -271,6 +279,28 @@ class PipelineCtl extends ChangeNotifier {
   int get chalIndex {
     final v = int.tryParse(chalSlot.text.trim()) ?? 0;
     return v < 0 ? 0 : v;
+  }
+
+  /// 导出服务端要记的三个校验值（--chal-out）。
+  ///
+  /// 让程序自己打出来而不是手抄：抄错一位，服务端就会拒掉一份合法产物，
+  /// 而这种错误在现场极难定位。
+  Future<void> fetchChalParams() async {
+    final exe = chalExe;
+    if (exe == null || !File(exe).existsSync()) {
+      _setStatus('还没有可验证的产物，先构建一次', level: Level.bad);
+      return;
+    }
+    final r = await runCapture(exe, ['--chal-out'], null,
+        timeout: const Duration(seconds: 20));
+    if (r.exitCode != 0 || r.output.trim().isEmpty) {
+      _setStatus('产物未提供校验参数（可能不是带应答构建的）', level: Level.bad);
+      return;
+    }
+    final params = r.output.trim();
+    chalParams = params;
+    log.add('校验参数：\n${params.replaceAll('\n', '\n  ')}');
+    _setStatus('校验参数已记入日志', level: Level.good);
   }
 
   /// 问产物要一次应答。

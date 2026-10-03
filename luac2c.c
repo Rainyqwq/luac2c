@@ -905,6 +905,12 @@ static unsigned g_mx1 = 0u, g_mx2 = 0u, g_mx3 = 0u;
 ** folds in, and the build-side nonce value.  -1 means the feature is off. */
 static int   g_chal_slot = -1;   /* pool entry the response folds in, -1 = off */
 static unsigned g_chal_nonce = 0u;   /* build-side value, folded into the slot */
+/* Per-build identity.  One account may hold several products, so a server has
+** to key its records by (account, build id) rather than by account alone -- the
+** response is a function of the build, not of the licence.  Left empty it
+** defaults to the first four bytes of the pool signature, which is already
+** unique per build and needs no bookkeeping. */
+static const char *g_chal_id = NULL;
 static unsigned g_hmul = 0u, g_hseed = 0u;
 
 /* One step of the emitted l2c_fnv(): the encoder walks the same bytes the
@@ -4676,6 +4682,17 @@ static void emit_pool(FILE *out) {
             "using the last one\n", g_chal_slot, g_pool_n);
         g_chal_slot = g_pool_n - 1;
     }
+    /* The chain value for entry N covers the ciphertext of entries 0..N-1: the
+    ** hash walks forward, so entry N is reached only after every byte before it
+    ** has been folded in.  A later slot therefore covers a larger part of the
+    ** blob -- editing any byte before it changes the answer, editing one after
+    ** it does not.  Saying so up front beats letting someone pick slot 0 and
+    ** then assume every edit is caught. */
+    if (g_chal_slot >= 0 && g_chal_slot > 0)
+        fprintf(stderr,
+            "luac2c: --chal %d covers pool entries 0..%d of %d "
+            "(a later slot catches more edits)\n",
+            g_chal_slot, g_chal_slot, g_pool_n);
     if (g_chal_slot >= 0) g_chal_nonce = rng_u32();
 
     /* Key corruption, defined in every build: the pool builder calls it when
@@ -5709,15 +5726,52 @@ static void emit_wm_slot(FILE *out) {
 
 static void emit_challenge(FILE *out) {
     if (g_chal_slot < 0) return;
-    /* The nonce is stored in the reserved tail word's neighbour so it travels
-    ** with the build rather than being recomputed; slot[7] is the tail magic
-    ** the finder looks for, so the response keeps its own array entry. */
+    /* Default build id: the first four bytes of the pool signature.  That is
+    ** already unique per build (it hashes the whole ciphertext), so it needs
+    ** no bookkeeping -- and --chal-id overrides it when a caller wants a
+    ** stable name for this particular build. */
+    char chal_id[16];
+    if (g_chal_id != NULL && *g_chal_id != 0) {
+        size_t n = strlen(g_chal_id);
+        if (n > 15) n = 15;
+        memcpy(chal_id, g_chal_id, n);
+        chal_id[n] = 0;
+    } else {
+        snprintf(chal_id, sizeof chal_id, "%08lX", (unsigned long)g_pool_sig);
+    }
+    /* A build id ends up in the binary as a string literal, so it has to be
+    ** printable and quote-free.  Anything else is a script injection into the
+    ** generated C -- the same reason --annotate's path is escaped. */
+    for (char *q = chal_id; *q; q++) {
+        unsigned char c = (unsigned char)*q;
+        if (c < 0x20u || c > 0x7Eu || *q == '"' || *q == '\\') *q = '_';
+    }
+    /* Two things live here.
+    **
+    ** The build id: one account may hold several products, so the server keys
+    ** its records by (account, build id).  It is baked in as a string so the
+    ** client can send it alongside the answer without a second round trip.
+    **
+    ** The response itself: a mix of the caller's nonce with a build-side value
+    ** and with the chain value of pool entry `slot`.  That chain value only
+    ** exists after the blob has been walked, and it moves if any ciphertext
+    ** byte moves -- so a rebuilt or patched pool cannot produce the right
+    ** answer.  The three build-side inputs (chal_nonce, chain[slot], poolsig)
+    ** are what a server records per build; --chal-out dumps them.
+    */
     fprintf(out,
         "/* Challenge/response.  See emit_challenge() in the translator for\n"
         "** what this is for; the short version is that the answer depends on a\n"
         "** pool entry the program had to decode to get here, so a patched pool\n"
         "** cannot produce the right one. */\n"
+        "const char l2c_chal_id[] = \"%s\";\n"
         "static unsigned l2c_chal_nonce = 0x%08Xu;\n"
+        "/* The per-build inputs a server records.  Exposed so that\n"
+        "** --chal-out can print them straight out of a linked binary instead of\n"
+        "** the build having to be replayed. */\n"
+        "unsigned l2c_chal_nonce_get (void) { return l2c_chal_nonce; }\n"
+        "unsigned l2c_chal_chain_get (void) { return l2c_chain[%d]; }\n"
+        "unsigned l2c_chal_poolsig_get (void) { return 0x%08Xu; }\n"
         "/* Feed the server's nonce in, get the answer back.  A server checks\n"
         "** this against its own copy of (nonce, build key). */\n"
         "unsigned l2c_challenge (unsigned nonce) {\n"
@@ -5727,7 +5781,9 @@ static void emit_challenge(FILE *out) {
         "  h *= 0x7A2D1B95u;\n"
         "  h = (h << 17) | (h >> 15);\n"
         "  return h ^ 0x%08Xu;\n"
-        "}\n\n", g_chal_nonce, g_chal_slot, g_pool_sig);
+        "}\n\n",
+        chal_id, g_chal_nonce, g_chal_slot, g_pool_sig,
+        g_chal_slot, g_pool_sig);
 }
 
 static void emit_wm_check(FILE *out) {
@@ -5983,10 +6039,18 @@ static void usage(const char *prog) {
         "  --who EXE [ID-LIST]\n"
         "                  read the watermark out of a built program\n"
         "  --chal N        emit a challenge/response function that folds pool\n"
-        "                  entry N into its answer; the program answers a nonce\n"
-        "                  with --chal-respond <nonce> and prints 8 hex digits.\n"
-        "                  A server that knows (nonce, build) can tell a patched\n"
-        "                  image from an intact one -- see 'Challenge' below.\n"
+        "                  entry N into its answer.  The chain value for N covers\n"
+        "                  entries 0..N-1, so a later slot catches more edits: a\n"
+        "                  byte edited after N does not change the answer.\n"
+        "                  One account may hold many products, so a server keys\n"
+        "                  its records by build:\n"
+        "                    prog --chal-out            dump id + the three values\n"
+        "                    prog --chal-respond <nonce>  the 8-hex answer\n"
+        "                  A server that knows (id, nonce, chal_nonce,\n"
+        "                  chal_chain, poolsig) can tell a rebuilt or patched\n"
+        "                  image from an intact one.\n"
+        "  --chal-id NAME  name for this build (default: the pool signature,\n"
+        "                  which is already unique per build)\n"
         "\n"
         "Hardening notes:\n"
         "  The generated program measures itself: a signature over the machine\n"
@@ -6071,6 +6135,11 @@ int main(int argc, char **argv) {
             ** been interned, so the value is clamped after the walk. */
             long v = strtol(argv[++i], NULL, 0);
             g_chal_slot = (v < 0) ? -1 : (int)v;
+        } else if (strcmp(argv[i], "--chal-id") == 0 && i + 1 < argc) {
+            /* Name for this build, so a server can key its records by
+            ** (account, build) when one account holds several products.
+            ** Defaults to the pool signature, which is already per-build. */
+            g_chal_id = argv[++i];
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -6406,7 +6475,7 @@ int main(int argc, char **argv) {
     ** -- which is the point: the answer folds in a chain value that only exists
     ** once the ciphertext has been walked, so a rewritten pool cannot produce
     ** the right one. */
-    if (g_chal_slot >= 0)
+    if (g_chal_slot >= 0) {
         fprintf(out,
             "  if (argc > 2 && strcmp(argv[1], \"--chal-respond\") == 0) {\n"
             "    unsigned n = (unsigned)strtoul(argv[2], NULL, 0);\n"
@@ -6414,6 +6483,27 @@ int main(int argc, char **argv) {
             "    printf(\"%%08X\\n\", l2c_challenge(n));\n"
             "    return 0;\n"
             "  }\n");
+        /* What a server records per build.  Printing it from the built binary
+        ** means the build does not have to be replayed to recover the values,
+        ** and it cannot drift from what the program actually uses (both read
+        ** the same variables).
+        **
+        ** chal_chain only separates builds when the slot is past the first
+        ** entry -- a one-entry pool always yields the chain seed.  The dump
+        ** says so in that case, because a server that treats it as unique on
+        ** its own would believe two different builds share a key.  poolsig is
+        ** the value that always separates them. */
+        fprintf(out,
+            "  if (argc > 1 && strcmp(argv[1], \"--chal-out\") == 0) {\n"
+            "    l2c_seed(L);\n"
+            "    printf(\"id=%%s\\n\", l2c_chal_id);\n"
+            "    printf(\"chal_nonce=%%08X\\n\", l2c_chal_nonce_get());\n"
+            "    printf(\"chal_chain=%%08X%s\\n\", l2c_chal_chain_get());\n"
+            "    printf(\"poolsig=%%08X\\n\", l2c_chal_poolsig_get());\n"
+            "    return 0;\n"
+            "  }\n",
+            g_chal_slot > 0 ? "" : " # chain seed; pool has one entry, use poolsig");
+    }
     fprintf(out,
         "  l2c_%s(L, %s);\n"        /* _ENV, then the constant pool */
         "  lua_pushcclosure(L, %s, 2);\n"
