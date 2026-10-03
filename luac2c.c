@@ -901,6 +901,10 @@ static unsigned g_pk1 = 0u, g_pk2 = 0u;   /* constant-pool key, two shares    */
 ** 0x9E3779B9 / 0x85EBCA6B / 0x2545F491 / 0x1B873593: recognisable constants
 ** that let a reader find every mixer in the file with one search. */
 static unsigned g_mx1 = 0u, g_mx2 = 0u, g_mx3 = 0u;
+/* Challenge/response (see emit_challenge below): which pool entry the answer
+** folds in, and the build-side nonce value.  -1 means the feature is off. */
+static int   g_chal_slot = -1;   /* pool entry the response folds in, -1 = off */
+static unsigned g_chal_nonce = 0u;   /* build-side value, folded into the slot */
 static unsigned g_hmul = 0u, g_hseed = 0u;
 
 /* One step of the emitted l2c_fnv(): the encoder walks the same bytes the
@@ -4649,6 +4653,17 @@ static void emit_helpers(FILE *out, FnCtx *C) {
 ** a Lua table, so no string or number from the original chunk survives as a
 ** literal in the object file. */
 static void emit_pool(FILE *out) {
+    /* The challenge folds in one pool entry, so the index has to exist.  The
+    ** pool is complete by now (bodies were emitted before this call), so the
+    ** real count is known and the request can be clamped to it. */
+    if (g_chal_slot >= g_pool_n) {
+        fprintf(stderr,
+            "luac2c: --chal %d is past the end of the pool (%d entries); "
+            "using the last one\n", g_chal_slot, g_pool_n);
+        g_chal_slot = g_pool_n - 1;
+    }
+    if (g_chal_slot >= 0) g_chal_nonce = rng_u32();
+
     /* Key corruption, defined in every build: the pool builder calls it when
     ** the guard word is non-zero, so it always has a caller. */
     /* On an intact run the key is 0 and every constant decodes to its real
@@ -5654,6 +5669,53 @@ static void emit_wm_slot(FILE *out) {
         "};\n\n", g_fp_wm);
 }
 
+/* -------------------------------------------------------------------------
+** Challenge / response
+**
+** Every other guard here answers the same question -- "has this file been
+** patched?" -- and a patcher who works that out once has a rule that applies
+** to every build.  This one asks the program to *prove* it: the response is
+** derived from a constant it actually decoded, so an image whose pool was
+** altered (whether by a patch, by a rebuild of the pool blob, or by patching
+** the decode path itself) answers differently.  The server checks the
+** answer against a nonce it just sent, and a mismatch is proof rather than a
+** heuristic.
+**
+** Only the client half lives here.  There is no server in this repository, so
+** what is emitted is:
+**   - a response function the program will answer with,
+**   - `--chal-out <file>` to dump the value a server needs in order to
+**     validate a build offline (useful for provisioning, and for testing
+**     without standing a server up).
+**
+** The response mixes a caller-supplied nonce with l2c_chain[] -- the chain
+** value of the pool entry chosen by --chal.  That value exists only after the
+** blob has been walked, and it moves if any ciphertext byte moves.
+** ------------------------------------------------------------------------- */
+
+static void emit_challenge(FILE *out) {
+    if (g_chal_slot < 0) return;
+    /* The nonce is stored in the reserved tail word's neighbour so it travels
+    ** with the build rather than being recomputed; slot[7] is the tail magic
+    ** the finder looks for, so the response keeps its own array entry. */
+    fprintf(out,
+        "/* Challenge/response.  See emit_challenge() in the translator for\n"
+        "** what this is for; the short version is that the answer depends on a\n"
+        "** pool entry the program had to decode to get here, so a patched pool\n"
+        "** cannot produce the right one. */\n"
+        "static unsigned l2c_chal_nonce = 0x%08Xu;\n"
+        "/* Feed the server's nonce in, get the answer back.  A server checks\n"
+        "** this against its own copy of (nonce, build key). */\n"
+        "unsigned l2c_challenge (unsigned nonce) {\n"
+        "  unsigned h = 0x3B9ACB93u ^ nonce ^ l2c_chal_nonce;\n"
+        "  h += l2c_chain[%d] + 0x000000A7u;\n"
+        "  h ^= h >> 13;\n"
+        "  h *= 0x7A2D1B95u;\n"
+        "  h = (h << 17) | (h >> 15);\n"
+        "  return h ^ 0x%08Xu;\n"
+        "}\n\n", g_chal_nonce, g_chal_slot, g_pool_sig);
+}
+
 static void emit_wm_check(FILE *out) {
     /* Inside the guarded span on purpose: the expected word is then covered by
     ** the code signature, so the pair (slot, code) cannot be edited into a
@@ -5906,6 +5968,11 @@ static void usage(const char *prog) {
         "                  sign the guarded code span of a linked program\n"
         "  --who EXE [ID-LIST]\n"
         "                  read the watermark out of a built program\n"
+        "  --chal N        emit a challenge/response function that folds pool\n"
+        "                  entry N into its answer; the program answers a nonce\n"
+        "                  with --chal-respond <nonce> and prints 8 hex digits.\n"
+        "                  A server that knows (nonce, build) can tell a patched\n"
+        "                  image from an intact one -- see 'Challenge' below.\n"
         "\n"
         "Hardening notes:\n"
         "  The generated program measures itself: a signature over the machine\n"
@@ -5984,6 +6051,12 @@ int main(int argc, char **argv) {
             g_requiresig = 1; /* treat an unsigned image as tampered */
         } else if (strcmp(argv[i], "--fingerprint") == 0 && i + 1 < argc) {
             g_fp_uid = argv[++i];
+        } else if (strcmp(argv[i], "--chal") == 0 && i + 1 < argc) {
+            /* Which pool entry the challenge response folds in.  Pick one that
+            ** is actually present: the range is only known once the pool has
+            ** been interned, so the value is clamped after the walk. */
+            long v = strtol(argv[++i], NULL, 0);
+            g_chal_slot = (v < 0) ? -1 : (int)v;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -6190,6 +6263,10 @@ int main(int argc, char **argv) {
     /* The pool is filled while the bodies are emitted, so it comes last. */
     emit_pool(out);
 
+    /* After the pool: the challenge response reads l2c_chain[], which only
+    ** exists once emit_pool has declared it. */
+    emit_challenge(out);
+
     /* The main chunk runs protected: an uncaught error is reported the
     ** way the standalone interpreter does (message on stderr, exit 1)
     ** instead of aborting through lua_error on an unprotected call. */
@@ -6292,6 +6369,10 @@ int main(int argc, char **argv) {
             fprintf(out, "    printf(\"poolsig=%%08X\\n\", l2c_poolsig());\n");
         if (g_fp_uid)
             fprintf(out, "    printf(\"watermark=%%08X\\n\", l2c_sigslot[6]);\n");
+        if (g_chal_slot >= 0)
+            fprintf(out,
+                "    printf(\"chal_slot=%%d chal_nonce=%%08X\\n\", %d, l2c_chal_nonce);\n",
+                g_chal_slot);
         fprintf(out,
             "    printf(\"flags=%%u\\n\", l2c_gflags);\n"
             "    return 0;\n"
@@ -6305,7 +6386,21 @@ int main(int argc, char **argv) {
         "  luaL_openlibs(L);\n"
         "  lua_pushcclosure(L, l2c_report, 0);\n"
         "  lua_pushglobaltable(L);\n"
-        "  l2c_seed(L);\n"          /* key first: the pool decodes through it */
+        "  l2c_seed(L);\n");        /* key first: the pool decodes through it */
+    /* The challenge answer, for a server that has just sent a nonce.  It goes
+    ** right after l2c_seed(L) so l2c_chain[] is already filled when it answers
+    ** -- which is the point: the answer folds in a chain value that only exists
+    ** once the ciphertext has been walked, so a rewritten pool cannot produce
+    ** the right one. */
+    if (g_chal_slot >= 0)
+        fprintf(out,
+            "  if (argc > 2 && strcmp(argv[1], \"--chal-respond\") == 0) {\n"
+            "    unsigned n = (unsigned)strtoul(argv[2], NULL, 0);\n"
+            "    l2c_seed(L);\n"
+            "    printf(\"%%08X\\n\", l2c_challenge(n));\n"
+            "    return 0;\n"
+            "  }\n");
+    fprintf(out,
         "  l2c_%s(L, %s);\n"        /* _ENV, then the constant pool */
         "  lua_pushcclosure(L, %s, 2);\n"
         "  status = lua_pcall(L, 0, 0, 1);\n"
