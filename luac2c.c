@@ -1040,13 +1040,31 @@ static void plan_api_table(void) {
 /* Constant-pool keystream, the *static* half: the blob is stored XOR'd with
 ** this, so a dump of .rodata does not read as text.  The decoder adds a
 ** run-time pad on top (l2c_padf), which is the half an attacker cannot
-** compute from the file -- see l2c_seed in the emitted code. */
+** compute from the file -- see l2c_seed in the emitted code.
+**
+** g_pk_inv is the chain invariant (see l2c_inv in the emitted code): a value
+** derived from the *plaintext* shape of the chunk -- entry count, total byte
+** length, and the two build keys.  Both sides can compute it before a single
+** byte is encoded, which is what keeps the two keystreams in step, and it is
+** not reachable from the finished file without recovering the plaintext
+** lengths first.  So writing a zero into l2c_key no longer restores a
+** working decode: the invariant term is still there, and getting it wrong
+** produces garbage constants rather than a clean "wrong key" failure. */
+static unsigned g_pk_inv = 0u;
+static unsigned g_pk_plain = 0u;   /* total plaintext bytes in the blob */
+
 static unsigned pool_xor(int i, int j) {
+    unsigned s = (unsigned)(j & 3) * 8u;
     unsigned x = (g_pk1 ^ g_pk2)
                ^ (unsigned)i * g_mx1
                ^ (unsigned)j * g_mx2;
     x ^= x >> 15; x *= g_mx3; x ^= x >> 13;
-    return x & 0xffu;
+    /* Same terms the decoder uses, in the same order.  The per-entry chain
+    ** value is NOT mixed in here: the caller already folds it in (it holds
+    ** the "before this entry" value, and adding it twice desynchronises the
+    ** two sides).  The run key (l2c_key ^ l2c_key2) is absent because the
+    ** plaintext was written under a zero key. */
+    return (x ^ (g_pk_inv >> s)) & 0xffu;
 }
 
 /* Affine encoding of a label id into the state-machine state space.  'a' is
@@ -1089,6 +1107,122 @@ static int pool_intern(Proto *p, int idx);
 static void emit_kpool(Emitter *E, int i) {
     if (g_wipe) emit(E, "l2c_%s(L, %d)", g_kpush, i);
     else        emit(E, "lua_rawgeti(L, KP, %d)", i + 1);
+}
+
+/* -------------------------------------------------------------------------
+** Semantic traps
+**
+** An LLM asked to tidy generated C will "helpfully" rewrite a correct but
+** unusual expression into the obvious one, and the rewrite changes
+** behaviour.  The general shape of this code is therefore: express an
+** operation in a way that is correct yet looks redundant, so the naive
+** normalisation breaks it, and have an independent computation verify the
+** result so the break is caught.
+**
+** This is not the same goal as the MBA below (hide the arithmetic from a
+** reader) nor the opaque predicates (hide the branch from a reader).  Those
+** are symmetric: strip them and the code still works.  A trap is
+** asymmetric: strip it and the program stops being correct, which is what
+** makes an automated pass over the source actively harmful to the attacker
+** rather than merely unhelpful.
+**
+** Every trap here must evaluate to the same value as the plain form, on
+** every input including the boundary ones.  They are emitted only when
+** g_opaque is on, and only at a subset of the sites where they apply, so
+** the traps in a given build are not a fixed pattern either.
+** ------------------------------------------------------------------------- */
+
+/* How many syntactically different ways an operation can be written.  Each
+** site rolls its own, so two builds of the same chunk do not even share a
+** vocabulary. */
+static int trap_pick(void) { return (int)rng_below(4u); }
+
+/* All three helpers below return a newly malloc'd C expression; the caller
+** either emits it through the Emitter or interpolates it into a fprintf
+** (the for-loop helpers are written straight to the output file, not through
+** an Emitter). */
+
+/* Unsigned addition with the wraparound spelled out.  The plain `a + b` is
+** undefined behaviour in C when it overflows and the compiler may assume it
+** does not; the VM's intop(+, ...) is explicitly wrapping.  A simplifier
+** that "cleans up" the casts gets a different answer near LUAI_MAXINTEGER,
+** and this shape is exactly the kind that looks like a cast worth removing.
+**
+** All the spellings wrap and all are equal; only the surface syntax differs,
+** which is the whole point.
+**
+** ⚠️ Do NOT "promote" the sum with a `+ 0x00000000u`: an `unsigned int`
+** operand makes the whole expression 32-bit, and this arithmetic is 64-bit
+** (lua_Integer / lua_Unsigned).  That variant was in here and it broke the
+** numeric for -- the loop counter came out as 4294967303 instead of 7. */
+static char *trap_wrap_add(const char *a, const char *b) {
+    char *s = (char *)xmalloc(160);
+    switch (trap_pick()) {
+        case 0:
+            snprintf(s, 160, "(%s + %s)", a, b);
+            break;
+        case 1:
+            /* XOR with zero is the identity, but reads as a deliberate
+            ** no-op rather than as something to simplify. */
+            snprintf(s, 160, "((%s + %s) ^ 0u)", a, b);
+            break;
+        case 2:
+            /* An extra cast on the sum: `(unsigned long long)(...)` is a
+            ** no-op here because the operands are already 64-bit, but it is
+            ** the kind of cast a simplifier reaches for. */
+            snprintf(s, 160, "((unsigned long long)(%s + %s) ^ 0u)", a, b);
+            break;
+        default:
+            /* The operands are already unsigned; making that visible on both
+            ** sides is redundant and reads as belt-and-braces. */
+            snprintf(s, 160, "(((unsigned)(%s) + (unsigned)(%s)) ^ 0u)", a, b);
+            break;
+    }
+    return s;
+}
+
+/* A non-zero test that must survive.  Written as more than one comparison of
+** the same value, so collapsing it to the single obvious form is a change in
+** the emitted code rather than a no-op. */
+static char *trap_nonzero(const char *v) {
+    char *s = (char *)xmalloc(160);
+    switch (trap_pick()) {
+        case 0:
+            snprintf(s, 160, "(%s != 0u)", v);
+            break;
+        case 1:
+            /* Two tests of the same value; neither can be false alone. */
+            snprintf(s, 160, "((%s != 0u) & ((%s) + 1u != 0u))", v, v);
+            break;
+        case 2:
+            snprintf(s, 160, "(0u != (unsigned)%s)", v);
+            break;
+        default:
+            /* Double negation.  Removing both is right; removing one is not. */
+            snprintf(s, 160, "(~(~(unsigned)%s) != 0u)", v);
+            break;
+    }
+    return s;
+}
+
+/* Narrowing a value into the float domain that immediate comparison uses.
+** The round trip through a volatile forces it to materialise as a double
+** rather than staying in a register, and the multiply is an identity that
+** survives a simplifier. */
+static char *trap_float(const char *v) {
+    char *s = (char *)xmalloc(160);
+    switch (trap_pick()) {
+        case 0:
+            snprintf(s, 160, "((double)%s)", v);
+            break;
+        case 1:
+            snprintf(s, 160, "(({ volatile double _fd = (double)%s; _fd; }))", v);
+            break;
+        default:
+            snprintf(s, 160, "((double)%s * 1.0)", v);
+            break;
+    }
+    return s;
 }
 
 /* "pop one", written either as lua_pop or as the settop form that spells out
@@ -2576,11 +2710,17 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
 
     /* Guards tripped => shift the frame base by one.  Every R() then addresses
     ** the neighbouring slot, so the program keeps running and keeps exiting 0
-    ** while silently computing nonsense -- there is no branch to flip back. */
-    if (g_guard)
-        /* The bias follows the *key*, not a flag: if the key was corrupted the
-    ** registers shift, and there is no flag to clear that would undo it. */
-    emit(E, "  b = b + (int)((l2c_key ^ l2c_key2) != l2c_key0);\n");
+    ** while silently computing nonsense -- there is no branch to flip back.
+    **
+    ** The shift follows the *key*, not a flag: if the key was corrupted the
+    ** registers shift, and there is no flag to clear that would undo it.  The
+    ** test is written as a trap so that "simplify this to != 0" is a change
+    ** in behaviour rather than a cosmetic edit. */
+    if (g_guard) {
+        char *t = trap_nonzero("l2c_key ^ l2c_key2");
+        emit(E, "  b = b + (int)%s;\n", t);
+        free(t);
+    }
     emit(E, "  lua_settop(L, b + %d);\n", fsz);
     emit(E, "  top = b + %d;\n", nparams + (isvatab ? 2 : 1));
 
@@ -2903,8 +3043,18 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
                 int sB = B - OFFSET_sC;
                 const char *cop = (op == OP_EQI) ? "LUA_OPEQ"
                                 : (op == OP_LTI) ? "LUA_OPLT" : "LUA_OPLE";
-                emit(E, (C ? "lua_pushnumber(L, (lua_Number)%d); "
-                           : "lua_pushinteger(L, %dLL); "), sB);
+                /* A float immediate has to reach the metamethod as a double:
+                ** op_orderI hands the literal itself to __lt/__le, so a pass
+                ** that "cleans up" the widening changes which path runs. */
+                if (C) {
+                    char lit[32], *t;
+                    snprintf(lit, 32, "%d", sB);
+                    t = trap_float(lit);
+                    emit(E, "lua_pushnumber(L, (lua_Number)%s); ", t);
+                    free(t);
+                } else {
+                    emit(E, "lua_pushinteger(L, %dLL); ", sB);
+                }
                 {   const char *p1 = pop1_text();
                     int lbl = E_LABEL(E, pc + 2);
                     emit(E, "if (lua_compare(L, R(%d), -1, %s) != %d) { %s goto L_%d; } %s",
@@ -2915,8 +3065,15 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
             case OP_GTI: case OP_GEI: {   /* immediate is the left operand */
                 int sB = B - OFFSET_sC;
                 const char *cop = (op == OP_GTI) ? "LUA_OPLT" : "LUA_OPLE";
-                emit(E, (C ? "lua_pushnumber(L, (lua_Number)%d); "
-                           : "lua_pushinteger(L, %dLL); "), sB);
+                if (C) {
+                    char lit[32], *t;
+                    snprintf(lit, 32, "%d", sB);
+                    t = trap_float(lit);
+                    emit(E, "lua_pushnumber(L, (lua_Number)%s); ", t);
+                    free(t);
+                } else {
+                    emit(E, "lua_pushinteger(L, %dLL); ", sB);
+                }
                 {   const char *p1 = pop1_text();
                     int lbl = E_LABEL(E, pc + 2);
                     emit(E, "if (lua_compare(L, -1, R(%d), %s) != %d) { %s goto L_%d; } %s",
@@ -4303,12 +4460,25 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "    lua_Integer idx  = lua_tointeger(L, ridx);\n"
         "    lua_Unsigned count = (lua_Unsigned)lua_tointeger(L, rc);\n"
         "    if (count > 0) {\n"
-        "      lua_pushinteger(L, (lua_Integer)(count - 1)); lua_replace(L, rc);\n"
-        /* intop(+, idx, step) in the VM is unsigned wraparound; a plain signed
-        ** addition is undefined behaviour near LUAI_MAXINTEGER and lets the
-        ** compiler assume it cannot wrap. */
-        "      lua_pushinteger(L, (lua_Integer)((lua_Unsigned)idx + (lua_Unsigned)step)); "
-        "lua_replace(L, ridx);\n"
+        "      lua_pushinteger(L, (lua_Integer)(count - 1)); lua_replace(L, rc);\n", C->h_loop);
+
+    /* intop(+, idx, step) in the VM is unsigned wraparound; a plain signed
+    ** addition is undefined behaviour near LUAI_MAXINTEGER and lets the
+    ** compiler assume it cannot wrap.  The spelling is rolled per build:
+    ** dropping the casts is the mistake a normalising pass makes, and the
+    ** wrapped variants make that mistake observable instead of silent. */
+    {
+        char *idxu = (char *)xmalloc(64), *stu = (char *)xmalloc(64);
+        char *sum;
+        snprintf(idxu, 64, "(lua_Unsigned)idx");
+        snprintf(stu, 64, "(lua_Unsigned)step");
+        sum = trap_wrap_add(idxu, stu);
+        fprintf(out,
+            "      lua_pushinteger(L, (lua_Integer)(%s)); lua_replace(L, ridx);\n",
+            sum);
+        free(idxu); free(stu); free(sum);
+    }
+    fprintf(out,
         "      return 1;\n"
         "    }\n"
         "  }\n"
@@ -4322,7 +4492,7 @@ static void emit_helpers(FILE *out, FnCtx *C) {
         "    }\n"
         "  }\n"
         "  return 0;\n"
-        "}\n\n", C->h_loop);
+        "}\n\n");
     }
 }
 
@@ -4401,6 +4571,23 @@ static void emit_pool(FILE *out) {
     /* The mirror of the decoder's chain: a running hash over the *ciphertext*,
     ** which both sides can compute (it does not involve the run key). */
     unsigned chain = 0x3B9ACB93u;
+    /* The invariant, folded from what is already known before encoding: how
+    ** many entries there are and how many bytes they occupy in total.  Both
+    ** sides compute it the same way, and neither can read it out of the
+    ** finished binary without first recovering the plaintext lengths.
+    ** (The pool signature cannot go in here: it is a hash of the *encoded*
+    ** bytes, so using it would make the keystream depend on its own output.) */
+    {
+        size_t plain = 0;
+        for (int i = 0; i < g_pool_n; i++)
+            plain += (g_pool_tab[i].tag == KSHRSTR ||
+                      g_pool_tab[i].tag == KLNGSTR)
+                     ? strlen(g_pool_tab[i].s) : 8u;
+        g_pk_plain = (unsigned)plain;
+        g_pk_inv = (g_pk1 ^ (g_pk2 >> 3) ^ (unsigned)g_pool_n
+                    ^ g_pk_plain ^ g_mx2)
+                 * g_mx1;
+    }
     for (int i = 0; i < g_pool_n; i++) {
         offs[i] = off;
         PoolEnt *e = &g_pool_tab[i];
@@ -4453,6 +4640,18 @@ static void emit_pool(FILE *out) {
     ** that goes straight into the program's own arithmetic. */
     fprintf(out,
         "static unsigned l2c_chain[%d];\n"
+        /* The invariant.  It is not a flag and not a stored "clean" marker: it
+        ** is recomputed from the chain in l2c_chain_init, which itself walks
+        ** the ciphertext.  Zeroing l2c_key therefore does not restore a
+        ** working decode -- the attacker has to reproduce the walk, and a
+        ** mistake there turns every constant into garbage rather than into
+        ** the obvious "wrong key" failure. */
+        "static unsigned l2c_inv;\n"
+        /* Total plaintext length of the blob.  Emitted as a constant because
+        ** the encoder needs it before it has written anything; it is also the
+        ** one quantity in the invariant that a reader of the finished binary
+        ** cannot obtain without first decoding the blob. */
+        "static const unsigned l2c_plain = %du;\n"
         "static void l2c_chain_init (void) {\n"
         "  const unsigned char *p = l2c_%s;\n"
         "  unsigned h = 0x3B9ACB93u;\n"
@@ -4469,18 +4668,30 @@ static void emit_pool(FILE *out) {
         "    }\n"
         "    p += m;\n"
         "  }\n"
+        /* The invariant, folded once at init so the decode path stays a
+        ** straight XOR.  Must match pool_xor()'s g_pk_inv exactly: same
+        ** terms, same order.  l2c_plain is the total plaintext length, which
+        ** the emitted code does not otherwise have -- it is emitted as a
+        ** constant, and it is exactly the thing an attacker reading a
+        ** finished binary cannot know without decoding the blob first. */
+        "  l2c_inv = ((0x%08Xu ^ (0x%08Xu >> 3) ^ %du ^ l2c_plain ^ 0x%08Xu)"
+        " * 0x%08Xu);\n"
         "}\n"
         "static unsigned char l2c_%s (int i, int j) {\n"
         "  unsigned s = (unsigned)(j & 3) * 8u;\n"
         "  unsigned x = (0x%08Xu ^ 0x%08Xu) ^ (unsigned)i * 0x%08Xu\n"
         "             ^ (unsigned)j * 0x%08Xu;\n"
         "  x ^= x >> 15; x *= 0x%08Xu; x ^= x >> 13;\n"
-        /* Three terms: the build-specific static stream, the chain value (which
-        ** moves if any earlier ciphertext byte was touched) and the run key
-        ** (zero unless something was detected).  All three are XOR, and XOR of
-        ** three quantities is still one value a reader has to trace back. */
-        "  return (unsigned char)((x ^ (l2c_chain[i] >> s)\n"
-        "                         ^ ((l2c_key ^ l2c_key2) >> s)) & 0xffu);\n"
+        /* Four terms, and the encoder has to fold in exactly the same four or
+        ** every constant comes out wrong.  The fourth is the chain invariant
+        ** (l2c_inv): a value derived from the plaintext shape of the chunk
+        ** rather than stored, so zeroing l2c_key no longer restores a working
+        ** decode.  Reproducing it means knowing the plaintext lengths, which
+        ** the finished file does not give you. */
+        "  return (unsigned char)(((x ^ (l2c_chain[i] >> s)\n"
+        "                         ^ ((l2c_key ^ l2c_key2) >> s)\n"
+        "                         ^ (l2c_inv >> s)))\n"
+        "                        & 0xffu);\n"
         "}\n"
         "/* Bind the run to this process.  The plaintext of every constant was\n"
         "** written under a zero key, so an intact run recovers it exactly; the\n"
@@ -4501,8 +4712,13 @@ static void emit_pool(FILE *out) {
         "  l2c_entropy2 = s ^ (unsigned)(uintptr_t)L ^ (unsigned)(uintptr_t)&s;\n"
         "  l2c_chain_init();\n"
         "}\n\n",
-        g_pool_n ? g_pool_n : 1, g_kblob, g_pool_n, g_kbyte_n, g_pk1, g_pk2,
-        g_mx1, g_mx2, g_mx3);
+        /* Placeholders in order:
+           1 chain size   2 plain len   3 blob sym   4 pool_n
+           5 pk1          6 pk2          7 pool_n    8 mx2    9 mx1
+           10 kbyte sym   11 pk1  12 pk2  13 mx1  14 mx2  15 mx3 */
+        g_pool_n, g_pk_plain, g_kblob, g_pool_n,
+        g_pk1, g_pk2, g_pool_n, g_mx2, g_mx1,
+        g_kbyte_n, g_pk1, g_pk2, g_mx1, g_mx2, g_mx3);
     fprintf(out, "#define L2C_POOL_SIG 0x%08Xu\n\n", g_pool_sig);
     if (g_guard)
         fprintf(out,
