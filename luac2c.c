@@ -3435,6 +3435,260 @@ static void emit_body(Emitter *E, Proto *p, FnCtx *FX) {
 ** ------------------------------------------------------------------------- */
 static void emit_wm_slot(FILE *out);   /* the watermark slot (defined below) */
 
+/* -------------------------------------------------------------------------
+** Check-set polymorphism
+**
+** A guard that always runs the same probes in the same order is a signature.
+** Once an unhook script exists for that layout it works on every build made
+** afterwards -- and an automated pass is exactly what produces one, because a
+** stable pattern is a pattern-matchable pattern.
+**
+** So each probe below is emitted as its own function, this build draws a
+** random subset of them, and the flag bit each one owns is handed out per
+** build.  An unhook script written against one product has to work out which
+** probes this one drew and which bit it uses, rather than recognising a layout
+** it has seen before.  The subset is never smaller than L2C_CHECK_MIN: a build
+** carrying almost nothing would simply be cheap to debug.
+** ------------------------------------------------------------------------- */
+#define L2C_CHECK_MIN 4
+#define L2C_NPROBE 6
+
+typedef struct {
+    void (*emit)(FILE *out, const char *fn, unsigned bit);
+} ChkProbe;
+
+static int      g_chk_sel[L2C_NPROBE];
+static unsigned g_chk_bits[L2C_NPROBE];
+static int      g_chk_nsel = 0;
+static int      g_chk_drawn = 0;
+
+/* --- the probes --------------------------------------------------------- */
+
+static void chk_p_isdebugg (FILE *out, const char *fn, unsigned b) {
+    fprintf(out,
+        "static int %s (void) {\n"
+        "  unsigned f = 0u;\n"
+        "#if defined(_WIN32)\n"
+        "  if (IsDebuggerPresent()) f |= %uu;\n"
+        "#elif defined(__APPLE__)\n"
+        "  { int mib[4]; struct kinfo_proc kp; size_t len = sizeof(kp);\n"
+        "    mib[0] = CTL_KERN; mib[1] = KERN_PROC; mib[2] = KERN_PROC_PID;\n"
+        "    mib[3] = getpid();\n"
+        "    if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0 &&\n"
+        "        (kp.kp_proc.p_flag & P_TRACED) != 0) f |= %uu; }\n"
+        "#elif defined(__linux__)\n"
+        "  { FILE *fp = fopen(\"/proc/self/status\", \"r\");\n"
+        "    if (fp != NULL) { char ln[512];\n"
+        "      while (fgets(ln, (int)sizeof ln, fp) != NULL)\n"
+        "        if (strncmp(ln, \"TracerPid:\", 10) == 0) {\n"
+        "          if (atoi(ln + 10) != 0) f |= %uu;\n"
+        "          break; }\n"
+        "      fclose(fp); } }\n"
+        "#endif\n"
+        "  return (int)f;\n}\n", fn, b, b, b);
+}
+
+static void chk_p_remotedbg (FILE *out, const char *fn, unsigned b) {
+    fprintf(out,
+        "static int %s (void) {\n"
+        "  unsigned f = 0u;\n"
+        "#if defined(_WIN32)\n"
+        "  { BOOL rem = FALSE;\n"
+        "    CheckRemoteDebuggerPresent(GetCurrentProcess(), &rem);\n"
+        "    if (rem) f |= %uu; }\n"
+        "#elif defined(__linux__)\n"
+        "  { errno = 0; if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) f |= %uu; }\n"
+        "#endif\n"
+        "  return (int)f;\n}\n", fn, b, b);
+}
+
+/* Two of the usual names, masked and assembled on the stack: as literals they
+** would just print the answer next to the binary. */
+static void chk_p_handles (FILE *out, const char *fn, unsigned b) {
+    fprintf(out,
+        "static int %s (void) {\n"
+        "  unsigned f = 0u;\n"
+        "#if defined(_WIN32)\n"
+        "  { static const unsigned char na[] = { 0x3Cu, 0x28u, 0x33u, 0x3Eu, 0x3Bu, 0x77u, 0x3Bu, 0x3Du, 0x3Fu, 0x34u, 0x2Eu, 0x74u, 0x3Eu, 0x36u, 0x36u };\n"
+        "    static const unsigned char nb[] = { 0x3Cu, 0x28u, 0x33u, 0x3Eu, 0x3Bu, 0x77u, 0x3Du, 0x3Bu, 0x3Eu, 0x3Du, 0x3Fu, 0x2Eu, 0x74u, 0x3Eu, 0x36u, 0x36u };\n"
+        "    char a[32], bb[32];\n"
+        "    int i;\n"
+        "    for (i = 0; i < 15; i++) a[i] = (char)(na[i] ^ 0x5Au);\n"
+        "    a[15] = 0;\n"
+        "    for (i = 0; i < 16; i++) bb[i] = (char)(nb[i] ^ 0x5Au);\n"
+        "    bb[16] = 0;\n"
+        "    if (GetModuleHandleA(a) != NULL || GetModuleHandleA(bb) != NULL)\n"
+        "      f |= %uu; }\n"
+        "#elif defined(__APPLE__)\n"
+        "  if (getenv(\"DYLD_INSERT_LIBRARIES\") != NULL) f |= %uu;\n"
+        "#elif defined(__linux__)\n"
+        "  if (getenv(\"LD_PRELOAD\") != NULL) f |= %uu;\n"
+        "#endif\n"
+        "  return (int)f;\n}\n", fn, b, b, b);
+}
+
+/* Walk the loaded modules / image list / maps and hash every name.  This is the
+** probe that catches a hook engine by its own presence. */
+static void chk_p_modlist (FILE *out, const char *fn, unsigned b) {
+    fprintf(out,
+        "static int %s (void) {\n"
+        "  unsigned f = 0u;\n"
+        "#if defined(_WIN32)\n"
+        "  { HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE,\n"
+        "                                        GetCurrentProcessId());\n"
+        "    if (h != INVALID_HANDLE_VALUE) {\n"
+        "      MODULEENTRY32 me; me.dwSize = (DWORD)sizeof(me);\n"
+        "      if (Module32First(h, &me)) do {\n"
+        "        int i; char nm[MAX_PATH];\n"
+        "        /* Read as unsigned so this compiles whether szModule is char or\n"
+        "        ** wchar_t; non-ASCII folds to '?' (module names are ASCII). */\n"
+        "        for (i = 0; i < MAX_PATH - 1; i++) {\n"
+        "          unsigned c = (unsigned)me.szModule[i];\n"
+        "          if (c == 0) break;\n"
+        "          if (c >= 'A' && c <= 'Z') c += 32u;\n"
+        "          if (c > 127u) c = '?';\n"
+        "          nm[i] = (char)c;\n"
+        "        }\n"
+        "        nm[i] = 0;\n"
+        "        if (l2c_namehit(nm) != 0) { f |= %uu; break; }\n"
+        "      } while (Module32Next(h, &me));\n"
+        "      CloseHandle(h);\n"
+        "    } }\n"
+        "#elif defined(__APPLE__)\n"
+        "  { uint32_t n = _dyld_image_count(), i;\n"
+        "    for (i = 0; i < n; i++) { const char *nm = _dyld_get_image_name(i);\n"
+        "      if (nm == NULL) continue;\n"
+        "      if (l2c_namehit(nm) != 0) { f |= %uu; break; } } }\n"
+        "#elif defined(__linux__)\n"
+        "  { FILE *fp = fopen(\"/proc/self/maps\", \"r\");\n"
+        "    if (fp != NULL) { char ln[1024];\n"
+        "      while (fgets(ln, (int)sizeof ln, fp) != NULL) {\n"
+        "        if (l2c_namehit(ln) != 0) { f |= %uu; break; }\n"
+        "      }\n"
+        "      fclose(fp); } }\n"
+        "#endif\n"
+        "  return (int)f;\n}\n", fn, b, b, b);
+}
+
+/* Thread names -- a hook engine usually names its threads. */
+static void chk_p_threads (FILE *out, const char *fn, unsigned b) {
+    fprintf(out,
+        "static int %s (void) {\n"
+        "  unsigned f = 0u;\n"
+        "#if defined(__linux__)\n"
+        "  { DIR *d = opendir(\"/proc/self/task\");\n"
+        "    if (d != NULL) { struct dirent *e;\n"
+        "      while ((e = readdir(d)) != NULL) {\n"
+        "        char pb[512], nm[256]; FILE *fp;\n"
+        "        if (e->d_name[0] == '.') continue;\n"
+        "        snprintf(pb, sizeof pb, \"/proc/self/task/%%s/comm\", e->d_name);\n"
+        "        fp = fopen(pb, \"r\"); if (fp == NULL) continue;\n"
+        "        if (fgets(nm, (int)sizeof nm, fp) != NULL) {\n"
+        "          if (l2c_namehit(nm) != 0) f |= %uu;\n"
+        "        }\n"
+        "        fclose(fp);\n"
+        "      }\n"
+        "      closedir(d); } }\n"
+        "#endif\n"
+        "  return (int)f;\n}\n", fn, b);
+}
+
+/* The PEB is read directly.  IsDebuggerPresent is the one API every
+** anti-anti-debug plugin patches first, and the fields it reads are still
+** there -- so this catches a debugger that only replaced the API. */
+static void chk_p_peb (FILE *out, const char *fn, unsigned b) {
+    fprintf(out,
+        "static int %s (void) {\n"
+        "  unsigned f = 0u;\n"
+        "#if defined(_WIN32)\n"
+        "  { unsigned char *peb;\n"
+        "    size_t off = 0x60;\n"
+        "    if (sizeof(void *) == 4u) off = 0x30;\n"
+        "    peb = (unsigned char *)(uintptr_t)\n"
+        "#if defined(_WIN64)\n"
+        "        __readgsqword((unsigned long)off);\n"
+        "#elif defined(_M_IX86) || defined(__i386__)\n"
+        "        __readfsdword((unsigned long)off);\n"
+        "#else\n"
+        "        0;\n"
+        "#endif\n"
+        "    if (peb != NULL) {\n"
+        "      if (peb[2] != 0) f |= %uu;               /* BeingDebugged */\n"
+        "      { unsigned nf;\n"
+        "        memcpy(&nf, peb + (sizeof(void *) == 8u ? 0xBC : 0x68),\n"
+        "               sizeof nf);\n"
+        "        /* FLG_HEAP_ENABLE_TAIL_CHECK | ENABLE_FREE | VALIDATE_PARAMETERS */\n"
+        "        if ((nf & 0x70u) != 0u) f |= %uu; }    /* NtGlobalFlag */\n"
+        "    } }\n"
+        "#endif\n"
+        "  return (int)f;\n}\n", fn, b, b);
+}
+
+static const ChkProbe g_chk_probes[L2C_NPROBE] = {
+    { chk_p_isdebugg },
+    { chk_p_remotedbg },
+    { chk_p_handles   },
+    { chk_p_modlist   },
+    { chk_p_threads   },
+    { chk_p_peb       },
+};
+
+/* Draw the subset and hand out the bits: one decision per build, so the probes
+** are at least internally consistent about which bit is theirs. */
+static void chk_plan(void) {
+    if (g_chk_drawn) return;
+    g_chk_drawn = 1;
+    int order[L2C_NPROBE];
+    for (int i = 0; i < L2C_NPROBE; i++) order[i] = i;
+    for (int i = L2C_NPROBE - 1; i > 0; i--) {              /* Fisher-Yates */
+        int j = (int)rng_below((unsigned)(i + 1));
+        int t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+    /* Bits from a shuffled pool, so the same probe does not own the same bit in
+    ** two builds.  1u<<(4+i) keeps them clear of the low bits the rest of the
+    ** guard already uses. */
+    unsigned pool[L2C_NPROBE];
+    for (int i = 0; i < L2C_NPROBE; i++) pool[i] = 1u << (4 + i);
+    for (int i = L2C_NPROBE - 1; i > 0; i--) {
+        int j = (int)rng_below((unsigned)(i + 1));
+        unsigned t = pool[i]; pool[i] = pool[j]; pool[j] = t;
+    }
+    int span = L2C_NPROBE - L2C_CHECK_MIN + 1;
+    int n = L2C_CHECK_MIN + (int)rng_below((unsigned)span);
+    if (n > L2C_NPROBE) n = L2C_NPROBE;
+    g_chk_nsel = n;
+    for (int i = 0; i < n; i++) {
+        g_chk_sel[i] = order[i];
+        /* The bit travels with the probe through the shuffle: taking pool[i] by
+        ** position would hand the first draw 16 every time, which is as much a
+        ** signature as a fixed assignment. */
+        g_chk_bits[i] = pool[order[i]];
+    }
+}
+
+/* Emit the drawn probes, then an aggregator that calls exactly those.  The
+** function names carry this build's own tag and bit, so both the set of
+** functions and their names differ from build to build. */
+static void emit_chk_probes(FILE *out) {
+    chk_plan();
+    char nm[L2C_NPROBE][20];
+    for (int i = 0; i < g_chk_nsel; i++) {
+        snprintf(nm[i], 20, "%sc%u_%u", g_api_tag,
+                 g_chk_bits[i] >> 4, g_chk_bits[i] & 0xFu);
+        g_chk_probes[g_chk_sel[i]].emit(out, nm[i], g_chk_bits[i]);
+    }
+    fprintf(out,
+        "/* Which probes this build carries, and which flag each one owns, is\n"
+        "** decided by the build seed. */\n"
+        "static int l2c_scan_env (void) {\n"
+        "  unsigned f = 0u;\n");
+    for (int i = 0; i < g_chk_nsel; i++)
+        fprintf(out, "  f |= (unsigned)%s();\n", nm[i]);
+    fprintf(out,
+        "  return (int)f;\n"
+        "}\n\n");
+}
+
 static void emit_guard_runtime(FILE *out) {
     fprintf(out,
         "#if defined(_WIN32)\n"
@@ -3683,118 +3937,13 @@ static void emit_guard_runtime(FILE *out) {
         "    }\n"
         "  }\n"
         "  return 0;\n"
-        "}\n\n"
-        "static int l2c_scan_env (void) {\n"
-        "  int f = 0;\n"
-        "#if defined(_WIN32)\n"
-        "  if (IsDebuggerPresent()) f |= 1;\n"
-        "  { BOOL rem = FALSE;\n"
-        "    CheckRemoteDebuggerPresent(GetCurrentProcess(), &rem);\n"
-        "    if (rem) f |= 2; }\n"
-        /* The loader is asked about two names; keeping them as text is the
-        ** same as printing the answer beside the binary.  Masked, assembled
-        ** on the stack for the call. */
-        "  { static const unsigned char na[] = { 0x3Cu, 0x28u, 0x33u, 0x3Eu, 0x3Bu, 0x77u, 0x3Bu, 0x3Du, 0x3Fu, 0x34u, 0x2Eu, 0x74u, 0x3Eu, 0x36u, 0x36u };\n"
-        "    static const unsigned char nb[] = { 0x3Cu, 0x28u, 0x33u, 0x3Eu, 0x3Bu, 0x77u, 0x3Du, 0x3Bu, 0x3Eu, 0x3Du, 0x3Fu, 0x2Eu, 0x74u, 0x3Eu, 0x36u, 0x36u };\n"
-        "    char a[32], b[32];\n"
-        "    int i;\n"
-        "    for (i = 0; i < 15; i++) a[i] = (char)(na[i] ^ 0x5Au);\n"
-        "    a[15] = 0;\n"
-        "    for (i = 0; i < 16; i++) b[i] = (char)(nb[i] ^ 0x5Au);\n"
-        "    b[16] = 0;\n"
-        "    if (GetModuleHandleA(a) != NULL || GetModuleHandleA(b) != NULL)\n"
-        "      f |= 4; }\n"
-        "  { HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE,\n"
-        "                                        GetCurrentProcessId());\n"
-        "    if (h != INVALID_HANDLE_VALUE) {\n"
-        "      MODULEENTRY32 me; me.dwSize = (DWORD)sizeof(me);\n"
-        "      if (Module32First(h, &me)) do {\n"
-        "        int i; char nm[MAX_PATH];\n"
-        "        /* Read as unsigned so the same code works whether szModule is\n"
-        "        ** char or wchar_t; non-ASCII folds to '?' (names are ASCII). */\n"
-        "        for (i = 0; i < MAX_PATH - 1; i++) {\n"
-        "          unsigned c = (unsigned)me.szModule[i];\n"
-        "          if (c == 0) break;\n"
-        "          if (c >= 'A' && c <= 'Z') c += 32u;\n"
-        "          if (c > 127u) c = '?';\n"
-        "          nm[i] = (char)c;\n"
-        "        }\n"
-        "        nm[i] = 0;\n"
-        "        if (l2c_namehit(nm) != 0) { f |= 8; break; }\n"
-
-        /* inline-hook frameworks: their own modules are the give-away, since
-        ** a hook they plant leaves no trace in the loaded-module list */
-
-        "      } while (Module32Next(h, &me));\n"
-        "      CloseHandle(h);\n"
-        "    } }\n"
-        /* Read the PEB directly.  IsDebuggerPresent is the one API every
-        ** anti-anti-debug plugin hooks first; the PEB fields it reads are
-        ** still there, so this catches a debugger that only patched the API. */
-        "  { unsigned char *peb;\n"
-        "    size_t off = 0x60;\n"
-        "    if (sizeof(void *) == 4u) off = 0x30;\n"
-        "    peb = (unsigned char *)(uintptr_t)\n"
-        "#if defined(_WIN64)\n"
-        "        __readgsqword((unsigned long)off);\n"
-        "#elif defined(_M_IX86) || defined(__i386__)\n"
-        "        __readfsdword((unsigned long)off);\n"
-        "#else\n"
-        "        0;\n"
-        "#endif\n"
-        "    if (peb != NULL) {\n"
-        "      if (peb[2] != 0) f |= 128;               /* BeingDebugged */\n"
-        "      { unsigned nf;\n"
-        "        memcpy(&nf, peb + (sizeof(void *) == 8u ? 0xBC : 0x68),\n"
-        "               sizeof nf);\n"
-        /* FLG_HEAP_ENABLE_TAIL_CHECK | ENABLE_FREE | VALIDATE_PARAMETERS */
-        "        if ((nf & 0x70u) != 0u) f |= 256; }    /* NtGlobalFlag */\n"
-        "    } }\n"
-        "#elif defined(__linux__)\n"
-        "  { FILE *fp = fopen(\"/proc/self/maps\", \"r\");\n"
-        "    if (fp != NULL) { char ln[1024];\n"
-        "      while (fgets(ln, (int)sizeof ln, fp) != NULL) {\n"
-        "        if (l2c_namehit(ln) != 0) { f |= 4; break; }\n"
-
-        "      }\n"
-        "      fclose(fp); } }\n"
-        "  { FILE *fp = fopen(\"/proc/self/status\", \"r\");\n"
-        "    if (fp != NULL) { char ln[512];\n"
-        "      while (fgets(ln, (int)sizeof ln, fp) != NULL)\n"
-        "        if (strncmp(ln, \"TracerPid:\", 10) == 0) {\n"
-        "          if (atoi(ln + 10) != 0) f |= 1;\n"
-        "          break;\n"
-        "        }\n"
-        "      fclose(fp); } }\n"
-        "  { DIR *d = opendir(\"/proc/self/task\");\n"
-        "    if (d != NULL) { struct dirent *e;\n"
-        "      while ((e = readdir(d)) != NULL) {\n"
-        "        char pb[512], nm[256]; FILE *fp;\n"
-        "        if (e->d_name[0] == '.') continue;\n"
-        "        snprintf(pb, sizeof pb, \"/proc/self/task/%%s/comm\", e->d_name);\n"
-        "        fp = fopen(pb, \"r\"); if (fp == NULL) continue;\n"
-        "        if (fgets(nm, (int)sizeof nm, fp) != NULL) {\n"
-        "          if (l2c_namehit(nm) != 0) f |= 8;\n"
-        "        }\n"
-        "        fclose(fp);\n"
-        "      }\n"
-        "      closedir(d); } }\n"
-        "  if (getenv(\"LD_PRELOAD\") != NULL) f |= 16;\n"
-        "  { errno = 0; if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) f |= 2; }\n"
-        "#elif defined(__APPLE__)\n"
-        "  { int mib[4]; struct kinfo_proc kp; size_t len = sizeof(kp);\n"
-        "    mib[0] = CTL_KERN; mib[1] = KERN_PROC; mib[2] = KERN_PROC_PID;\n"
-        "    mib[3] = getpid();\n"
-        "    if (sysctl(mib, 4, &kp, &len, NULL, 0) == 0 &&\n"
-        "        (kp.kp_proc.p_flag & P_TRACED) != 0) f |= 1; }\n"
-        "  { uint32_t n = _dyld_image_count(), i;\n"
-        "    for (i = 0; i < n; i++) { const char *nm = _dyld_get_image_name(i);\n"
-        "      if (nm == NULL) continue;\n"
-        "      if (l2c_namehit(nm) != 0) { f |= 4; break; } } }\n"
-        "  if (getenv(\"DYLD_INSERT_LIBRARIES\") != NULL) f |= 16;\n"
-        "#endif\n"
-        "  return f;\n"
         "}\n\n");
+
+    /* The environment probes are emitted per build by emit_chk_probes()
+    ** (above): it draws a random subset of them and assigns each one a flag
+    ** bit, so an unhook script written against one layout does not transfer
+    ** to the next. */
+    emit_chk_probes(out);
 
     fprintf(out,
         "/* Timing.  A trivial loop takes microseconds on any real machine but\n"
