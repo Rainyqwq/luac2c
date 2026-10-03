@@ -23,12 +23,18 @@ class BuildOptions {
   final bool noPool;
   final bool annotate;
   final bool guard;
+
+  /// 挑战应答：让产物能对服务端 nonce 给出应答（--chal N）。
+  /// -1 = 不启用。槽位是常量池的条目下标，取值在 0 以上。
+  final int chal;
+
   const BuildOptions({
     this.mode = layoutRandom,
     this.seed = '0',
     this.noPool = false,
     this.annotate = false,
     this.guard = true,
+    this.chal = -1,
   });
 
   /// 组装 luac2c 的参数
@@ -42,6 +48,8 @@ class BuildOptions {
     if (noPool) args.add('--no-pool');
     if (annotate) args.add('--annotate');
     if (!guard) args.add('--no-guard');
+    // 不混淆模式下不应留下挑战应答：--static 关掉的正是那些防护。
+    if (chal >= 0 && mode != layoutPlain) args.addAll(['--chal', '$chal']);
     // 登录后把账号标识交给 luac2c：产物里会嵌入这个账号的指纹，
     // 之后拿 luac2c --who 就能从任意一份副本反查归属。
     final uid = AccountCtl.I.uid;

@@ -1161,6 +1161,12 @@ static int trap_pick(void) { return (int)rng_below(4u); }
 ** numeric for -- the loop counter came out as 4294967303 instead of 7. */
 static char *trap_wrap_add(const char *a, const char *b) {
     char *s = (char *)xmalloc(160);
+    /* --no-opaque turns the traps off along with the junk: leaving them in
+    ** would mean the switch does not mean what it says. */
+    if (!g_opaque) {
+        snprintf(s, 160, "(%s + %s)", a, b);
+        return s;
+    }
     switch (trap_pick()) {
         case 0:
             snprintf(s, 160, "(%s + %s)", a, b);
@@ -1190,6 +1196,10 @@ static char *trap_wrap_add(const char *a, const char *b) {
 ** the emitted code rather than a no-op. */
 static char *trap_nonzero(const char *v) {
     char *s = (char *)xmalloc(160);
+    if (!g_opaque) {
+        snprintf(s, 160, "(%s != 0u)", v);
+        return s;
+    }
     switch (trap_pick()) {
         case 0:
             snprintf(s, 160, "(%s != 0u)", v);
@@ -1215,6 +1225,10 @@ static char *trap_nonzero(const char *v) {
 ** survives a simplifier. */
 static char *trap_float(const char *v) {
     char *s = (char *)xmalloc(160);
+    if (!g_opaque) {
+        snprintf(s, 160, "((double)%s)", v);
+        return s;
+    }
     switch (trap_pick()) {
         case 0:
             snprintf(s, 160, "((double)%s)", v);

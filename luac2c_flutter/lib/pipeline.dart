@@ -51,6 +51,16 @@ class PipelineCtl extends ChangeNotifier {
   /// 运行时防护：反调试 + 代码/常量完整性自校验（关闭等价于 --no-guard）
   bool guard = true;
 
+  // ---- 挑战应答 ----
+  /// 是否让产物带上应答能力（--chal）。
+  bool chal = false;
+  /// 槽位：常量池条目下标，0 起。由界面上的输入框给出。
+  final TextEditingController chalSlot = TextEditingController(text: '0');
+  /// 取最近一次应答（--chal-respond 的输出），null 表示还没取过。
+  String? chalAnswer;
+  /// 刚构建完的产物路径，应答要从它身上取。
+  String? chalExe;
+
   bool _disposed = false;
   Timer? _notifyTimer;
 
@@ -106,6 +116,7 @@ class PipelineCtl extends ChangeNotifier {
     log.flush();
     log.close();
     seed.dispose();
+    chalSlot.dispose();
     super.dispose();
   }
 
@@ -168,6 +179,9 @@ class PipelineCtl extends ChangeNotifier {
     results.clear();
     doneCount = 0;
     totalCount = 0;
+    // 产物没了，上一次应答也就没有意义（它对应的是那份产物）。
+    chalAnswer = null;
+    chalExe = null;
     _touch();
   }
 
@@ -219,6 +233,10 @@ class PipelineCtl extends ChangeNotifier {
   void noteLogCopied() =>
       _setStatus('日志已复制到剪贴板', level: Level.good);
 
+  /// 应答复制完成
+  void noteChalCopied() =>
+      _setStatus('应答已复制到剪贴板', level: Level.good);
+
   // ---------------------------------------------------------------- 选项
   void setMode(int v) {
     mode = v;
@@ -240,6 +258,46 @@ class PipelineCtl extends ChangeNotifier {
     _touch();
   }
 
+  // ------------------------------------------------------------ 挑战应答
+  void setChal(bool v) {
+    if (chal == v) return;
+    chal = v;
+    if (v) chalAnswer = null; // 换了一次构建，旧的应答不再对应
+    _touch();
+  }
+
+  /// 槽位下标。写坏了就退回 0 —— 槽位越界时 luac2c 会自己钳到末项并告警，
+  /// 但那是个没有人会看的告警，所以在这里先挡住。
+  int get chalIndex {
+    final v = int.tryParse(chalSlot.text.trim()) ?? 0;
+    return v < 0 ? 0 : v;
+  }
+
+  /// 问产物要一次应答。
+  ///
+  /// nonce 由调用方给（真实部署里是服务端刚发来的那一个）；这里用时钟
+  /// 派生一个，仅仅是为了让"按一下有反应"。应答本身与运行时刻无关 ——
+  /// 同样的 nonce 在同样的产物上永远得到同样的结果，这正是服务端能
+  /// 离线校验的前提。
+  Future<void> fetchChalAnswer() async {
+    final exe = chalExe;
+    if (exe == null || !File(exe).existsSync()) {
+      _setStatus('还没有可验证的产物，先构建一次', level: Level.bad);
+      return;
+    }
+    final nonce = DateTime.now().millisecondsSinceEpoch & 0x7FFFFFFF;
+    final r = await runCapture(exe, ['--chal-respond', '$nonce'], null,
+        timeout: const Duration(seconds: 20));
+    final out = r.output.trim();
+    if (r.exitCode != 0 || out.isEmpty) {
+      _setStatus('产物未提供应答（可能不是带应答构建的）', level: Level.bad);
+      return;
+    }
+    chalAnswer = out;
+    log.add('挑战应答：nonce=$nonce 应答=$out');
+    _setStatus('应答 $out（nonce $nonce）', level: Level.good);
+  }
+
   /// 三种布局的一句话说明（免得「随机 / 固定种子 / 不混淆」看着没头没尾）
   String get modeHint {
     switch (mode) {
@@ -259,6 +317,9 @@ class PipelineCtl extends ChangeNotifier {
         noPool: noPool,
         annotate: annotate,
         guard: guard,
+        // 主程序不认识 --chal 时不发这个选项，否则整步会以
+        // "unknown option" 失败 —— 客户端可以配到旧版 luac2c。
+        chal: (chal && tools.l2cChal) ? chalIndex : -1,
       );
 
   // ---------------------------------------------------------------- 批量流水线
@@ -316,7 +377,12 @@ class PipelineCtl extends ChangeNotifier {
           final f = queue[cursor++];
           final o = await _processOne(f, full);
           log.addAll(o.lines); // 整段入库，避免逐行触发刷新
-          if (o.ok) pass++;
+          if (o.ok) {
+            pass++;
+            // 记下最后一份成功的产物：挑战应答要从它身上取，而"仅生成 C"
+            // 那条路不产生可执行文件。
+            if (full) chalExe = BuildPaths.of(f).exe;
+          }
           if (_disposed) return;
           doneCount++;
           results[f] = o.ok;

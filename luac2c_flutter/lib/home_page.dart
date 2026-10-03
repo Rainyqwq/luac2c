@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'home/actions_card.dart';
+import 'home/chal_card.dart';
 import 'home/mode_card.dart';
 import 'home/source_card.dart';
 import 'home/status_bar.dart';
@@ -65,6 +66,8 @@ class _HomePageState extends State<HomePage> {
         const SizedBox(height: 12),
         ModeCard(_ctl),
         const SizedBox(height: 12),
+        ChalCard(_ctl),
+        const SizedBox(height: 12),
         ToolsCard(_ctl),
         const SizedBox(height: 12),
         ActionsSection(_ctl),
@@ -81,6 +84,8 @@ class _HomePageState extends State<HomePage> {
         SingleActivator(LogicalKeyboardKey.enter, control: true):
             _RunIntent(),
         // Esc 停止。Windows 里 Esc 永远是"中止正在做的事"
+        SingleActivator(LogicalKeyboardKey.keyR, control: true):
+            _ChalIntent(),
         SingleActivator(LogicalKeyboardKey.escape): _StopIntent(),
       },
       child: Actions(
@@ -100,6 +105,14 @@ class _HomePageState extends State<HomePage> {
           _StopIntent: CallbackAction<_StopIntent>(
             onInvoke: (_) {
               _ctl.stop();
+              return null;
+            },
+          ),
+          // Ctrl+R：向刚构建出的产物重新要一次应答。
+          // Windows 里 F5 习惯是刷新，这里用 Ctrl+R，读起来是"重发一次"。
+          _ChalIntent: CallbackAction<_ChalIntent>(
+            onInvoke: (_) {
+              if (!_ctl.busy) _ctl.fetchChalAnswer();
               return null;
             },
           ),
@@ -206,4 +219,8 @@ class _RunIntent extends Intent {
 
 class _StopIntent extends Intent {
   const _StopIntent();
+}
+
+class _ChalIntent extends Intent {
+  const _ChalIntent();
 }

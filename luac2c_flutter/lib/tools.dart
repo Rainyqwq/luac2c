@@ -15,10 +15,18 @@ class Tools {
   bool luacOk = false, l2cOk = false, luaOk = false, gccOk = false;
   bool get allOk => luacOk && l2cOk && luaOk && gccOk;
 
+  /// 主程序是否认识 --chal（挑战应答）。
+  ///
+  /// 这项必须探测而不是假定：客户端可以配到任意一份 luac2c.exe，包括
+  /// 早于该功能的版本，而把不认识的选项传过去会直接让整步失败。探测只
+  /// 跑一次 --help 并看输出，代价可以忽略。
+  bool l2cChal = false;
+
   /// 状态签名：轮询时用它判断工具链是否真的变了，避免无谓的重建
   String get signature {
     String e(bool ok) => ok ? '1' : '0';
-    return '$root|$luac${e(luacOk)}|$l2c${e(l2cOk)}|$lua${e(luaOk)}|$gcc${e(gccOk)}';
+    return '$root|$luac${e(luacOk)}|$l2c${e(l2cOk)}|$lua${e(luaOk)}'
+        '|$gcc${e(gccOk)}|${e(l2cChal)}';
   }
 
   /// 缺失的工具名列表（用于一次性提示，而不是跑到一半才报错）
@@ -226,7 +234,22 @@ Tools findTools() {
   t.inc1 = ini['inc1'] ?? '${t.root}\\lua-5.5.1\\src';
   t.inc2 = ini['inc2'] ?? '${t.root}\\lua5.5-include';
   t.lib = ini['lib'] ?? '${t.root}\\lua-5.5.1\\build\\liblua.a';
+  t.l2cChal = t.l2cOk && _probeChal(t.l2c);
   return t;
+}
+
+/// 主程序是否支持 --chal：跑一次 --help 看有没有这个词。
+///
+/// 只在探测时跑一次（Tools.signature 变了才会重新探测），因为它是一次
+/// 进程启动，真放进流水线里就是每文件多一次开销。
+bool _probeChal(String l2c) {
+  try {
+    final r = Process.runSync(l2c, ['--help'], workingDirectory: null);
+    final out = '${r.stdout}\n${r.stderr}';
+    return out.contains('--chal');
+  } catch (_) {
+    return false;
+  }
 }
 
 /// 从系统 PATH 环境变量里枚举某工具的候选路径

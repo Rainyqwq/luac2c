@@ -82,8 +82,8 @@ mingw32-make distclean    # 再加上 .audit/ .rt/ .st/ tools/.audit/ 与散落�
 │   └── lib/              # main / app / app_shell 三个入口，其余按职责分模块
 │       ├── pipeline.dart # 构建调度（并发池、进度、状态文案），不含 Widget
 │       ├── steps.dart    # 单文件五步：luac → luac2c → gcc → 运行 → 比对
-│       ├── tools.dart    # 工具链探测
-│       ├── home/ mine/   # 两个页面的部件
+│       ├── tools.dart    # 工具链探测（含主程序能力探测）
+│       ├── home/         # 主页部件：源文件 / 防护 / 挑战应答 / 工具链 / 操作
 │       └── widgets.dart  # 通用卡片/开关/指示灯原语
 ├── luac2c_client.exe     # 客户端构建产物（build 后拷到根目录）
 ├── luac.exe / lua.exe    # Lua 5.5 工具链（可由 lua-5.5.1 重建）
